@@ -2,7 +2,7 @@
 
 mod bind;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod storage;
 
 pub use bind::{BuildError, Transaction};

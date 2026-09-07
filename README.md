@@ -233,7 +233,7 @@ ID and a unique nonzero cursor namespace. The caller selects the identities outs
 code.
 
 ```rust
-# #[cfg(unix)]
+# #[cfg(any(unix, windows))]
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 use blop_db::storage::{self, Genesis, LimitPolicy, TreeId};
 
@@ -257,7 +257,7 @@ let reopened = storage::open(&path)?;
 assert_eq!(reopened.manifest().checkpoint_sequence, 0);
 # Ok::<(), Box<dyn std::error::Error>>(())
 # }
-# #[cfg(not(unix))]
+# #[cfg(not(any(unix, windows)))]
 # fn main() {}
 ```
 
@@ -280,11 +280,31 @@ reads. No VM, scheduler, logical log writer, catalogue operations, cursor lifecy
 replication, GC or whole-file compaction is implemented here. Old manifests and unreferenced pages
 are retained rather than reclaimed unsafely.
 
-The storage module is available on Unix targets. Durable storage requires atomic same-directory
-rename and durable file and directory synchronization. An OS lock protects the directory until the
-store and all views and scans have been dropped. After a publication I/O error, the store rejects
-further mutations with `NeedsRecovery`; drop its handles and reopen to establish which publication
-survived.
+### Platforms
+
+The storage module builds on Unix and Windows. A small internal platform module handles positional
+I/O, file and directory synchronization, and same-directory file replacement. Page formats and the
+publication sequence are unchanged. An OS lock protects the directory until the store and all views
+and scans have been dropped.
+
+**Windows support is experimental and has not been runtime-tested.** No Windows machine was
+available. The workspace, including test targets, has been checked from Linux with
+`cargo check --workspace --all-targets --target x86_64-pc-windows-gnu`. This checks compilation, not
+linking, execution, filesystem behaviour or crash durability. Tests have run on Linux only; other
+Unix platforms have not been runtime-tested either. Do not rely on the Windows backend for important
+data until its filesystem and recovery behaviour has been tested on Windows.
+
+The Windows backend uses synchronous offset I/O, writable directory handles opened with
+`FILE_FLAG_BACKUP_SEMANTICS`, and `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` and
+`MOVEFILE_WRITE_THROUGH`. It does not delete the destination first or enable a cross-volume copy
+fallback. Windows directory-flush support and permissions remain unverified. A filesystem or account
+that cannot perform the required directory flushes will cause creation or publication to fail; the
+implementation never treats those flushes as optional or substitutes a no-op.
+
+Durable storage still requires the filesystem guarantees in design section G.3: atomic
+same-directory replacement and durable file and directory synchronization. Write-through flags alone
+are not proof of those guarantees. After a publication I/O error, the store rejects further
+mutations with `NeedsRecovery`; drop its handles and reopen to establish which publication survived.
 
 ## Development
 
@@ -294,3 +314,8 @@ check all 48 ISA 1 opcodes and verify emitted control-flow graphs and definite r
 initialization. Storage tests also cover binary conformance, malformed and truncated objects,
 model-checked tree edits, retained roots, MVCC filtering and injected interruptions at publication
 boundaries. These filesystem interruption tests do not simulate hardware power loss.
+
+To check the Windows code without running it, install the target with
+`rustup target add x86_64-pc-windows-gnu`, then run
+`cargo check --workspace --all-targets --target x86_64-pc-windows-gnu`. A native Windows test run is
+still required before claiming tested Windows support.

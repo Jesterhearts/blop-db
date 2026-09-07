@@ -12,7 +12,7 @@ use super::{
     Current, Entry, Error, Genesis, LimitPolicy, Manifest, Result, TreeId, metadata,
     mvcc::{StateKey, StateValue},
     page::{MAX_KEY, MAX_VALUE, PageFile, PageReader},
-    tree,
+    platform, tree,
 };
 
 const TREES: [TreeId; 5] = [
@@ -103,12 +103,12 @@ pub fn create(
     let path = path.as_ref();
     fs::create_dir(path)?;
     let directory = fs::canonicalize(path)?;
-    File::open(
+    let parent = platform::open_directory(
         directory
             .parent()
             .ok_or(Error::InvalidInput("directory has no parent"))?,
-    )?
-    .sync_all()?;
+    )?;
+    platform::sync_directory(&parent)?;
     let lease = lock(&directory)?;
     write_new(&directory.join("GENESIS"), &genesis_bytes)?;
     let file = OpenOptions::new()
@@ -586,7 +586,7 @@ fn next_generation(store: &Store) -> Result<u64> {
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;
-    file.sync_all()?;
+    platform::sync_file(&file)?;
     Ok(())
 }
 
@@ -600,16 +600,15 @@ fn publish_files(store: &mut Store, manifest: &Manifest) -> Result<()> {
     store.pages.sync()?;
     publication_step(store)?;
     for segment in &manifest.segments {
-        File::open(
-            store
+        platform::sync_file_path(
+            &store
                 .directory
                 .join(format!("log-{:020}.bin", segment.segment_id)),
-        )?
-        .sync_all()?;
+        )?;
         publication_step(store)?;
     }
-    let directory = File::open(&store.directory)?;
-    directory.sync_all()?;
+    let directory = platform::open_directory(&store.directory)?;
+    platform::sync_directory(&directory)?;
     publication_step(store)?;
     let temporary = store.directory.join("manifest.pending");
     remove_temporary(&temporary)?;
@@ -621,17 +620,17 @@ fn publish_files(store: &mut Store, manifest: &Manifest) -> Result<()> {
     if final_path.try_exists()? {
         return Err(Error::InvalidInput("manifest generation already exists"));
     }
-    fs::rename(&temporary, &final_path)?;
+    platform::rename(&temporary, &final_path)?;
     publication_step(store)?;
-    directory.sync_all()?;
+    platform::sync_directory(&directory)?;
     publication_step(store)?;
     let temporary = store.directory.join("CURRENT.pending");
     remove_temporary(&temporary)?;
     write_new(&temporary, &current)?;
     publication_step(store)?;
-    fs::rename(&temporary, store.directory.join("CURRENT"))?;
+    platform::rename(&temporary, &store.directory.join("CURRENT"))?;
     publication_step(store)?;
-    directory.sync_all()?;
+    platform::sync_directory(&directory)?;
     publication_step(store)?;
     Ok(())
 }
@@ -657,8 +656,6 @@ fn publication_step(_store: &mut Store) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::FileExt;
-
     use super::*;
     use crate::storage::{SegmentDescriptor, mvcc};
 
@@ -1035,11 +1032,11 @@ mod tests {
             .write(true)
             .open(path.join("pages-00000000000000000001.bin"))
             .unwrap();
-        file.write_all_at(b"bad", dead_root * 16_384).unwrap();
+        platform::write_all_at(&file, b"bad", dead_root * 16_384).unwrap();
         let selected_policy = store.manifest.roots[2];
         drop(store);
         drop(open(&path).unwrap());
-        file.write_all_at(b"bad", selected_policy * 16_384).unwrap();
+        platform::write_all_at(&file, b"bad", selected_policy * 16_384).unwrap();
         assert!(matches!(open(&path), Err(Error::Corrupt(_))));
         fs::remove_file(path.join("pages-00000000000000000001.bin")).unwrap();
         assert!(matches!(open(&path), Err(Error::Corrupt(_))));

@@ -529,9 +529,10 @@ fn check_key(key: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs::File, os::unix::fs::FileExt};
+    use std::{collections::BTreeMap, fs::File};
 
     use super::super::page::{INLINE_LIMIT, PAYLOAD_SIZE, Value};
+    use super::super::platform::{read_exact_at, write_all_at};
     use super::*;
 
     fn create() -> PageFile {
@@ -1046,13 +1047,12 @@ mod tests {
 
     fn corrupt(file: &File, id: u64, offset: usize, data: &[u8]) {
         let mut bytes = [0u8; PAGE_SIZE];
-        file.read_exact_at(&mut bytes, id * PAGE_SIZE as u64)
-            .unwrap();
+        read_exact_at(file, &mut bytes, id * PAGE_SIZE as u64).unwrap();
         bytes[offset..offset + data.len()].copy_from_slice(data);
         bytes[60..64].fill(0);
         let crc = crc32c::crc32c(&bytes);
         bytes[60..64].copy_from_slice(&crc.to_le_bytes());
-        file.write_all_at(&bytes, id * PAGE_SIZE as u64).unwrap();
+        write_all_at(file, &bytes, id * PAGE_SIZE as u64).unwrap();
     }
 
     #[test]

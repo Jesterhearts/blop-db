@@ -5,14 +5,16 @@
 //! durability-before-execution, resolved-prefix selection and retention claims. A [`View`]
 //! is an immutable physical root set, not an externally visible database snapshot.
 //!
-//! Durability requires a Unix filesystem with atomic same-directory rename and working file
-//! and directory synchronization. One process owns the directory until its store, views and
-//! scans have all been dropped. No VM, sequencer, logical log writer or changefeed is included.
+//! Durability requires atomic same-directory rename and working file and directory synchronization.
+//! The Windows backend is experimental and has not been runtime-tested; synchronization errors
+//! are propagated, not ignored. One process owns the directory until its store, views and scans
+//! have all been dropped. No VM, sequencer, logical log writer or changefeed is included.
 
 pub mod encoding;
 mod metadata;
 pub mod mvcc;
 mod page;
+mod platform;
 mod store;
 mod tree;
 

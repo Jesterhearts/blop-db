@@ -25,6 +25,7 @@ dependencies = [
  "crc32c",
  "sha2",
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]

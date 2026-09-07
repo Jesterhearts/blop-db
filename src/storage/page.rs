@@ -1,7 +1,8 @@
 //! Version 1 page encoding and positional, append-only file access.
 
-use std::{collections::HashSet, fs::File, io, os::unix::fs::FileExt, sync::Arc};
+use std::{collections::HashSet, fs::File, io, sync::Arc};
 
+use super::platform::{read_exact_at, sync_file, write_all_at};
 use super::{Error, Result, TreeId};
 
 pub(super) const PAGE_SIZE: usize = 16_384;
@@ -70,7 +71,7 @@ impl PageFile {
         bytes[72..88].copy_from_slice(&database_id);
         bytes[88..96].copy_from_slice(&file_id.to_le_bytes());
         checksum(&mut bytes);
-        file.write_all_at(bytes.as_slice(), 0)?;
+        write_all_at(&file, bytes.as_slice(), 0)?;
         Ok(Self {
             reader: PageReader {
                 file: Arc::new(file),
@@ -122,7 +123,7 @@ impl PageFile {
         if self.poisoned {
             return Err(Error::NeedsRecovery);
         }
-        self.reader.file.sync_all()?;
+        sync_file(&self.reader.file)?;
         Ok(())
     }
 
@@ -181,10 +182,7 @@ impl PageFile {
         self.next_page += 1;
         bytes[8..16].copy_from_slice(&id.to_le_bytes());
         checksum(&mut bytes);
-        if let Err(error) = self
-            .reader
-            .file
-            .write_all_at(bytes.as_slice(), id * PAGE_SIZE as u64)
+        if let Err(error) = write_all_at(&self.reader.file, bytes.as_slice(), id * PAGE_SIZE as u64)
         {
             self.poisoned = true;
             return Err(error.into());
@@ -235,10 +233,7 @@ impl PageReader {
             return Err(Error::Corrupt("page reference outside tree prefix"));
         }
         let mut bytes = Box::new([0; PAGE_SIZE]);
-        if let Err(error) = self
-            .file
-            .read_exact_at(bytes.as_mut_slice(), id * PAGE_SIZE as u64)
-        {
+        if let Err(error) = read_exact_at(&self.file, bytes.as_mut_slice(), id * PAGE_SIZE as u64) {
             return Err(if error.kind() == io::ErrorKind::UnexpectedEof {
                 Error::Corrupt("truncated page")
             } else {
@@ -587,19 +582,18 @@ mod tests {
 
     fn raw(file: &PageFile, id: u64) -> Bytes {
         let mut bytes = Box::new([0; PAGE_SIZE]);
-        file.reader
-            .file
-            .read_exact_at(bytes.as_mut_slice(), id * PAGE_SIZE as u64)
-            .unwrap();
+        read_exact_at(
+            &file.reader.file,
+            bytes.as_mut_slice(),
+            id * PAGE_SIZE as u64,
+        )
+        .unwrap();
         bytes
     }
 
     fn overwrite(file: &PageFile, id: u64, bytes: &mut [u8; PAGE_SIZE]) {
         checksum(bytes);
-        file.reader
-            .file
-            .write_all_at(bytes, id * PAGE_SIZE as u64)
-            .unwrap();
+        write_all_at(&file.reader.file, bytes, id * PAGE_SIZE as u64).unwrap();
     }
 
     #[test]
@@ -667,10 +661,7 @@ mod tests {
         }
         assert!(PageFile::open(descriptor(), [8; 16], 19, 1).is_err());
         assert!(PageFile::open(descriptor(), [7; 16], 20, 1).is_err());
-        file.reader
-            .file
-            .write_all_at(&[0xee; 27], PAGE_SIZE as u64)
-            .unwrap();
+        write_all_at(&file.reader.file, &[0xee; 27], PAGE_SIZE as u64).unwrap();
         let mut reopened = PageFile::open(descriptor(), [7; 16], 19, 1).unwrap();
         assert_eq!(reopened.page_count(), 1);
         assert_eq!(
@@ -687,10 +678,7 @@ mod tests {
     #[test]
     fn append_never_overwrites_an_untrimmed_tail_or_failed_allocation() {
         let file = create();
-        file.reader
-            .file
-            .write_all_at(&[9; 3], PAGE_SIZE as u64)
-            .unwrap();
+        write_all_at(&file.reader.file, &[9; 3], PAGE_SIZE as u64).unwrap();
         let mut reopened =
             PageFile::open(file.reader.file.try_clone().unwrap(), [7; 16], 19, 1).unwrap();
         let pinned = reopened.reader();
@@ -698,10 +686,7 @@ mod tests {
         assert!(pinned.node(TreeId::State, 2).is_err());
         assert_eq!(reopened.page_count(), 3);
         let mut tail = [0; 3];
-        file.reader
-            .file
-            .read_exact_at(&mut tail, PAGE_SIZE as u64)
-            .unwrap();
+        read_exact_at(&file.reader.file, &mut tail, PAGE_SIZE as u64).unwrap();
         assert_eq!(tail, [9; 3]);
 
         let named = tempfile::NamedTempFile::new().unwrap();
@@ -783,11 +768,8 @@ mod tests {
             PageFile::open(file.reader.file.try_clone().unwrap(), [7; 16], 19, 1),
             Err(Error::Unsupported { version: 2, .. })
         ));
-        file.reader
-            .file
-            .write_all_at(original.as_slice(), 0)
-            .unwrap();
-        file.reader.file.write_all_at(&[1], 100).unwrap();
+        write_all_at(&file.reader.file, original.as_slice(), 0).unwrap();
+        write_all_at(&file.reader.file, &[1], 100).unwrap();
         assert!(matches!(
             PageFile::open(file.reader.file.try_clone().unwrap(), [7; 16], 19, 1),
             Err(Error::Corrupt(_))
@@ -932,19 +914,20 @@ mod tests {
                 ),
                 "page {id}, offset {offset}"
             );
-            file.reader
-                .file
-                .write_all_at(original.as_slice(), head * PAGE_SIZE as u64)
-                .unwrap();
-            file.reader
-                .file
-                .write_all_at(final_page.as_slice(), final_id * PAGE_SIZE as u64)
-                .unwrap();
-        }
-        file.reader
-            .file
-            .write_all_at(&[9], head * PAGE_SIZE as u64 + 64)
+            write_all_at(
+                &file.reader.file,
+                original.as_slice(),
+                head * PAGE_SIZE as u64,
+            )
             .unwrap();
+            write_all_at(
+                &file.reader.file,
+                final_page.as_slice(),
+                final_id * PAGE_SIZE as u64,
+            )
+            .unwrap();
+        }
+        write_all_at(&file.reader.file, &[9], head * PAGE_SIZE as u64 + 64).unwrap();
         assert!(file.reader().value(TreeId::State, &value).is_err());
     }
 
