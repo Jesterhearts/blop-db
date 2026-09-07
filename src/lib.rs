@@ -5,20 +5,21 @@ mod bind;
 #[cfg(any(unix, windows))]
 pub mod storage;
 
-pub use bind::{BuildError, Transaction};
-
+pub use bind::BuildError;
+pub use bind::Transaction;
 #[doc(hidden)]
 pub use blop_db_macros::compile_tx as __compile_tx;
 
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::bind::{bind_program, push_blob};
+    pub use crate::bind::bind_program;
+    pub use crate::bind::push_blob;
 }
 
 /// Compile a transaction program and bind its runtime inputs.
 ///
-/// Returns a [`Result<Transaction, BuildError>`]. This constructs a transaction;
-/// it does not execute the program.
+/// Returns a [`Result<Transaction, BuildError>`]. This constructs a
+/// transaction; it does not execute the program.
 ///
 /// ```
 /// let transaction = blop_db::tx! { -> i64 { return 42; } }?;

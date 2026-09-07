@@ -1,12 +1,22 @@
 use std::collections::HashSet;
 
-use proc_macro2::{Group, TokenStream, TokenTree};
-use syn::{
-    Block, Expr, Ident, Path, Result, Token, braced,
-    parse::{Parse, ParseStream},
-};
+use proc_macro2::Group;
+use proc_macro2::TokenStream;
+use proc_macro2::TokenTree;
+use syn::Block;
+use syn::Expr;
+use syn::Ident;
+use syn::Path;
+use syn::Result;
+use syn::Token;
+use syn::braced;
+use syn::parse::Parse;
+use syn::parse::ParseStream;
 
-use crate::types::{Type, key_size, parse_type, validate_type};
+use crate::types::Type;
+use crate::types::key_size;
+use crate::types::parse_type;
+use crate::types::validate_type;
 
 pub struct Capture {
     pub name: Ident,
@@ -113,14 +123,20 @@ impl Parse for Program {
     }
 }
 
-fn keyword(input: ParseStream<'_>, name: &str) -> bool {
+fn keyword(
+    input: ParseStream<'_>,
+    name: &str,
+) -> bool {
     input
         .fork()
         .parse::<Ident>()
         .is_ok_and(|ident| ident == name)
 }
 
-fn unique_name(input: ParseStream<'_>, names: &mut HashSet<String>) -> Result<Ident> {
+fn unique_name(
+    input: ParseStream<'_>,
+    names: &mut HashSet<String>,
+) -> Result<Ident> {
     let name: Ident = input.parse()?;
     validate_name(&name)?;
     if !names.insert(name.to_string()) {
@@ -145,7 +161,10 @@ pub fn validate_name(name: &Ident) -> Result<()> {
     Ok(())
 }
 
-fn strip_capture_markers(tokens: TokenStream, names: &HashSet<String>) -> Result<TokenStream> {
+fn strip_capture_markers(
+    tokens: TokenStream,
+    names: &HashSet<String>,
+) -> Result<TokenStream> {
     let mut out = TokenStream::new();
     let mut tokens = tokens.into_iter();
     while let Some(token) = tokens.next() {
@@ -166,7 +185,8 @@ fn strip_capture_markers(tokens: TokenStream, names: &HashSet<String>) -> Result
                 if !names.contains(&name.to_string()) {
                     return Err(syn::Error::new(name.span(), "unknown capture"));
                 }
-                // A marker remains distinct from a shadowing local with the same name.
+                // A marker remains distinct from a shadowing local with the
+                // same name.
                 out.extend(quote::quote_spanned!(name.span()=> __capture(#name)));
             }
             TokenTree::Group(group) => {

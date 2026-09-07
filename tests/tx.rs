@@ -1,8 +1,11 @@
 use std::collections::BTreeSet;
 
-use blop_db::{BuildError, Transaction, tx};
+use blop_db::BuildError;
+use blop_db::Transaction;
+use blop_db::tx;
 
-// This decoder follows DESIGN.md appendices A, B and C, not the macro's encoder.
+// This decoder follows DESIGN.md appendices A, B and C, not the macro's
+// encoder.
 #[derive(Debug, PartialEq, Eq)]
 enum Ty {
     Unit,
@@ -31,17 +34,26 @@ struct Program<'a> {
     instructions: Vec<Instruction<'a>>,
 }
 
-fn take<'a>(input: &mut &'a [u8], length: usize) -> &'a [u8] {
+fn take<'a>(
+    input: &mut &'a [u8],
+    length: usize,
+) -> &'a [u8] {
     let (prefix, rest) = input.split_at(length);
     *input = rest;
     prefix
 }
 
-fn word(bytes: &[u8], offset: usize) -> u16 {
+fn word(
+    bytes: &[u8],
+    offset: usize,
+) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
 }
 
-fn dword(bytes: &[u8], offset: usize) -> u32 {
+fn dword(
+    bytes: &[u8],
+    offset: usize,
+) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
@@ -85,7 +97,10 @@ fn descriptor(input: &mut &[u8]) -> Ty {
     ty
 }
 
-fn check_value(ty: &Ty, input: &mut &[u8]) {
+fn check_value(
+    ty: &Ty,
+    input: &mut &[u8],
+) {
     match ty {
         Ty::Unit => {}
         Ty::Bool => assert!(take(input, 1)[0] <= 1),

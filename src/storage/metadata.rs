@@ -1,17 +1,22 @@
-//! Version 1 metadata codecs and read-only validation of published log prefixes.
+//! Version 1 metadata codecs and read-only validation of published log
+//! prefixes.
 //!
-//! These checks do not select a manifest, validate page contents, compare successive
-//! publications, or interpret log bodies. Those checks belong to the store and engine.
+//! These checks do not select a manifest, validate page contents, compare
+//! successive publications, or interpret log bodies. Those checks belong to the
+//! store and engine.
 
-use std::{
-    fs::File,
-    io::{self, Read},
-    path::Path,
+use std::fs::File;
+use std::io::Read;
+use std::io::{
+    self,
 };
+use std::path::Path;
 
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+use sha2::Sha256;
 
-use super::{Error, Result};
+use super::Error;
+use super::Result;
 
 const POLICY_LENGTH: usize = 140;
 const GENESIS_LENGTH: usize = 180;
@@ -187,7 +192,10 @@ fn validate_descriptor(segment: &SegmentDescriptor) -> std::result::Result<(), &
     Ok(())
 }
 
-fn append_descriptor(bytes: &mut Vec<u8>, segment: &SegmentDescriptor) {
+fn append_descriptor(
+    bytes: &mut Vec<u8>,
+    segment: &SegmentDescriptor,
+) {
     for value in [
         segment.segment_id,
         segment.first_sequence,
@@ -275,7 +283,8 @@ impl Manifest {
         if length != Some(bytes.len()) {
             return Err(Error::Corrupt("invalid manifest segment vector length"));
         }
-        // The complete vector fits the checked enclosing length before allocation.
+        // The complete vector fits the checked enclosing length before
+        // allocation.
         let (descriptors, _) = bytes[268..bytes.len() - 4].as_chunks::<DESCRIPTOR_LENGTH>();
         let mut segments = Vec::with_capacity(count);
         for bytes in descriptors {
@@ -443,14 +452,20 @@ fn valid_id(id: u64) -> bool {
     id != 0 && id != u64::MAX
 }
 
-fn check_version(version: u16, format: &'static str) -> Result<()> {
+fn check_version(
+    version: u16,
+    format: &'static str,
+) -> Result<()> {
     if version != 1 {
         return Err(Error::Unsupported { format, version });
     }
     Ok(())
 }
 
-fn metadata_prefix(magic: &[u8; 8], length: usize) -> Vec<u8> {
+fn metadata_prefix(
+    magic: &[u8; 8],
+    length: usize,
+) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(length);
     bytes.extend_from_slice(magic);
     bytes.extend_from_slice(&1_u16.to_le_bytes());
@@ -490,30 +505,48 @@ fn check_metadata(
     Ok(())
 }
 
-// All callers check the enclosing fixed layout before reading fields at fixed offsets.
-fn array_at<const N: usize>(bytes: &[u8], offset: usize) -> [u8; N] {
+// All callers check the enclosing fixed layout before reading fields at fixed
+// offsets.
+fn array_at<const N: usize>(
+    bytes: &[u8],
+    offset: usize,
+) -> [u8; N] {
     bytes[offset..offset + N]
         .try_into()
         .expect("validated field bounds")
 }
 
-fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+fn u16_at(
+    bytes: &[u8],
+    offset: usize,
+) -> u16 {
     u16::from_le_bytes(array_at(bytes, offset))
 }
 
-fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+fn u32_at(
+    bytes: &[u8],
+    offset: usize,
+) -> u32 {
     u32::from_le_bytes(array_at(bytes, offset))
 }
 
-fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+fn u64_at(
+    bytes: &[u8],
+    offset: usize,
+) -> u64 {
     u64::from_le_bytes(array_at(bytes, offset))
 }
 
-/// Validate only manifest-authoritative log bytes without changing the directory.
+/// Validate only manifest-authoritative log bytes without changing the
+/// directory.
 ///
-/// Bodies remain opaque, except for the fixed SetLimits body length. This checks
-/// framing and integrity, not transaction, catalogue, or policy body semantics.
-pub fn validate_logs(directory: &Path, manifest: &Manifest) -> Result<()> {
+/// Bodies remain opaque, except for the fixed SetLimits body length. This
+/// checks framing and integrity, not transaction, catalogue, or policy body
+/// semantics.
+pub fn validate_logs(
+    directory: &Path,
+    manifest: &Manifest,
+) -> Result<()> {
     validate_manifest(manifest).map_err(Error::Corrupt)?;
     for segment in &manifest.segments {
         let path = directory.join(format!("log-{:020}.bin", segment.segment_id));
@@ -524,7 +557,8 @@ pub fn validate_logs(directory: &Path, manifest: &Manifest) -> Result<()> {
                 Error::Io(error)
             }
         })?;
-        // A bounded reader must not even prefetch bytes from an uncommitted tail.
+        // A bounded reader must not even prefetch bytes from an uncommitted
+        // tail.
         let mut reader = file.take(segment.committed_bytes);
         let mut header = [0; SEGMENT_HEADER_LENGTH as usize];
         read_committed(&mut reader, &mut header)?;
@@ -549,7 +583,10 @@ pub fn validate_logs(directory: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn read_committed(reader: &mut impl Read, bytes: &mut [u8]) -> Result<()> {
+fn read_committed(
+    reader: &mut impl Read,
+    bytes: &mut [u8],
+) -> Result<()> {
     reader.read_exact(bytes).map_err(|error| {
         if error.kind() == io::ErrorKind::UnexpectedEof {
             Error::Corrupt("truncated committed log prefix")
@@ -654,7 +691,11 @@ mod tests {
         Sha256::digest(bytes).into()
     }
 
-    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    fn put_u64(
+        bytes: &mut [u8],
+        offset: usize,
+        value: u64,
+    ) {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
 
@@ -1231,7 +1272,12 @@ mod tests {
         assert!(manifest.segments[0].encode().is_err());
     }
 
-    fn record(sequence: u64, kind: u8, predecessor: [u8; 32], body: &[u8]) -> Vec<u8> {
+    fn record(
+        sequence: u64,
+        kind: u8,
+        predecessor: [u8; 32],
+        body: &[u8],
+    ) -> Vec<u8> {
         let length = (72 + body.len()) as u32;
         let mut bytes = vec![0; 64];
         bytes[..8].copy_from_slice(b"BLR1\x40\x00\x01\x00");
@@ -1275,7 +1321,10 @@ mod tests {
         (descriptor, bytes)
     }
 
-    fn single_log(kind: u8, body: &[u8]) -> (tempfile::TempDir, Manifest, Vec<u8>) {
+    fn single_log(
+        kind: u8,
+        body: &[u8],
+    ) -> (tempfile::TempDir, Manifest, Vec<u8>) {
         let directory = tempfile::tempdir().unwrap();
         let mut manifest = initial_manifest();
         let record = record(1, kind, manifest.genesis_digest, body);

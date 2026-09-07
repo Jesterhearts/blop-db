@@ -1,6 +1,8 @@
-//! Validated storage schemas and binary transforms between values and canonical keys.
+//! Validated storage schemas and binary transforms between values and canonical
+//! keys.
 
-use super::{Error, Result};
+use super::Error;
+use super::Result;
 
 pub(crate) const MAX_KEY_BYTES: usize = 1_024;
 pub(crate) const MAX_VALUE_BYTES: usize = 16 * 1024 * 1024;
@@ -69,7 +71,10 @@ impl Schema {
     }
 }
 
-fn take<'a>(input: &mut &'a [u8], length: usize) -> Result<&'a [u8]> {
+fn take<'a>(
+    input: &mut &'a [u8],
+    length: usize,
+) -> Result<&'a [u8]> {
     if length > input.len() {
         return Err(Error::InvalidInput("truncated schema, value, or key"));
     }
@@ -78,7 +83,10 @@ fn take<'a>(input: &mut &'a [u8], length: usize) -> Result<&'a [u8]> {
     Ok(bytes)
 }
 
-fn decode_node(input: &mut &[u8], depth: usize) -> Result<(TypeNode, usize, usize)> {
+fn decode_node(
+    input: &mut &[u8],
+    depth: usize,
+) -> Result<(TypeNode, usize, usize)> {
     if depth > 16 {
         return Err(Error::InvalidInput("schema nesting exceeds depth 16"));
     }
@@ -137,8 +145,12 @@ fn decode_node(input: &mut &[u8], depth: usize) -> Result<(TypeNode, usize, usiz
     Ok((node, value_bytes, key_bytes))
 }
 
-/// Validate one complete schema-encoded value without allocating its decoded form.
-pub fn validate_value(schema: &Schema, value: &[u8]) -> Result<()> {
+/// Validate one complete schema-encoded value without allocating its decoded
+/// form.
+pub fn validate_value(
+    schema: &Schema,
+    value: &[u8],
+) -> Result<()> {
     if value.len() > schema.max_value_bytes {
         return Err(Error::InvalidInput("value exceeds schema maximum size"));
     }
@@ -150,8 +162,12 @@ pub fn validate_value(schema: &Schema, value: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Convert a complete schema-encoded value to an order-preserving canonical key.
-pub fn encode_key(schema: &Schema, value: &[u8]) -> Result<Vec<u8>> {
+/// Convert a complete schema-encoded value to an order-preserving canonical
+/// key.
+pub fn encode_key(
+    schema: &Schema,
+    value: &[u8],
+) -> Result<Vec<u8>> {
     if schema.max_key_bytes > MAX_KEY_BYTES {
         return Err(Error::InvalidInput("schema key size exceeds 1,024 bytes"));
     }
@@ -167,7 +183,11 @@ pub fn encode_key(schema: &Schema, value: &[u8]) -> Result<Vec<u8>> {
     Ok(key)
 }
 
-fn read_value(node: &TypeNode, input: &mut &[u8], mut key: Option<&mut Vec<u8>>) -> Result<()> {
+fn read_value(
+    node: &TypeNode,
+    input: &mut &[u8],
+    mut key: Option<&mut Vec<u8>>,
+) -> Result<()> {
     match node {
         TypeNode::Unit => {}
         TypeNode::Boolean => {
@@ -211,7 +231,10 @@ fn read_value(node: &TypeNode, input: &mut &[u8], mut key: Option<&mut Vec<u8>>)
 }
 
 /// Decode one complete canonical key into its canonical schema value encoding.
-pub fn decode_key(schema: &Schema, key: &[u8]) -> Result<Vec<u8>> {
+pub fn decode_key(
+    schema: &Schema,
+    key: &[u8],
+) -> Result<Vec<u8>> {
     if schema.max_key_bytes > MAX_KEY_BYTES {
         return Err(Error::InvalidInput("schema key size exceeds 1,024 bytes"));
     }
@@ -227,7 +250,11 @@ pub fn decode_key(schema: &Schema, key: &[u8]) -> Result<Vec<u8>> {
     Ok(value)
 }
 
-fn read_key(node: &TypeNode, input: &mut &[u8], value: &mut Vec<u8>) -> Result<()> {
+fn read_key(
+    node: &TypeNode,
+    input: &mut &[u8],
+    value: &mut Vec<u8>,
+) -> Result<()> {
     match node {
         TypeNode::Unit => {}
         TypeNode::Boolean => {
@@ -307,11 +334,18 @@ mod tests {
         [&(bytes.len() as u32).to_le_bytes(), bytes].concat()
     }
 
-    fn bytes_schema(tag: u8, bound: u32) -> Schema {
+    fn bytes_schema(
+        tag: u8,
+        bound: u32,
+    ) -> Schema {
         schema(&[&[tag], bound.to_le_bytes().as_slice()].concat())
     }
 
-    fn round_trip(schema: &Schema, value: &[u8], expected: &[u8]) {
+    fn round_trip(
+        schema: &Schema,
+        value: &[u8],
+        expected: &[u8],
+    ) {
         validate_value(schema, value).unwrap();
         assert_eq!(encode_key(schema, value).unwrap(), expected);
         assert_eq!(decode_key(schema, expected).unwrap(), value);

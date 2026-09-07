@@ -1,11 +1,20 @@
-use syn::{ExprCall, Result, spanned::Spanned};
+use syn::ExprCall;
+use syn::Result;
+use syn::spanned::Spanned;
 
-use super::{
-    Compiler, address, emit_table,
-    expr::{binary_instruction, compile_expr, field_instruction, tuple_instruction, type_hint},
-    immediate, path_name, table_info,
-};
-use crate::types::{Type, VALUE_LIMIT};
+use super::Compiler;
+use super::address;
+use super::emit_table;
+use super::expr::binary_instruction;
+use super::expr::compile_expr;
+use super::expr::field_instruction;
+use super::expr::tuple_instruction;
+use super::expr::type_hint;
+use super::immediate;
+use super::path_name;
+use super::table_info;
+use crate::types::Type;
+use crate::types::VALUE_LIMIT;
 
 pub(super) fn compile_call(
     compiler: &mut Compiler,
@@ -158,7 +167,8 @@ pub(super) fn compile_call(
                 _ => unreachable!(),
             };
             operands.push(right);
-            // A legal descriptor caps growth; the VM enforces this bound on the actual result.
+            // A legal descriptor caps growth; the VM enforces this bound on the
+            // actual result.
             let bound = (u64::from(*a) + u64::from(b)).min(VALUE_LIMIT - 4) as u32;
             let ty = if matches!(source_type, Type::Bytes(_)) {
                 Type::Bytes(bound)
@@ -188,7 +198,10 @@ pub(super) fn compile_call(
     Ok(result)
 }
 
-fn scan(compiler: &mut Compiler, call: &ExprCall) -> Result<u16> {
+fn scan(
+    compiler: &mut Compiler,
+    call: &ExprCall,
+) -> Result<u16> {
     let span = call.span();
     let args = &call.args;
     let table = table_info(compiler, &args[0])?;

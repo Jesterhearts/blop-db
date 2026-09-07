@@ -1,5 +1,10 @@
 use proc_macro2::Span;
-use syn::{Ident, LitInt, Result, Token, parenthesized, parse::ParseStream};
+use syn::Ident;
+use syn::LitInt;
+use syn::Result;
+use syn::Token;
+use syn::parenthesized;
+use syn::parse::ParseStream;
 
 pub const VALUE_LIMIT: u64 = 16 * 1024 * 1024;
 
@@ -20,7 +25,10 @@ impl Type {
         matches!(self, Self::I64 | Self::U64)
     }
 
-    pub fn same_shape(&self, other: &Self) -> bool {
+    pub fn same_shape(
+        &self,
+        other: &Self,
+    ) -> bool {
         match (self, other) {
             (Self::Bytes(_), Self::Bytes(_)) | (Self::String(_), Self::String(_)) => true,
             (Self::Tuple(a), Self::Tuple(b)) => {
@@ -33,7 +41,10 @@ impl Type {
         }
     }
 
-    pub fn union(&self, other: &Self) -> Self {
+    pub fn union(
+        &self,
+        other: &Self,
+    ) -> Self {
         match (self, other) {
             (Self::Bytes(a), Self::Bytes(b)) => Self::Bytes((*a).max(*b)),
             (Self::String(a), Self::String(b)) => Self::String((*a).max(*b)),
@@ -58,7 +69,10 @@ pub fn parse_type(input: ParseStream<'_>) -> Result<Type> {
     parse_type_at_depth(input, 1)
 }
 
-fn parse_type_at_depth(input: ParseStream<'_>, depth: u8) -> Result<Type> {
+fn parse_type_at_depth(
+    input: ParseStream<'_>,
+    depth: u8,
+) -> Result<Type> {
     let span = input.span();
     if depth > 16 {
         return Err(syn::Error::new(span, "VM types may nest at most 16 levels"));
@@ -118,8 +132,16 @@ fn parse_type_at_depth(input: ParseStream<'_>, depth: u8) -> Result<Type> {
     Ok(ty)
 }
 
-pub fn validate_type(ty: &Type, allow_rows: bool, span: Span) -> Result<()> {
-    fn size(ty: &Type, depth: u8, allow_rows: bool) -> Option<u64> {
+pub fn validate_type(
+    ty: &Type,
+    allow_rows: bool,
+    span: Span,
+) -> Result<()> {
+    fn size(
+        ty: &Type,
+        depth: u8,
+        allow_rows: bool,
+    ) -> Option<u64> {
         if depth > 16 {
             return None;
         }
@@ -163,7 +185,10 @@ pub fn key_size(ty: &Type) -> u64 {
     }
 }
 
-fn encode_node(ty: &Type, out: &mut Vec<u8>) {
+fn encode_node(
+    ty: &Type,
+    out: &mut Vec<u8>,
+) {
     match ty {
         Type::Unit => out.push(0),
         Type::Bool => out.push(1),

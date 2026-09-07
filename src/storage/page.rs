@@ -1,9 +1,16 @@
 //! Version 1 page encoding and positional, append-only file access.
 
-use std::{collections::HashSet, fs::File, io, sync::Arc};
+use std::collections::HashSet;
+use std::fs::File;
+use std::io;
+use std::sync::Arc;
 
-use super::platform::{read_exact_at, sync_file, write_all_at};
-use super::{Error, Result, TreeId};
+use super::Error;
+use super::Result;
+use super::TreeId;
+use super::platform::read_exact_at;
+use super::platform::sync_file;
+use super::platform::write_all_at;
 
 pub(super) const PAGE_SIZE: usize = 16_384;
 pub(super) const HEADER_SIZE: usize = 64;
@@ -21,7 +28,8 @@ pub(super) struct PageFile {
     poisoned: bool,
 }
 
-/// A pinned descriptor and immutable readable prefix, independent of later appends.
+/// A pinned descriptor and immutable readable prefix, independent of later
+/// appends.
 #[derive(Clone)]
 pub(super) struct PageReader {
     file: Arc<File>,
@@ -61,7 +69,11 @@ impl Node {
 
 impl PageFile {
     /// Creates page zero in an empty file; never overwrites an existing file.
-    pub(super) fn create(file: File, database_id: [u8; 16], file_id: u64) -> Result<Self> {
+    pub(super) fn create(
+        file: File,
+        database_id: [u8; 16],
+        file_id: u64,
+    ) -> Result<Self> {
         if file.metadata()?.len() != 0 {
             return Err(Error::InvalidInput("page file is not empty"));
         }
@@ -82,7 +94,8 @@ impl PageFile {
         })
     }
 
-    /// Checks the committed prefix and identities without discarding a crash tail.
+    /// Checks the committed prefix and identities without discarding a crash
+    /// tail.
     pub(super) fn open(
         file: File,
         database_id: [u8; 16],
@@ -144,11 +157,19 @@ impl PageFile {
         Ok(())
     }
 
-    pub(super) fn append_node(&mut self, tree: TreeId, node: &Node) -> Result<u64> {
+    pub(super) fn append_node(
+        &mut self,
+        tree: TreeId,
+        node: &Node,
+    ) -> Result<u64> {
         self.append(encode_node(tree, node)?)
     }
 
-    pub(super) fn store_value(&mut self, tree: TreeId, value: &[u8]) -> Result<Value> {
+    pub(super) fn store_value(
+        &mut self,
+        tree: TreeId,
+        value: &[u8],
+    ) -> Result<Value> {
         if value.len() > MAX_VALUE {
             return Err(Error::InvalidInput("value exceeds 128 MiB"));
         }
@@ -156,7 +177,8 @@ impl PageFile {
             return Ok(Value::Inline(value.to_vec()));
         }
         let mut head = 0u64;
-        // Writing backwards makes every link refer to an already completed page.
+        // Writing backwards makes every link refer to an already completed
+        // page.
         for chunk in value.chunks(PAYLOAD_SIZE).rev() {
             let mut bytes = header(3, 0, tree as u32);
             bytes[32..40].copy_from_slice(&head.to_le_bytes());
@@ -170,7 +192,10 @@ impl PageFile {
         })
     }
 
-    fn append(&mut self, mut bytes: Bytes) -> Result<u64> {
+    fn append(
+        &mut self,
+        mut bytes: Bytes,
+    ) -> Result<u64> {
         if self.poisoned {
             return Err(Error::NeedsRecovery);
         }
@@ -178,7 +203,8 @@ impl PageFile {
             return Err(Error::Exhausted);
         }
         let id = self.next_page;
-        // Reserve before I/O. An uncertain write must never be retried at this ID.
+        // Reserve before I/O. An uncertain write must never be retried at this
+        // ID.
         self.next_page += 1;
         bytes[8..16].copy_from_slice(&id.to_le_bytes());
         checksum(&mut bytes);
@@ -193,12 +219,20 @@ impl PageFile {
 }
 
 impl PageReader {
-    pub(super) fn node(&self, tree: TreeId, id: u64) -> Result<Node> {
+    pub(super) fn node(
+        &self,
+        tree: TreeId,
+        id: u64,
+    ) -> Result<Node> {
         let bytes = self.read(id, Some(tree))?;
         decode_node(&bytes, self.page_count)
     }
 
-    pub(super) fn value(&self, tree: TreeId, value: &Value) -> Result<Vec<u8>> {
+    pub(super) fn value(
+        &self,
+        tree: TreeId,
+        value: &Value,
+    ) -> Result<Vec<u8>> {
         match value {
             Value::Inline(bytes) => Ok(bytes.clone()),
             Value::Overflow { len, head } => {
@@ -228,7 +262,11 @@ impl PageReader {
         Ok(())
     }
 
-    fn read(&self, id: u64, tree: Option<TreeId>) -> Result<Bytes> {
+    fn read(
+        &self,
+        id: u64,
+        tree: Option<TreeId>,
+    ) -> Result<Bytes> {
         if id >= self.page_count || (id == 0) != tree.is_none() {
             return Err(Error::Corrupt("page reference outside tree prefix"));
         }
@@ -277,7 +315,11 @@ fn walk_overflow(
     Ok(())
 }
 
-fn header(kind: u8, level: u8, tree: u32) -> Bytes {
+fn header(
+    kind: u8,
+    level: u8,
+    tree: u32,
+) -> Bytes {
     let mut bytes = Box::new([0; PAGE_SIZE]);
     bytes[..4].copy_from_slice(b"BLP1");
     bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
@@ -380,7 +422,10 @@ fn validate_header(
     Ok(())
 }
 
-fn decode_node(bytes: &[u8; PAGE_SIZE], page_count: u64) -> Result<Node> {
+fn decode_node(
+    bytes: &[u8; PAGE_SIZE],
+    page_count: u64,
+) -> Result<Node> {
     let leaf = match bytes[6] {
         1 => true,
         2 => false,
@@ -472,7 +517,10 @@ pub(super) fn leaf_size(cell: &LeafCell) -> usize {
         }
 }
 
-fn encode_node(tree: TreeId, node: &Node) -> Result<Bytes> {
+fn encode_node(
+    tree: TreeId,
+    node: &Node,
+) -> Result<Bytes> {
     let (kind, count, size) = match node {
         Node::Leaf(cells) => (
             1,
@@ -543,19 +591,31 @@ fn encode_node(tree: TreeId, node: &Node) -> Result<Bytes> {
     Ok(bytes)
 }
 
-fn valid_ref(id: u64, count: u64) -> bool {
+fn valid_ref(
+    id: u64,
+    count: u64,
+) -> bool {
     id != 0 && id < count
 }
 
-fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+fn u16_at(
+    bytes: &[u8],
+    offset: usize,
+) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
 }
 
-fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+fn u32_at(
+    bytes: &[u8],
+    offset: usize,
+) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
-fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+fn u64_at(
+    bytes: &[u8],
+    offset: usize,
+) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
@@ -580,7 +640,10 @@ mod tests {
         ])
     }
 
-    fn raw(file: &PageFile, id: u64) -> Bytes {
+    fn raw(
+        file: &PageFile,
+        id: u64,
+    ) -> Bytes {
         let mut bytes = Box::new([0; PAGE_SIZE]);
         read_exact_at(
             &file.reader.file,
@@ -591,7 +654,11 @@ mod tests {
         bytes
     }
 
-    fn overwrite(file: &PageFile, id: u64, bytes: &mut [u8; PAGE_SIZE]) {
+    fn overwrite(
+        file: &PageFile,
+        id: u64,
+        bytes: &mut [u8; PAGE_SIZE],
+    ) {
         checksum(bytes);
         write_all_at(&file.reader.file, bytes, id * PAGE_SIZE as u64).unwrap();
     }

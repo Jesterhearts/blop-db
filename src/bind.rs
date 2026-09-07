@@ -42,7 +42,10 @@ pub enum BuildError {
 }
 
 impl fmt::Display for BuildError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
         match self {
             Self::BoundExceeded {
                 max_bytes,
@@ -66,7 +69,11 @@ impl fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 /// Append one length-prefixed Blob without changing `out` on error.
-pub fn push_blob(out: &mut Vec<u8>, bytes: &[u8], max_bytes: u32) -> Result<(), BuildError> {
+pub fn push_blob(
+    out: &mut Vec<u8>,
+    bytes: &[u8],
+    max_bytes: u32,
+) -> Result<(), BuildError> {
     let length = u32::try_from(bytes.len())
         .ok()
         .filter(|&length| length <= max_bytes)
@@ -85,11 +92,13 @@ pub fn push_blob(out: &mut Vec<u8>, bytes: &[u8], max_bytes: u32) -> Result<(), 
     Ok(())
 }
 
-/// Bind table IDs to a compiler-validated template and attach encoded arguments.
+/// Bind table IDs to a compiler-validated template and attach encoded
+/// arguments.
 ///
-/// Each patch contains an absolute byte offset and an original table declaration
-/// index. Only the table array and these u16 operands are rewritten. Checks here
-/// protect binding ranges and indices; they do not validate bytecode or arguments.
+/// Each patch contains an absolute byte offset and an original table
+/// declaration index. Only the table array and these u16 operands are
+/// rewritten. Checks here protect binding ranges and indices; they do not
+/// validate bytecode or arguments.
 pub fn bind_program(
     template: &'static [u8],
     table_offset: usize,

@@ -1,0 +1,18 @@
+# Use nightly Rust because this configuration enables unstable rustfmt options.
+# - wrap_comments keeps comments and documentation comments within the line limit.
+# - group_imports separates standard-library, external-crate, and local imports.
+# - imports_layout puts each imported name on its own line to make changes easier to review.
+# - imports_granularity limits each import statement to one item.
+# - fn_params_layout uses a vertical layout for function parameters.
+# - format_strings wraps long string literals to fit the line limit.
+# - format_code_in_doc_comments formats Rust code blocks in documentation comments.
+# - reorder_impl_items applies a consistent order to items in impl blocks.
+
+wrap_comments               = true
+group_imports               = "StdExternalCrate"
+imports_layout              = "Vertical"
+imports_granularity         = "Item"
+fn_params_layout            = "Vertical"
+format_strings              = true
+format_code_in_doc_comments = true
+reorder_impl_items          = true

@@ -1,11 +1,23 @@
-//! Immutable-root B+ tree operations. Only the changed path and repair siblings are copied.
+//! Immutable-root B+ tree operations. Only the changed path and repair siblings
+//! are copied.
 
-use std::{collections::HashSet, ops::Bound, vec};
+use std::collections::HashSet;
+use std::ops::Bound;
+use std::vec;
 
-use super::page::{
-    HEADER_SIZE, LeafCell, MAX_KEY, MAX_VALUE, Node, PAGE_SIZE, PageFile, PageReader, leaf_size,
-};
-use super::{Entry, Error, Result, TreeId};
+use super::Entry;
+use super::Error;
+use super::Result;
+use super::TreeId;
+use super::page::HEADER_SIZE;
+use super::page::LeafCell;
+use super::page::MAX_KEY;
+use super::page::MAX_VALUE;
+use super::page::Node;
+use super::page::PAGE_SIZE;
+use super::page::PageFile;
+use super::page::PageReader;
+use super::page::leaf_size;
 
 pub(super) fn get(
     reader: &PageReader,
@@ -46,7 +58,8 @@ struct Frame {
     next: usize,
 }
 
-/// Owns a pinned reader, one leaf, and the ancestor path, not the complete result set.
+/// Owns a pinned reader, one leaf, and the ancestor path, not the complete
+/// result set.
 pub struct Scan {
     reader: PageReader,
     tree: TreeId,
@@ -211,7 +224,12 @@ pub(super) fn put(
     finish(file, tree, root, key, Some(value))
 }
 
-pub(super) fn delete(file: &mut PageFile, tree: TreeId, root: u64, key: &[u8]) -> Result<u64> {
+pub(super) fn delete(
+    file: &mut PageFile,
+    tree: TreeId,
+    root: u64,
+    key: &[u8],
+) -> Result<u64> {
     check_key(key)?;
     if root == 0 {
         return Ok(0);
@@ -356,7 +374,12 @@ fn child_list(
         .collect())
 }
 
-fn minimum(reader: &PageReader, tree: TreeId, mut id: u64, mut expected: u8) -> Result<Vec<u8>> {
+fn minimum(
+    reader: &PageReader,
+    tree: TreeId,
+    mut id: u64,
+    mut expected: u8,
+) -> Result<Vec<u8>> {
     loop {
         match load(reader, tree, id, Some(expected))? {
             Node::Leaf(cells) => return Ok(cells[0].key.clone()),
@@ -370,7 +393,11 @@ fn minimum(reader: &PageReader, tree: TreeId, mut id: u64, mut expected: u8) -> 
     }
 }
 
-fn write_leaves(file: &mut PageFile, tree: TreeId, mut cells: Vec<LeafCell>) -> Result<Edit> {
+fn write_leaves(
+    file: &mut PageFile,
+    tree: TreeId,
+    mut cells: Vec<LeafCell>,
+) -> Result<Edit> {
     let mut children = Vec::new();
     if cells.is_empty() {
         return Ok(Edit { level: 0, children });
@@ -396,7 +423,10 @@ fn write_leaves(file: &mut PageFile, tree: TreeId, mut cells: Vec<LeafCell>) -> 
     Ok(Edit { level: 0, children })
 }
 
-fn internal(level: u8, children: &[Child]) -> Node {
+fn internal(
+    level: u8,
+    children: &[Child],
+) -> Node {
     Node::Internal {
         level,
         keys: children[1..]
@@ -438,7 +468,10 @@ fn write_internal(
     })
 }
 
-fn split_point(sizes: &[usize], internal: bool) -> Result<usize> {
+fn split_point(
+    sizes: &[usize],
+    internal: bool,
+) -> Result<usize> {
     let minimum = if internal { 2 } else { 1 };
     let total = sizes.iter().sum::<usize>();
     let mut left = 0;
@@ -462,7 +495,11 @@ fn split_point(sizes: &[usize], internal: bool) -> Result<usize> {
 }
 
 /// Checks every reachable node and overflow page, including unique ownership.
-pub(super) fn validate(reader: &PageReader, tree: TreeId, root: u64) -> Result<()> {
+pub(super) fn validate(
+    reader: &PageReader,
+    tree: TreeId,
+    root: u64,
+) -> Result<()> {
     if root != 0 {
         validate_subtree(reader, tree, root, None, &mut HashSet::new())?;
     }
@@ -508,7 +545,12 @@ fn validate_subtree(
     }
 }
 
-fn load(reader: &PageReader, tree: TreeId, id: u64, expected: Option<u8>) -> Result<Node> {
+fn load(
+    reader: &PageReader,
+    tree: TreeId,
+    id: u64,
+    expected: Option<u8>,
+) -> Result<Node> {
     let node = reader.node(tree, id)?;
     if expected.is_some_and(|expected| node.level() != expected) {
         return Err(Error::Corrupt("child level does not decrease by one"));
@@ -516,7 +558,10 @@ fn load(reader: &PageReader, tree: TreeId, id: u64, expected: Option<u8>) -> Res
     Ok(node)
 }
 
-fn route(keys: &[Vec<u8>], key: &[u8]) -> usize {
+fn route(
+    keys: &[Vec<u8>],
+    key: &[u8],
+) -> usize {
     keys.partition_point(|separator| separator.as_slice() <= key)
 }
 
@@ -529,17 +574,24 @@ fn check_key(key: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs::File};
+    use std::collections::BTreeMap;
+    use std::fs::File;
 
-    use super::super::page::{INLINE_LIMIT, PAYLOAD_SIZE, Value};
-    use super::super::platform::{read_exact_at, write_all_at};
+    use super::super::page::INLINE_LIMIT;
+    use super::super::page::PAYLOAD_SIZE;
+    use super::super::page::Value;
+    use super::super::platform::read_exact_at;
+    use super::super::platform::write_all_at;
     use super::*;
 
     fn create() -> PageFile {
         PageFile::create(tempfile::tempfile().unwrap(), [1; 16], 1).unwrap()
     }
 
-    fn entries(reader: &PageReader, root: u64) -> Vec<Entry> {
+    fn entries(
+        reader: &PageReader,
+        root: u64,
+    ) -> Vec<Entry> {
         scan(
             reader,
             TreeId::State,
@@ -552,7 +604,11 @@ mod tests {
         .unwrap()
     }
 
-    fn compare(file: &PageFile, root: u64, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
+    fn compare(
+        file: &PageFile,
+        root: u64,
+        model: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) {
         let reader = file.reader();
         validate(&reader, TreeId::State, root).unwrap();
         assert_eq!(
@@ -577,7 +633,10 @@ mod tests {
         *seed >> 16
     }
 
-    fn shuffle(ids: &mut [u64], seed: &mut u64) {
+    fn shuffle(
+        ids: &mut [u64],
+        seed: &mut u64,
+    ) {
         for index in (1..ids.len()).rev() {
             ids.swap(index, random(seed) as usize % (index + 1));
         }
@@ -872,7 +931,10 @@ mod tests {
         }
     }
 
-    fn leaf(file: &mut PageFile, keys: &[&[u8]]) -> u64 {
+    fn leaf(
+        file: &mut PageFile,
+        keys: &[&[u8]],
+    ) -> u64 {
         let mut cells = Vec::with_capacity(keys.len());
         for key in keys {
             cells.push(LeafCell {
@@ -883,7 +945,12 @@ mod tests {
         file.append_node(TreeId::State, &Node::Leaf(cells)).unwrap()
     }
 
-    fn branch(file: &mut PageFile, level: u8, keys: &[&[u8]], children: Vec<u64>) -> u64 {
+    fn branch(
+        file: &mut PageFile,
+        level: u8,
+        keys: &[&[u8]],
+        children: Vec<u64>,
+    ) -> u64 {
         file.append_node(
             TreeId::State,
             &Node::Internal {
@@ -1045,7 +1112,12 @@ mod tests {
         validate(&file.reader(), TreeId::State, a).unwrap();
     }
 
-    fn corrupt(file: &File, id: u64, offset: usize, data: &[u8]) {
+    fn corrupt(
+        file: &File,
+        id: u64,
+        offset: usize,
+        data: &[u8],
+    ) {
         let mut bytes = [0u8; PAGE_SIZE];
         read_exact_at(file, &mut bytes, id * PAGE_SIZE as u64).unwrap();
         bytes[offset..offset + data.len()].copy_from_slice(data);

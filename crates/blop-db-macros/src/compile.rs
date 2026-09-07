@@ -1,14 +1,28 @@
 use std::collections::HashMap;
 
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::Span;
+use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Block, Expr, Ident, Pat, Path, Result, Stmt, parse::Parser, spanned::Spanned};
+use syn::Block;
+use syn::Expr;
+use syn::Ident;
+use syn::Pat;
+use syn::Path;
+use syn::Result;
+use syn::Stmt;
+use syn::parse::Parser;
+use syn::spanned::Spanned;
 
-use crate::{
-    bytecode::{self, Instruction, pool_index},
-    syntax::{Program, validate_name},
-    types::{Type, parse_type, validate_type},
+use crate::bytecode::Instruction;
+use crate::bytecode::pool_index;
+use crate::bytecode::{
+    self,
 };
+use crate::syntax::Program;
+use crate::syntax::validate_name;
+use crate::types::Type;
+use crate::types::parse_type;
+use crate::types::validate_type;
 
 mod expr;
 mod intrinsics;
@@ -38,14 +52,23 @@ struct Compiler {
 }
 
 impl Compiler {
-    fn register(&mut self, ty: Type, span: Span) -> Result<u16> {
+    fn register(
+        &mut self,
+        ty: Type,
+        span: Span,
+    ) -> Result<u16> {
         validate_type(&ty, true, span)?;
         let register = pool_index(self.registers.len(), span)?;
         self.registers.push(ty);
         Ok(register)
     }
 
-    fn emit(&mut self, opcode: u8, operands: &[u16], span: Span) -> Result<usize> {
+    fn emit(
+        &mut self,
+        opcode: u8,
+        operands: &[u16],
+        span: Span,
+    ) -> Result<usize> {
         pool_index(self.instructions.len(), span)?;
         let index = self.instructions.len();
         self.instructions.push(Instruction {
@@ -56,7 +79,11 @@ impl Compiler {
         Ok(index)
     }
 
-    fn jump(&mut self, condition: Option<u16>, span: Span) -> Result<usize> {
+    fn jump(
+        &mut self,
+        condition: Option<u16>,
+        span: Span,
+    ) -> Result<usize> {
         let index = if let Some(condition) = condition {
             self.emit(0x61, &[condition], span)?
         } else {
@@ -66,14 +93,20 @@ impl Compiler {
         Ok(index)
     }
 
-    fn patch_jump(&mut self, index: usize) {
+    fn patch_jump(
+        &mut self,
+        index: usize,
+    ) {
         let target = self.instructions.len() as u32;
         let operands = &mut self.instructions[index].operands;
         let offset = operands.len() - 4;
         operands[offset..].copy_from_slice(&target.to_le_bytes());
     }
 
-    fn ty(&self, register: u16) -> &Type {
+    fn ty(
+        &self,
+        register: u16,
+    ) -> &Type {
         &self.registers[usize::from(register)]
     }
 }
@@ -172,7 +205,12 @@ pub fn compile(program: Program) -> Result<TokenStream> {
     }})
 }
 
-fn encode_capture(ty: &Type, source: TokenStream, out: &Ident, runtime: &Path) -> TokenStream {
+fn encode_capture(
+    ty: &Type,
+    source: TokenStream,
+    out: &Ident,
+    runtime: &Path,
+) -> TokenStream {
     match ty {
         Type::Unit => quote! { let _: &() = #source; },
         Type::Bool => {
@@ -207,7 +245,10 @@ fn encode_capture(ty: &Type, source: TokenStream, out: &Ident, runtime: &Path) -
     }
 }
 
-fn compile_block(compiler: &mut Compiler, block: &Block) -> Result<bool> {
+fn compile_block(
+    compiler: &mut Compiler,
+    block: &Block,
+) -> Result<bool> {
     let outer = compiler.locals.clone();
     let mut terminated = false;
     for statement in &block.stmts {
@@ -223,7 +264,10 @@ fn compile_block(compiler: &mut Compiler, block: &Block) -> Result<bool> {
     Ok(terminated)
 }
 
-fn compile_statement(compiler: &mut Compiler, statement: &Stmt) -> Result<bool> {
+fn compile_statement(
+    compiler: &mut Compiler,
+    statement: &Stmt,
+) -> Result<bool> {
     match statement {
         Stmt::Local(local) => {
             let (pattern, annotation) = match &local.pat {
@@ -277,7 +321,10 @@ fn compile_statement(compiler: &mut Compiler, statement: &Stmt) -> Result<bool> 
     }
 }
 
-fn compile_statement_expr(compiler: &mut Compiler, expression: &Expr) -> Result<bool> {
+fn compile_statement_expr(
+    compiler: &mut Compiler,
+    expression: &Expr,
+) -> Result<bool> {
     let span = expression.span();
     match expression {
         Expr::If(branch) => {
@@ -476,7 +523,12 @@ fn assign_value(
     Ok(())
 }
 
-fn constant(compiler: &mut Compiler, ty: Type, bytes: Vec<u8>, span: Span) -> Result<u16> {
+fn constant(
+    compiler: &mut Compiler,
+    ty: Type,
+    bytes: Vec<u8>,
+    span: Span,
+) -> Result<u16> {
     let index = pool_index(compiler.constants.len(), span)?;
     let register = compiler.register(ty.clone(), span)?;
     compiler.constants.push((ty, bytes));
@@ -497,7 +549,10 @@ fn path_name(expression: &Expr) -> Result<String> {
     ))
 }
 
-fn table_info(compiler: &Compiler, expression: &Expr) -> Result<TableInfo> {
+fn table_info(
+    compiler: &Compiler,
+    expression: &Expr,
+) -> Result<TableInfo> {
     let name = path_name(expression)?;
     compiler.tables.get(&name).cloned().ok_or_else(|| {
         syn::Error::new(
@@ -507,7 +562,10 @@ fn table_info(compiler: &Compiler, expression: &Expr) -> Result<TableInfo> {
     })
 }
 
-fn address(compiler: &mut Compiler, expression: &Expr) -> Result<(TableInfo, u16)> {
+fn address(
+    compiler: &mut Compiler,
+    expression: &Expr,
+) -> Result<(TableInfo, u16)> {
     let Expr::Index(index) = expression else {
         return Err(syn::Error::new(expression.span(), "expected table[key]"));
     };
@@ -529,7 +587,10 @@ fn emit_table(
     Ok(index)
 }
 
-fn immediate(expression: &Expr, max: u64) -> Result<u64> {
+fn immediate(
+    expression: &Expr,
+    max: u64,
+) -> Result<u64> {
     if let Expr::Lit(literal) = expression
         && let syn::Lit::Int(integer) = &literal.lit
     {
@@ -544,7 +605,11 @@ fn immediate(expression: &Expr, max: u64) -> Result<u64> {
     ))
 }
 
-fn require_shape(actual: &Type, expected: &Type, span: Span) -> Result<()> {
+fn require_shape(
+    actual: &Type,
+    expected: &Type,
+    span: Span,
+) -> Result<()> {
     if !actual.same_shape(expected) {
         return Err(syn::Error::new(
             span,
@@ -688,7 +753,8 @@ mod tests {
                 "unsigned integer literal",
             ),
             (
-                "tables { t: u64 => i64 = 1 } let r = scan_bounded(t, 0, 1, 0, 1, 1); return r == r;",
+                "tables { t: u64 => i64 = 1 } let r = scan_bounded(t, 0, 1, 0, 1, 1); return r == \
+                 r;",
                 "invalid VM operands",
             ),
         ] {

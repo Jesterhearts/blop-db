@@ -7,8 +7,16 @@
 
 use std::ops::Bound;
 
-use super::encoding::{MAX_KEY_BYTES, MAX_VALUE_BYTES, escape, unescape};
-use super::{Entry, Error, Result, Scan, TreeId, View};
+use super::Entry;
+use super::Error;
+use super::Result;
+use super::Scan;
+use super::TreeId;
+use super::View;
+use super::encoding::MAX_KEY_BYTES;
+use super::encoding::MAX_VALUE_BYTES;
+use super::encoding::escape;
+use super::encoding::unescape;
 
 const MAX_STATE_KEY_BYTES: usize = 8 + 2 * MAX_KEY_BYTES + 2 + 8;
 
@@ -21,7 +29,11 @@ pub struct StateKey {
 }
 
 impl StateKey {
-    pub fn new(table_id: u64, key: Vec<u8>, sequence: u64) -> Result<Self> {
+    pub fn new(
+        table_id: u64,
+        key: Vec<u8>,
+        sequence: u64,
+    ) -> Result<Self> {
         check_snapshot(table_id, sequence)?;
         check_key(&key)?;
         if sequence <= table_id {
@@ -110,7 +122,10 @@ fn value_payload(encoded: &[u8]) -> Result<Option<&[u8]>> {
     Ok(Some(&encoded[5..]))
 }
 
-fn check_snapshot(table_id: u64, sequence: u64) -> Result<()> {
+fn check_snapshot(
+    table_id: u64,
+    sequence: u64,
+) -> Result<()> {
     if table_id == 0 || table_id == u64::MAX {
         return Err(Error::InvalidInput("invalid state table ID"));
     }
@@ -127,21 +142,32 @@ fn check_key(key: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn address_prefix(table_id: u64, key: &[u8]) -> Vec<u8> {
+fn address_prefix(
+    table_id: u64,
+    key: &[u8],
+) -> Vec<u8> {
     let mut prefix = table_id.to_be_bytes().to_vec();
     prefix.extend_from_slice(&escape(key));
     prefix
 }
 
-fn seek_key(table_id: u64, key: &[u8], sequence: u64) -> Vec<u8> {
+fn seek_key(
+    table_id: u64,
+    key: &[u8],
+    sequence: u64,
+) -> Vec<u8> {
     let mut encoded = address_prefix(table_id, key);
     encoded.extend_from_slice(&(!sequence).to_be_bytes());
     encoded
 }
 
-fn after_key(table_id: u64, key: &[u8]) -> Vec<u8> {
+fn after_key(
+    table_id: u64,
+    key: &[u8],
+) -> Vec<u8> {
     let mut end = address_prefix(table_id, key);
-    // Replacing the terminator's last 00 by 01 skips every version, but no extension of the key.
+    // Replacing the terminator's last 00 by 01 skips every version, but no
+    // extension of the key.
     *end.last_mut().unwrap() = 1;
     end
 }
@@ -153,11 +179,18 @@ fn corrupt_input(error: Error) -> Error {
     }
 }
 
-/// Return the newest Put at or before `sequence`; a tombstone is terminal absence.
+/// Return the newest Put at or before `sequence`; a tombstone is terminal
+/// absence.
 ///
-/// The caller protects the snapshot and checks table liveness and schema validity.
-/// Sequence zero is a valid seek bound even though it is not a stored row version.
-pub fn get(view: &View, table: u64, key: &[u8], sequence: u64) -> Result<Option<Vec<u8>>> {
+/// The caller protects the snapshot and checks table liveness and schema
+/// validity. Sequence zero is a valid seek bound even though it is not a stored
+/// row version.
+pub fn get(
+    view: &View,
+    table: u64,
+    key: &[u8],
+    sequence: u64,
+) -> Result<Option<Vec<u8>>> {
     check_snapshot(table, sequence)?;
     check_key(key)?;
     let lower = seek_key(table, key, sequence);
@@ -184,9 +217,10 @@ pub fn get(view: &View, table: u64, key: &[u8], sequence: u64) -> Result<Option<
 
 /// A lazy scan of logical `(canonical_key, schema_encoded_value)` entries.
 ///
-/// Owns the physical scan's pinned reader, not a borrowed view or complete result
-/// set. Every consumed physical key and value frame is validated, including
-/// invisible and obsolete versions. Schema validation belongs to the caller.
+/// Owns the physical scan's pinned reader, not a borrowed view or complete
+/// result set. Every consumed physical key and value frame is validated,
+/// including invisible and obsolete versions. Schema validation belongs to the
+/// caller.
 pub struct StateScan {
     physical: Scan,
     table_id: u64,
@@ -195,7 +229,8 @@ pub struct StateScan {
     done: bool,
 }
 
-/// Scan a table at a caller-protected sequence, without catalogue or overlay handling.
+/// Scan a table at a caller-protected sequence, without catalogue or overlay
+/// handling.
 pub fn scan(
     view: &View,
     table: u64,
@@ -289,7 +324,13 @@ impl std::iter::FusedIterator for StateScan {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Genesis, LimitPolicy, Mutation, Store, apply, create, view};
+    use crate::storage::Genesis;
+    use crate::storage::LimitPolicy;
+    use crate::storage::Mutation;
+    use crate::storage::Store;
+    use crate::storage::apply;
+    use crate::storage::create;
+    use crate::storage::view;
 
     fn create_store() -> (tempfile::TempDir, Store) {
         let directory = tempfile::tempdir().unwrap();
@@ -301,7 +342,12 @@ mod tests {
         (directory, store)
     }
 
-    fn mutation(table: u64, key: &[u8], sequence: u64, value: StateValue) -> Mutation {
+    fn mutation(
+        table: u64,
+        key: &[u8],
+        sequence: u64,
+        value: StateValue,
+    ) -> Mutation {
         Mutation {
             tree: TreeId::State,
             key: StateKey::new(table, key.to_vec(), sequence)

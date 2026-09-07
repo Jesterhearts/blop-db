@@ -1,8 +1,20 @@
 use proc_macro2::Span;
-use syn::{BinOp, Expr, Lit, Result, UnOp, spanned::Spanned};
+use syn::BinOp;
+use syn::Expr;
+use syn::Lit;
+use syn::Result;
+use syn::UnOp;
+use syn::spanned::Spanned;
 
-use super::{Compiler, address, constant, emit_table, intrinsics, path_name, require_shape};
-use crate::{bytecode::blob, types::Type};
+use super::Compiler;
+use super::address;
+use super::constant;
+use super::emit_table;
+use super::intrinsics;
+use super::path_name;
+use super::require_shape;
+use crate::bytecode::blob;
+use crate::types::Type;
 
 pub(super) fn compile_expr(
     compiler: &mut Compiler,
@@ -143,7 +155,8 @@ pub(super) fn compile_expr(
         _ => {
             return Err(syn::Error::new(
                 span,
-                "unsupported VM expression; loops, Rust calls, casts, and value-producing blocks are not allowed",
+                "unsupported VM expression; loops, Rust calls, casts, and value-producing blocks \
+                 are not allowed",
             ));
         }
     };
@@ -153,7 +166,11 @@ pub(super) fn compile_expr(
     Ok(register)
 }
 
-fn compile_literal(compiler: &mut Compiler, literal: &Lit, expected: Option<&Type>) -> Result<u16> {
+fn compile_literal(
+    compiler: &mut Compiler,
+    literal: &Lit,
+    expected: Option<&Type>,
+) -> Result<u16> {
     let span = literal.span();
     let (ty, bytes) = match literal {
         Lit::Bool(value) => (Type::Bool, vec![u8::from(value.value)]),
@@ -198,7 +215,10 @@ fn compile_literal(compiler: &mut Compiler, literal: &Lit, expected: Option<&Typ
     constant(compiler, ty, bytes, span)
 }
 
-pub(super) fn type_hint(compiler: &Compiler, expression: &Expr) -> Option<Type> {
+pub(super) fn type_hint(
+    compiler: &Compiler,
+    expression: &Expr,
+) -> Option<Type> {
     match expression {
         Expr::Paren(paren) => type_hint(compiler, &paren.expr),
         Expr::Group(group) => type_hint(compiler, &group.expr),

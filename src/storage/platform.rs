@@ -1,21 +1,31 @@
-//! Filesystem operations whose platform semantics matter to storage correctness.
+//! Filesystem operations whose platform semantics matter to storage
+//! correctness.
 //!
-//! Offset I/O must not be mixed with cursor-based I/O on the same handle: Windows offset
-//! operations also change the cursor. Handles must be synchronous and opened without append.
-//! Publication callers serialize namespace changes and supply paths in one directory.
+//! Offset I/O must not be mixed with cursor-based I/O on the same handle:
+//! Windows offset operations also change the cursor. Handles must be
+//! synchronous and opened without append. Publication callers serialize
+//! namespace changes and supply paths in one directory.
 
-use std::{fs::File, fs::OpenOptions, io, path::Path};
-
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
-use std::os::windows::{
-    ffi::OsStrExt,
-    fs::{FileExt, OpenOptionsExt},
-};
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+use std::path::Path;
 
-/// Complete an offset read, retrying interruptions and reporting short files explicitly.
-pub(super) fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
+/// Complete an offset read, retrying interruptions and reporting short files
+/// explicitly.
+pub(super) fn read_exact_at(
+    file: &File,
+    mut bytes: &mut [u8],
+    mut offset: u64,
+) -> io::Result<()> {
     check_range(offset, bytes.len())?;
     while !bytes.is_empty() {
         #[cfg(unix)]
@@ -36,7 +46,11 @@ pub(super) fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) 
 }
 
 /// Complete an offset write without consulting the handle's current cursor.
-pub(super) fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> io::Result<()> {
+pub(super) fn write_all_at(
+    file: &File,
+    mut bytes: &[u8],
+    mut offset: u64,
+) -> io::Result<()> {
     check_range(offset, bytes.len())?;
     while !bytes.is_empty() {
         #[cfg(unix)]
@@ -56,7 +70,10 @@ pub(super) fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> io
     Ok(())
 }
 
-fn check_range(offset: u64, length: usize) -> io::Result<()> {
+fn check_range(
+    offset: u64,
+    length: usize,
+) -> io::Result<()> {
     if offset
         .checked_add(length as u64)
         .is_none_or(|end| end > i64::MAX as u64)
@@ -88,7 +105,8 @@ pub(super) fn open_directory(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-        // Directory handles need this flag; FlushFileBuffers requires GENERIC_WRITE.
+        // Directory handles need this flag; FlushFileBuffers requires
+        // GENERIC_WRITE.
         options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
     }
     let file = options.open(path)?;
@@ -98,16 +116,21 @@ pub(super) fn open_directory(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Never substitute a no-op when a filesystem does not support directory flushing.
+/// Never substitute a no-op when a filesystem does not support directory
+/// flushing.
 pub(super) fn sync_directory(directory: &File) -> io::Result<()> {
     directory.sync_all()
 }
 
 /// Replace a name without a delete-first gap or cross-volume copy fallback.
 ///
-/// The caller flushes the source first and the directory afterwards. Windows write-through
-/// is additional protection, not a substitute for the directory flush or crash testing.
-pub(super) fn rename(source: &Path, destination: &Path) -> io::Result<()> {
+/// The caller flushes the source first and the directory afterwards. Windows
+/// write-through is additional protection, not a substitute for the directory
+/// flush or crash testing.
+pub(super) fn rename(
+    source: &Path,
+    destination: &Path,
+) -> io::Result<()> {
     if source.parent().is_none() || source.parent() != destination.parent() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -120,12 +143,13 @@ pub(super) fn rename(source: &Path, destination: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        };
+        use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
+        use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
         let source = wide_path(source)?;
         let destination = wide_path(destination)?;
-        // SAFETY: Both paths are live, NUL-terminated UTF-16 buffers without interior NULs.
+        // SAFETY: Both paths are live, NUL-terminated UTF-16 buffers without
+        // interior NULs.
         let result = unsafe {
             MoveFileExW(
                 source.as_ptr(),

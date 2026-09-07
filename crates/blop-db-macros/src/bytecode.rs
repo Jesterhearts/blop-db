@@ -1,7 +1,8 @@
 use proc_macro2::Span;
 use syn::Result;
 
-use crate::types::{Type, VALUE_LIMIT};
+use crate::types::Type;
+use crate::types::VALUE_LIMIT;
 
 pub struct Instruction {
     pub opcode: u8,
@@ -15,7 +16,10 @@ pub struct Encoded {
     pub patches: Vec<(usize, u16)>,
 }
 
-pub fn pool_index(len: usize, span: Span) -> Result<u16> {
+pub fn pool_index(
+    len: usize,
+    span: Span,
+) -> Result<u16> {
     if len >= 65_535 {
         Err(syn::Error::new(
             span,
@@ -97,7 +101,10 @@ pub fn encode(
     })
 }
 
-pub fn blob(value: &[u8], out: &mut Vec<u8>) -> Result<()> {
+pub fn blob(
+    value: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
     if value.len() > VALUE_LIMIT as usize || out.len() + 4 + value.len() > VALUE_LIMIT as usize {
         return Err(syn::Error::new(
             Span::call_site(),

@@ -1,19 +1,36 @@
-use std::{
-    fs::{self, File, OpenOptions, TryLockError},
-    io::{Read, Write},
-    ops::Bound,
-    path::{Path, PathBuf},
-    sync::Arc,
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::fs::TryLockError;
+use std::fs::{
+    self,
 };
+use std::io::Read;
+use std::io::Write;
+use std::ops::Bound;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+use sha2::Sha256;
 
-use super::{
-    Current, Entry, Error, Genesis, LimitPolicy, Manifest, Result, TreeId, metadata,
-    mvcc::{StateKey, StateValue},
-    page::{MAX_KEY, MAX_VALUE, PageFile, PageReader},
-    platform, tree,
-};
+use super::Current;
+use super::Entry;
+use super::Error;
+use super::Genesis;
+use super::LimitPolicy;
+use super::Manifest;
+use super::Result;
+use super::TreeId;
+use super::metadata;
+use super::mvcc::StateKey;
+use super::mvcc::StateValue;
+use super::page::MAX_KEY;
+use super::page::MAX_VALUE;
+use super::page::PageFile;
+use super::page::PageReader;
+use super::platform;
+use super::tree;
 
 const TREES: [TreeId; 5] = [
     TreeId::State,
@@ -25,7 +42,8 @@ const TREES: [TreeId; 5] = [
 
 /// The exclusive directory owner and its latest installed physical roots.
 ///
-/// Mutating functions require exclusive access. Views and scans can be read concurrently.
+/// Mutating functions require exclusive access. Views and scans can be read
+/// concurrently.
 pub struct Store {
     directory: PathBuf,
     lease: Arc<File>,
@@ -52,7 +70,8 @@ impl Store {
     }
 }
 
-/// An immutable, pinned physical root set. It may contain versions above the public frontier.
+/// An immutable, pinned physical root set. It may contain versions above the
+/// public frontier.
 #[derive(Clone)]
 pub struct View {
     reader: PageReader,
@@ -60,10 +79,12 @@ pub struct View {
     roots: [u64; 5],
 }
 
-/// One physical edit. `None` removes an entry, rather than installing an MVCC tombstone.
+/// One physical edit. `None` removes an entry, rather than installing an MVCC
+/// tombstone.
 ///
-/// The engine must validate system values, schemas and complete outcomes before installation.
-/// For an MVCC deletion, put an encoded [`StateValue::Delete`] at its versioned key.
+/// The engine must validate system values, schemas and complete outcomes before
+/// installation. For an MVCC deletion, put an encoded [`StateValue::Delete`] at
+/// its versioned key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mutation {
     pub tree: TreeId,
@@ -87,10 +108,12 @@ impl Iterator for Scan {
 
 impl std::iter::FusedIterator for Scan {}
 
-/// Create a new directory, without initializing over any existing directory or crash output.
+/// Create a new directory, without initializing over any existing directory or
+/// crash output.
 ///
-/// Both identities must be nonzero and selected uniquely by the caller outside transaction code.
-/// On failure, an incomplete directory may remain and must not be opened as an empty database.
+/// Both identities must be nonzero and selected uniquely by the caller outside
+/// transaction code. On failure, an incomplete directory may remain and must
+/// not be opened as an empty database.
 pub fn create(
     path: impl AsRef<Path>,
     genesis: Genesis,
@@ -160,12 +183,14 @@ pub fn create(
     Ok(store)
 }
 
-/// Restore exactly the CURRENT-selected checkpoint and validate its reachable physical storage.
+/// Restore exactly the CURRENT-selected checkpoint and validate its reachable
+/// physical storage.
 ///
-/// Extra files are not alternative authorities. Unpublished page and active-log tails are
-/// truncated only after validation. Committed corruption never triggers checkpoint fallback.
-/// This does not replay `(checkpoint_sequence, durable_sequence]`; the engine must do that
-/// before serving public reads or resuming transaction execution.
+/// Extra files are not alternative authorities. Unpublished page and active-log
+/// tails are truncated only after validation. Committed corruption never
+/// triggers checkpoint fallback. This does not replay `(checkpoint_sequence,
+/// durable_sequence]`; the engine must do that before serving public reads or
+/// resuming transaction execution.
 pub fn open(path: impl AsRef<Path>) -> Result<Store> {
     let directory = fs::canonicalize(path)?;
     let lease = lock(&directory)?;
@@ -221,7 +246,8 @@ pub fn open(path: impl AsRef<Path>) -> Result<Store> {
     })
 }
 
-/// Pin the latest installed roots, including any materialization above the checkpoint.
+/// Pin the latest installed roots, including any materialization above the
+/// checkpoint.
 pub fn view(store: &Store) -> View {
     View {
         reader: store.pages.reader(),
@@ -238,22 +264,36 @@ pub fn checkpoint_view(store: &Store) -> View {
     }
 }
 
-pub fn get(view: &View, tree: TreeId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+pub fn get(
+    view: &View,
+    tree: TreeId,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>> {
     tree::get(&view.reader, tree, view.roots[tree.index()], key)
 }
 
-pub fn scan(view: &View, tree: TreeId, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<Scan> {
+pub fn scan(
+    view: &View,
+    tree: TreeId,
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+) -> Result<Scan> {
     Ok(Scan {
         inner: tree::scan(&view.reader, tree, view.roots[tree.index()], lower, upper)?,
         _lease: Arc::clone(&view.lease),
     })
 }
 
-/// Install an entire physical batch against the latest roots, or leave those roots unchanged.
+/// Install an entire physical batch against the latest roots, or leave those
+/// roots unchanged.
 ///
-/// This is not a database write transaction and does not publish durability or visibility.
-/// The caller includes all final versions and their complete outcome in the same batch.
-pub fn apply(store: &mut Store, changes: &[Mutation]) -> Result<()> {
+/// This is not a database write transaction and does not publish durability or
+/// visibility. The caller includes all final versions and their complete
+/// outcome in the same batch.
+pub fn apply(
+    store: &mut Store,
+    changes: &[Mutation],
+) -> Result<()> {
     writable(store)?;
     for change in changes {
         if change.key.len() > MAX_KEY || change.value.as_ref().is_some_and(|v| v.len() > MAX_VALUE)
@@ -282,11 +322,16 @@ pub fn apply(store: &mut Store, changes: &[Mutation]) -> Result<()> {
     Ok(())
 }
 
-/// Build a separate checkpoint root set, excluding all logical entries above `sequence`.
+/// Build a separate checkpoint root set, excluding all logical entries above
+/// `sequence`.
 ///
-/// Live roots are not changed. Older history is retained conservatively, without GC.
-/// The caller must establish that the selected sequence is a contiguous resolved prefix.
-pub fn prepare_checkpoint(store: &mut Store, sequence: u64) -> Result<View> {
+/// Live roots are not changed. Older history is retained conservatively,
+/// without GC. The caller must establish that the selected sequence is a
+/// contiguous resolved prefix.
+pub fn prepare_checkpoint(
+    store: &mut Store,
+    sequence: u64,
+) -> Result<View> {
     writable(store)?;
     if sequence < store.manifest.checkpoint_sequence || sequence == u64::MAX {
         return Err(Error::InvalidInput("invalid checkpoint sequence"));
@@ -315,16 +360,23 @@ pub fn prepare_checkpoint(store: &mut Store, sequence: u64) -> Result<View> {
 
 /// Durably publish a complete checkpoint root set and engine-supplied metadata.
 ///
-/// Start `manifest` from the latest [`Store::manifest`], then update only frontiers, log
-/// descriptors and next cursor/segment IDs. Page identity, roots, page count and the next
-/// generation are managed here. Stale manifests and views from another owner are rejected.
+/// Start `manifest` from the latest [`Store::manifest`], then update only
+/// frontiers, log descriptors and next cursor/segment IDs. Page identity,
+/// roots, page count and the next generation are managed here. Stale manifests
+/// and views from another owner are rejected.
 ///
-/// This validates physical storage, system framing, log envelopes and monotonic metadata.
-/// It cannot prove that the engine executed a log prefix correctly or protected every active
-/// retention claim. Log bodies, schemas, outcomes and catalogue semantics remain engine inputs.
-/// No logical log is written here: supplied segment prefixes must already exist in the directory.
-/// Any publication I/O failure requires dropping handles and reopening, not retrying blindly.
-pub fn publish(store: &mut Store, checkpoint: &View, mut manifest: Manifest) -> Result<()> {
+/// This validates physical storage, system framing, log envelopes and monotonic
+/// metadata. It cannot prove that the engine executed a log prefix correctly or
+/// protected every active retention claim. Log bodies, schemas, outcomes and
+/// catalogue semantics remain engine inputs. No logical log is written here:
+/// supplied segment prefixes must already exist in the directory.
+/// Any publication I/O failure requires dropping handles and reopening, not
+/// retrying blindly.
+pub fn publish(
+    store: &mut Store,
+    checkpoint: &View,
+    mut manifest: Manifest,
+) -> Result<()> {
     writable(store)?;
     if !Arc::ptr_eq(&store.lease, &checkpoint.lease) {
         return Err(Error::InvalidInput(
@@ -337,7 +389,8 @@ pub fn publish(store: &mut Store, checkpoint: &View, mut manifest: Manifest) -> 
     }
     manifest.generation = next_generation(store)?;
     manifest.roots = checkpoint.roots;
-    // Even a previously pinned root must not roll back allocation of published page IDs.
+    // Even a previously pinned root must not roll back allocation of published
+    // page IDs.
     manifest.page_count = store.pages.page_count();
     manifest.encode()?;
     validate_checkpoint(&checkpoint.reader, &manifest, &store.genesis)?;
@@ -359,7 +412,10 @@ fn writable(store: &Store) -> Result<()> {
     }
 }
 
-fn validate_transition(store: &Store, next: &Manifest) -> Result<()> {
+fn validate_transition(
+    store: &Store,
+    next: &Manifest,
+) -> Result<()> {
     let old = &store.manifest;
     if next.generation != old.generation
         || next.database_id != old.database_id
@@ -408,10 +464,14 @@ fn validate_transition(store: &Store, next: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn validate_anchors(store: &Store, next: &Manifest) -> Result<()> {
+fn validate_anchors(
+    store: &Store,
+    next: &Manifest,
+) -> Result<()> {
     let old = &store.manifest;
     if next.durable_sequence > old.durable_sequence {
-        // The new retained log must demonstrate extension of the acknowledged old history.
+        // The new retained log must demonstrate extension of the acknowledged
+        // old history.
         let mut anchor = next.clone();
         anchor.checkpoint_sequence = old.durable_sequence;
         anchor.checkpoint_digest = old.durable_digest;
@@ -430,7 +490,10 @@ fn validate_anchors(store: &Store, next: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn entry_sequence(tree: TreeId, key: &[u8]) -> Result<u64> {
+fn entry_sequence(
+    tree: TreeId,
+    key: &[u8],
+) -> Result<u64> {
     let sequence = match tree {
         TreeId::State => StateKey::decode(key).map_err(persisted)?.sequence(),
         TreeId::Catalogue => {
@@ -461,7 +524,11 @@ fn entry_sequence(tree: TreeId, key: &[u8]) -> Result<u64> {
     Ok(sequence)
 }
 
-fn validate_checkpoint(reader: &PageReader, manifest: &Manifest, genesis: &Genesis) -> Result<()> {
+fn validate_checkpoint(
+    reader: &PageReader,
+    manifest: &Manifest,
+    genesis: &Genesis,
+) -> Result<()> {
     for tree in TREES {
         let root = manifest.roots[tree.index()];
         tree::validate(reader, tree, root)?;
@@ -497,7 +564,11 @@ fn validate_checkpoint(reader: &PageReader, manifest: &Manifest, genesis: &Genes
     Ok(())
 }
 
-fn validate_cursor(id: u64, value: &[u8], manifest: &Manifest) -> Result<()> {
+fn validate_cursor(
+    id: u64,
+    value: &[u8],
+    manifest: &Manifest,
+) -> Result<()> {
     if id >= manifest.next_cursor_id || value.len() < 16 || value.len() > 271 {
         return Err(Error::Corrupt("invalid cursor identity or value length"));
     }
@@ -553,7 +624,10 @@ fn authoritative_error(error: std::io::Error) -> Error {
     }
 }
 
-fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>> {
+fn read_bounded(
+    path: &Path,
+    maximum: u64,
+) -> Result<Vec<u8>> {
     let file = File::open(path).map_err(authoritative_error)?;
     if file.metadata()?.len() > maximum {
         return Err(Error::Corrupt("metadata file exceeds its format ceiling"));
@@ -583,14 +657,20 @@ fn next_generation(store: &Store) -> Result<u64> {
     }
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_new(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;
     platform::sync_file(&file)?;
     Ok(())
 }
 
-fn publish_files(store: &mut Store, manifest: &Manifest) -> Result<()> {
+fn publish_files(
+    store: &mut Store,
+    manifest: &Manifest,
+) -> Result<()> {
     let bytes = manifest.encode()?;
     let current = Current {
         generation: manifest.generation,
@@ -657,7 +737,8 @@ fn publication_step(_store: &mut Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{SegmentDescriptor, mvcc};
+    use crate::storage::SegmentDescriptor;
+    use crate::storage::mvcc;
 
     fn new_store() -> (tempfile::TempDir, Store) {
         let directory = tempfile::tempdir().unwrap();
@@ -673,7 +754,10 @@ mod tests {
         (directory, store)
     }
 
-    fn cursor(id: u64, baseline: u64) -> Mutation {
+    fn cursor(
+        id: u64,
+        baseline: u64,
+    ) -> Mutation {
         let mut value = vec![1, 0, 1, 0];
         value.extend_from_slice(&baseline.to_le_bytes());
         value.extend_from_slice(&0_u32.to_le_bytes());
@@ -684,7 +768,11 @@ mod tests {
         }
     }
 
-    fn row(key: &[u8], sequence: u64, value: StateValue) -> Mutation {
+    fn row(
+        key: &[u8],
+        sequence: u64,
+        value: StateValue,
+    ) -> Mutation {
         Mutation {
             tree: TreeId::State,
             key: StateKey::new(1, key.to_vec(), sequence).unwrap().encode(),
@@ -692,15 +780,22 @@ mod tests {
         }
     }
 
-    fn publish_cursors(store: &mut Store, next_cursor_id: u64) -> Result<()> {
+    fn publish_cursors(
+        store: &mut Store,
+        next_cursor_id: u64,
+    ) -> Result<()> {
         let checkpoint = view(store);
         let mut manifest = store.manifest.clone();
         manifest.next_cursor_id = next_cursor_id;
         publish(store, &checkpoint, manifest)
     }
 
-    // The log fixture supplies valid envelopes and policies, without executing any records.
-    fn write_log(store: &Store, count: u64) -> (Manifest, Vec<[u8; 32]>) {
+    // The log fixture supplies valid envelopes and policies, without executing
+    // any records.
+    fn write_log(
+        store: &Store,
+        count: u64,
+    ) -> (Manifest, Vec<[u8; 32]>) {
         let id = store.manifest.next_segment_id;
         let first = store.manifest.durable_sequence + 1;
         let mut bytes = vec![0; 96];
@@ -1102,7 +1197,8 @@ mod tests {
             let value = if tree == TreeId::Policy {
                 store.genesis.initial_policy.encode()
             } else {
-                // Filtering is independent of engine-validated catalogue/outcome payloads.
+                // Filtering is independent of engine-validated
+                // catalogue/outcome payloads.
                 vec![1, 0]
             };
             apply(
@@ -1157,7 +1253,8 @@ mod tests {
         drop(initial);
         drop(checkpoint);
         drop(store);
-        // The retired segment is not an authority and does not supply recovery bytes.
+        // The retired segment is not an authority and does not supply recovery
+        // bytes.
         fs::remove_file(path.join("log-00000000000000000001.bin")).unwrap();
         let reopened = open(&path).unwrap();
         assert_eq!(reopened.manifest.checkpoint_sequence, 3);

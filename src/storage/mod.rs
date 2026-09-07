@@ -1,14 +1,17 @@
-//! Append-only, copy-on-write storage using the version 1 page and publication formats.
+//! Append-only, copy-on-write storage using the version 1 page and publication
+//! formats.
 //!
-//! This is an engine-facing API, not a transaction execution API. Physical batches contain
-//! already-validated system entries. The caller owns catalogue/schema consistency, outcomes,
-//! durability-before-execution, resolved-prefix selection and retention claims. A [`View`]
-//! is an immutable physical root set, not an externally visible database snapshot.
+//! This is an engine-facing API, not a transaction execution API. Physical
+//! batches contain already-validated system entries. The caller owns
+//! catalogue/schema consistency, outcomes, durability-before-execution,
+//! resolved-prefix selection and retention claims. A [`View`] is an immutable
+//! physical root set, not an externally visible database snapshot.
 //!
-//! Durability requires atomic same-directory rename and working file and directory synchronization.
-//! The Windows backend is experimental and has not been runtime-tested; synchronization errors
-//! are propagated, not ignored. One process owns the directory until its store, views and scans
-//! have all been dropped. No VM, sequencer, logical log writer or changefeed is included.
+//! Durability requires atomic same-directory rename and working file and
+//! directory synchronization. The Windows backend is experimental and has not
+//! been runtime-tested; synchronization errors are propagated, not ignored. One
+//! process owns the directory until its store, views and scans have all been
+//! dropped. No VM, sequencer, logical log writer or changefeed is included.
 
 pub mod encoding;
 mod metadata;
@@ -18,13 +21,27 @@ mod platform;
 mod store;
 mod tree;
 
-pub use metadata::{Current, Genesis, LimitPolicy, Manifest, SegmentDescriptor};
-pub use store::{
-    Mutation, Scan, Store, View, apply, checkpoint_view, create, get, open, prepare_checkpoint,
-    publish, scan, view,
-};
+use std::fmt;
+use std::io;
 
-use std::{fmt, io};
+pub use metadata::Current;
+pub use metadata::Genesis;
+pub use metadata::LimitPolicy;
+pub use metadata::Manifest;
+pub use metadata::SegmentDescriptor;
+pub use store::Mutation;
+pub use store::Scan;
+pub use store::Store;
+pub use store::View;
+pub use store::apply;
+pub use store::checkpoint_view;
+pub use store::create;
+pub use store::get;
+pub use store::open;
+pub use store::prepare_checkpoint;
+pub use store::publish;
+pub use store::scan;
+pub use store::view;
 
 /// A physical system-tree identity from storage format 1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,7 +76,10 @@ pub enum Error {
 }
 
 impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "storage I/O error: {error}"),
             Self::Corrupt(reason) => write!(f, "storage corruption: {reason}"),
