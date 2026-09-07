@@ -1,0 +1,9 @@
+[package]
+name    = "blop-db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[lints.clippy]
+too_many_arguments = "allow"
