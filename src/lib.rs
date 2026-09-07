@@ -2,6 +2,9 @@
 
 mod bind;
 
+#[cfg(unix)]
+pub mod storage;
+
 pub use bind::{BuildError, Transaction};
 
 #[doc(hidden)]

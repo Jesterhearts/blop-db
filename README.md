@@ -1,5 +1,8 @@
 # blop-db
 
+This repository contains a transaction compiler and an engine-facing storage layer. It does not yet
+execute database transactions.
+
 `tx!` compiles a small deterministic transaction program to the ISA 1 bytecode specified in
 [`DESIGN.md`](DESIGN.md), appendices A, B and C. Parsing, type checking, register allocation and
 branch resolution happen during Rust compilation. Runtime binding snapshots the captures and
@@ -200,9 +203,94 @@ let value = 1_u64;
 let _ = blop_db::tx! { captures { value: i64 = value } return value; };
 ```
 
+## Storage
+
+`blop_db::storage` implements the physical storage formats in design appendices F and G, with
+canonical key and MVCC encodings from appendix B. This is a low-level engine component, not a
+client-side database write API.
+
+- Append-only, copy-on-write B+ trees use 16 KiB checksummed pages and all five system-tree IDs.
+- Point lookups and lazy ordered scans operate on immutable, pinned roots. Inserts, replacements and
+  physical deletions copy changed paths, including splits and root collapse.
+- Values through 1,024 bytes are inline. Larger values use validated overflow chains, up to the
+  physical 128 MiB ceiling.
+- `apply` installs a complete physical batch against the latest roots. Include a transaction's final
+  state versions and its complete outcome together. The batch does not advance visibility or make
+  anything durable.
+- `view` pins the latest installed roots. `checkpoint_view` pins the published checkpoint roots.
+  Neither is an externally admitted snapshot or proof of a resolved log prefix.
+- `prepare_checkpoint` constructs separate roots that exclude logical versions above a selected
+  sequence, without changing live roots. It conservatively retains all older history.
+- `publish` flushes referenced files, writes an immutable manifest and atomically replaces
+  `CURRENT`. It rejects stale metadata, decreasing frontiers, changed history anchors and stale
+  cursor roots.
+- `open` restores only the selected checkpoint and validates reachable pages and committed log
+  envelopes. Unpublished tails are discarded; corrupt committed data is an error, not a reason to
+  fall back to an older manifest.
+
+Creation requires a **new directory**, an explicit initial limit policy, a unique nonzero database
+ID and a unique nonzero cursor namespace. The caller selects the identities outside transaction
+code.
+
+```rust
+# #[cfg(unix)]
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use blop_db::storage::{self, Genesis, LimitPolicy, TreeId};
+
+# let temporary = tempfile::tempdir()?;
+# let path = temporary.path().join("database");
+# let database_id = [1_u8; 16];
+# let cursor_namespace = [2_u8; 16];
+// Zero is a valid policy limit. Supply the intended 17 resource limits at creation.
+let genesis = Genesis {
+    database_id,
+    initial_policy: LimitPolicy::new([0; 17])?,
+};
+let store = storage::create(&path, genesis, cursor_namespace)?;
+let checkpoint = storage::checkpoint_view(&store);
+let initial_policy = storage::get(&checkpoint, TreeId::Policy, &0_u64.to_be_bytes())?;
+assert_eq!(initial_policy, Some(store.genesis().initial_policy.encode()));
+
+drop(checkpoint);
+drop(store);
+let reopened = storage::open(&path)?;
+assert_eq!(reopened.manifest().checkpoint_sequence, 0);
+# Ok::<(), Box<dyn std::error::Error>>(())
+# }
+# #[cfg(not(unix))]
+# fn main() {}
+```
+
+`storage::encoding::Schema` validates non-Rows schema descriptors. `encode_key` and `decode_key`
+convert between schema value bytes and canonical ordered keys. `storage::mvcc` provides validated
+`StateKey` and `StateValue` framing, sequence-bounded point reads and logical range scans. A
+tombstone stops lookup; it never falls through to an older value. Physical `Mutation::value = None`
+instead removes an entry and is intended for storage maintenance, not a transaction DELETE.
+
+The engine supplies already-validated catalogue and outcome values. It remains responsible for
+table-schema consistency, matching outcomes to state versions, interpreting log bodies, selecting a
+contiguous resolved checkpoint prefix and protecting retention claims. `publish` takes a pinned
+checkpoint view and a clone of the **latest** `Store::manifest()`, with the engine's frontier, log
+descriptor and next-ID updates. Storage manages page identity, roots, page count and manifest
+generation. Newly durable log prefixes must extend the previously published hash-chain anchor.
+
+When `durable_sequence > checkpoint_sequence`, reopening deliberately leaves the durable suffix
+unexecuted. A future execution layer must replay every record in that suffix before serving public
+reads. No VM, scheduler, logical log writer, catalogue operations, cursor lifecycle API, changefeed,
+replication, GC or whole-file compaction is implemented here. Old manifests and unreferenced pages
+are retained rather than reclaimed unsafely.
+
+The storage module is available on Unix targets. Durable storage requires atomic same-directory
+rename and durable file and directory synchronization. An OS lock protects the directory until the
+store and all views and scans have been dropped. After a publication I/O error, the store rejects
+further mutations with `NeedsRecovery`; drop its handles and reopen to establish which publication
+survived.
+
 ## Development
 
 Run `cargo test --workspace`, `cargo +nightly fmt --all -- --check` and
 `cargo clippy --workspace --all-targets -- -D warnings`. Tests compare canonical byte encodings,
 check all 48 ISA 1 opcodes and verify emitted control-flow graphs and definite register
-initialization.
+initialization. Storage tests also cover binary conformance, malformed and truncated objects,
+model-checked tree edits, retained roots, MVCC filtering and injected interruptions at publication
+boundaries. These filesystem interruption tests do not simulate hardware power loss.

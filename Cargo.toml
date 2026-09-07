@@ -12,6 +12,11 @@ too_many_arguments = "allow"
 
 [dependencies]
 blop-db-macros = { path = "crates/blop-db-macros", version = "0.1.0" }
+crc32c         = "0.6.8"
+sha2           = "0.11.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 [lints.clippy]
 too_many_arguments = "allow"
