@@ -5,6 +5,9 @@ mod bind;
 #[cfg(any(unix, windows))]
 pub mod storage;
 
+#[cfg(any(unix, windows))]
+pub mod vm;
+
 pub use bind::BuildError;
 pub use bind::Transaction;
 #[doc(hidden)]

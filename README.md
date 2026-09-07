@@ -1,7 +1,8 @@
 # blop-db
 
-This repository contains a transaction compiler and an engine-facing storage layer. It does not yet
-execute database transactions.
+This repository contains a transaction compiler, a single-threaded reference VM and an engine-facing
+storage layer. The VM executes transactions and atomically materializes their outcomes. It is not
+yet a durable database submission API.
 
 `tx!` compiles a small deterministic transaction program to the ISA 1 bytecode specified in
 [`DESIGN.md`](DESIGN.md), appendices A, B and C. Parsing, type checking, register allocation and
@@ -69,10 +70,10 @@ Changing capture values does not change the program bytes. Changing table IDs ch
 array and its instruction references. Rust functions may produce captures, but they never become VM
 callbacks.
 
-This repository does not yet implement the VM, database execution, access manifests or resource
-claims. These two byte vectors are not the complete logged Transaction body. The future database
-must independently validate bytecode, actual catalogue schemas, scopes and resource claims before
-sequencing. In particular, the macro cannot check whether a runtime table ID names a live table.
+These two byte vectors are not the complete logged Transaction body. The reference VM independently
+validates bytecode, actual catalogue schemas and explicit resource claims before interpreting them.
+The macro alone cannot check whether a runtime table ID names a live table. Access manifest
+derivation, complete log-body admission and durable sequencing remain unimplemented.
 
 ## Types
 
@@ -203,6 +204,88 @@ let value = 1_u64;
 let _ = blop_db::tx! { captures { value: i64 = value } return value; };
 ```
 
+## Reference Execution
+
+`blop_db::vm` implements all 48 ISA 1 opcodes as a single-threaded reference interpreter. Its reader
+converts bytecode into typed Rust instruction enums and validates the entire program before
+execution: operand layouts, types, forward control flow, reachability and definite register
+initialization on every branch. The runtime never dispatches on raw opcode bytes.
+
+- `interpret` accepts program and argument bytes, a pinned storage view, a record sequence and
+  explicit claims. It returns an `Outcome` without changing storage.
+- `execute` accepts a bound `Transaction`. `execute_bytes` accepts its saved byte vectors directly,
+  including for reference replay. Both interpret the program and install its final versions and
+  canonical outcome in one storage batch.
+- `execute_catalogue` creates, renames or drops tables. Creation uses the record sequence as the
+  table ID. `execute_limits` replaces the policy for later records. These operations share the
+  transaction sequence space and remain available even when the policy disables transactions.
+- Executing APIs require consecutive records after the checkpoint. Rejected input does not install
+  an outcome or consume that position. A semantic abort installs an outcome but no data versions, so
+  the following record can proceed. Already resolved or checkpointed positions cannot be
+  overwritten.
+
+Reads use the catalogue, policy and MVCC state strictly below the transaction sequence. Private
+writes take precedence, including tombstones. Bounded scans merge this overlay before selecting rows
+in canonical key order. Register, range and overlay charges follow the logical quantities and
+failure order in the design, rather than allocation sizes or physical version counts. Final effects
+are sorted by table ID and canonical key, with one effect per written address.
+
+`Outcome::Success` contains the result descriptor, decoded `Value` and final effects.
+`Outcome::Aborted` contains the stable reason, instruction index, user code and resource detail.
+Submission errors and storage failures are separate `Err` values, never semantic aborts.
+
+The following example uses an **isolated reference store**, explicit resource limits and fixture
+record digests. It does not create a durable transaction log:
+
+```rust
+# #[cfg(any(unix, windows))]
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use blop_db::{storage, tx, vm};
+use storage::{Genesis, LimitPolicy};
+use vm::{CatalogueOperation, Outcome, Type, Value};
+
+# let temporary = tempfile::tempdir()?;
+# let path = temporary.path().join("reference");
+// Resource IDs 1 through 17, in design appendix D.2 order.
+let claims = LimitPolicy::new([
+    1_048_576, 1024, 1024, 64, 1_048_576, 64, 0, 1024, 1024, 1024,
+    1_048_576, 8_388_608, 1024, 8_388_608, 1024, 8_388_608, 1_048_576,
+])?;
+let mut store = storage::create(path, Genesis {
+    database_id: [1; 16],
+    initial_policy: claims.clone(),
+}, [2; 16])?;
+
+vm::execute_catalogue(&mut store, 1, [1; 32], &CatalogueOperation::Create {
+    name: "counters".into(),
+    key: Type::U64,
+    value: Type::I64,
+})?;
+let transaction = tx! {
+    tables { counters: u64 => i64 = 1 }
+    insert(counters[7], 40);
+    counters[7] += 2;
+    return counters[7];
+}?;
+let outcome = vm::execute(&mut store, 2, [2; 32], &transaction, &claims)?;
+assert!(matches!(outcome, Outcome::Success { value: Value::I64(42), .. }));
+# Ok(())
+# }
+# #[cfg(not(any(unix, windows)))]
+# fn main() {}
+```
+
+**Execution is not a durability receipt.** In a running database the caller must establish log
+durability before executing, supply the digest of the complete canonical record, protect the prior
+history and publish only a fully resolved checkpoint prefix. The reference APIs do not verify that
+digest against a log, append log records, advance public visibility or orchestrate recovery.
+Reopening storage restores checkpoint roots; replay must execute every subsequent durable record
+against those roots, rather than reuse later cached outcomes.
+
+Access manifests, their resource-7 count and full logged Transaction body validation are not part of
+this layer. Other admission and runtime claims are checked against the historical policy. There is
+no parallel scheduler or optimized execution path.
+
 ## Storage
 
 `blop_db::storage` implements the physical storage formats in design appendices F and G, with
@@ -267,18 +350,19 @@ convert between schema value bytes and canonical ordered keys. `storage::mvcc` p
 tombstone stops lookup; it never falls through to an older value. Physical `Mutation::value = None`
 instead removes an entry and is intended for storage maintenance, not a transaction DELETE.
 
-The engine supplies already-validated catalogue and outcome values. It remains responsible for
-table-schema consistency, matching outcomes to state versions, interpreting log bodies, selecting a
-contiguous resolved checkpoint prefix and protecting retention claims. `publish` takes a pinned
-checkpoint view and a clone of the **latest** `Store::manifest()`, with the engine's frontier, log
-descriptor and next-ID updates. Storage manages page identity, roots, page count and manifest
-generation. Newly durable log prefixes must extend the previously published hash-chain anchor.
+The reference VM supplies schema-checked state versions and complete catalogue and outcome values.
+Callers using physical storage directly remain responsible for those checks. The engine must also
+interpret log bodies, select a contiguous resolved checkpoint prefix and protect retention claims.
+`publish` takes a pinned checkpoint view and a clone of the **latest** `Store::manifest()`, with the
+engine's frontier, log descriptor and next-ID updates. Storage manages page identity, roots, page
+count and manifest generation. Newly durable log prefixes must extend the previously published
+hash-chain anchor.
 
 When `durable_sequence > checkpoint_sequence`, reopening deliberately leaves the durable suffix
-unexecuted. A future execution layer must replay every record in that suffix before serving public
-reads. No VM, scheduler, logical log writer, catalogue operations, cursor lifecycle API, changefeed,
-replication, GC or whole-file compaction is implemented here. Old manifests and unreferenced pages
-are retained rather than reclaimed unsafely.
+unexecuted. A future recovery coordinator must read and validate that suffix and pass every record
+to the reference execution layer before serving public reads. No scheduler, logical log writer,
+recovery coordinator, cursor lifecycle API, changefeed, replication, GC or whole-file compaction is
+implemented here. Old manifests and unreferenced pages are retained rather than reclaimed unsafely.
 
 ### Platforms
 
@@ -311,9 +395,12 @@ mutations with `NeedsRecovery`; drop its handles and reopen to establish which p
 Run `cargo test --workspace`, `cargo +nightly fmt --all -- --check` and
 `cargo clippy --workspace --all-targets -- -D warnings`. Tests compare canonical byte encodings,
 check all 48 ISA 1 opcodes and verify emitted control-flow graphs and definite register
-initialization. Storage tests also cover binary conformance, malformed and truncated objects,
-model-checked tree edits, retained roots, MVCC filtering and injected interruptions at publication
-boundaries. These filesystem interruption tests do not simulate hardware power loss.
+initialization. VM tests execute compiled programs through actual storage, checking rollback,
+read-your-writes, historical schemas and limits, scan merging, resource-limit precedence and
+repeatable replay from saved bytes. Storage tests also cover binary conformance, malformed and
+truncated objects, model-checked tree edits, retained roots, MVCC filtering and injected
+interruptions at publication boundaries. These filesystem interruption tests do not simulate
+hardware power loss.
 
 To check the Windows code without running it, install the target with
 `rustup target add x86_64-pc-windows-gnu`, then run
