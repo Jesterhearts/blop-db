@@ -2,8 +2,9 @@
 
 This repository contains a transaction compiler, a single-threaded reference VM, an engine-facing
 storage layer and an async database API with revocable snapshots, durable retention cursors and
-resolved feeds. The writer sequences transactions on a background thread, publishes their log
-records before execution and returns receipts after checkpoint publication.
+resolved feeds. A coordinator sequences transactions, publishes their log records before dispatch,
+and installs complete worker outcomes against the latest storage roots. A persistent worker pool
+interprets independent transactions in parallel. Receipts follow prefix checkpoint publication.
 
 `tx!` compiles a small deterministic transaction program to the ISA 1 bytecode specified in
 [`DESIGN.md`](DESIGN.md), appendices A, B and C. Parsing, type checking, register allocation and
@@ -20,6 +21,9 @@ functions accept a cloneable `Database` handle:
   already exist.
 - `open(path).await` restores the checkpoint and replays any later durable records before accepting
   work.
+- `create_with_options(path, create_options, engine_options).await` and
+  `open_with_options(path, engine_options).await` select nonpersistent worker and capacity settings.
+  Existing `CreateOptions` initializers are unchanged.
 - `execute(&db, transaction, claims).await` returns a `Receipt { sequence, outcome }` after the
   transaction is durable, resolved and checkpointed.
 - `execute_with_manifest(&db, transaction, claims, manifest).await` independently validates supplied
@@ -30,6 +34,7 @@ functions accept a cloneable `Database` handle:
   policy prevents transaction submission.
 - `close(&db).await` stops submissions from every clone, drains accepted requests and waits for the
   directory lock to be released. Dropping every handle also drains accepted work, but does not wait.
+- `status(&db)` returns the latest `EngineStatus` sample without waiting for workers or storage I/O.
 
 Both transaction claims and creation limits use `Limits`, a struct with semantic names for all 17
 resources. Defaults are the generous, finite format ceilings. Override individual fields for your
@@ -70,10 +75,92 @@ must be unique and nonzero. Inspect the selected identities with `db.database_id
 never substituted during replay. For the low-level APIs, `LimitPolicy::try_from(limits)` validates
 the same named fields and `Limits::from(&policy)` exposes a stored policy by name.
 
-The API uses Tokio channels, but its futures can run on any executor. Blocking I/O, VM execution and
-recovery run on one dedicated thread per database. The queue holds at most 64 waiting requests;
-additional submissions await capacity. Execution is serial, with two durable publications per
-record, not a parallel scheduler or a group-commit implementation.
+The API uses Tokio channels and semaphores, but its futures can run on any executor. Validation,
+blocking publication I/O and installation run on one coordinator thread per database. Persistent
+standard-library worker threads interpret typed `vm::PreparedTransaction` values without mutating
+storage. Recovery remains sequential and uses the recorded historical catalogue and semantic policy,
+not the live scheduler's operational limits.
+
+### Bounded Execution
+
+`EngineOptions` controls live admission and scheduling independently of `Limits`:
+
+| Field                    | Default                               | Purpose                                                                      |
+| ------------------------ | ------------------------------------- | ---------------------------------------------------------------------------- |
+| `workers`                | Available CPUs clamped to 2 through 4 | Persistent interpreters; configurable from 1 through 256.                    |
+| `execution_window`       | 64                                    | Dispatch only `F < N <= min(D, F + W)`, using overflow-safe arithmetic.      |
+| `submission_queue_count` | 64                                    | Count permits for unassigned submissions, including the prepared queue head. |
+| `submission_queue_bytes` | 64 MiB                                | Input byte reservations for those submissions.                               |
+| `assigned_backlog_count` | 64                                    | Maximum assigned records waiting for visible checkpointed receipts.          |
+| `assigned_backlog_bytes` | 64 MiB                                | Maximum canonical log bytes in that assigned backlog.                        |
+| `execution_bytes`        | 512 MiB                               | Aggregate lifetime reservations for assigned transactions.                   |
+| `preparation_bytes`      | 512 MiB                               | Separate capacity for one active validation or prepared queue head.          |
+
+Count and byte permits are acquired before enqueueing. Waiting producers retain their own inputs;
+those inputs have not been accepted by the engine. Count permits can also be held while waiting for
+byte permits, so diagnostics report admission reservations rather than only channel occupancy.
+Cancelling such a wait releases its permits. The writer never drops a sequenced transaction to make
+space.
+
+Before assigning a transaction, the coordinator reserves its decoded program, scopes, dependency
+list, registers, distinct-address set, overlay, pending outcome and above-frontier logical versions.
+The reservation includes representation and temporary-buffer allowances, including zero-width tuple
+values and scan results built before destination checks. It remains charged until the record is
+installed, visible and checkpointed. Reserving the full lifetime in sequence order, then dispatching
+the oldest ready work first, prevents later work from taking capacity needed by the oldest record.
+Preparation separately bounds decoding and conservative access-analysis scratch before those stages
+run. These estimates deliberately favour safety over accepting every program that might fit in
+practice.
+
+Resource pressure delays admission. If a single record cannot fit the configured capacity,
+submission returns `Error::OperationalLimit { resource, required, limit }` before sequencing. It
+does not append an abort or change semantic claims. Increase the relevant process capacity or reduce
+the transaction. Reopening with smaller operational settings still replays already durable records
+under their original semantics. A process must nevertheless have enough actual resources to perform
+that replay.
+
+Reservations are accounting bounds, not an RSS or total disk-space cap. Storage traversal buffers,
+thread stacks, allocator/OS overhead, public read/feed results and retained visible history are
+separate. Administrative operations drain transactions and use fixed format-bounded scratch rather
+than transaction execution reservations. Their canonical record must still fit the assigned byte
+limit. History, old manifests and unreachable copy-on-write pages are not reclaimed yet, so total
+disk usage can continue to grow even when all backlog budgets are respected.
+
+Dependency registration follows durable sequence order. A reader waits for **all** unresolved
+earlier possible writers that overlap its reads, including table-wide declarations, aborted
+predecessors and successful branches that omit writes. Blind writers remain independent. When
+dependencies become ready, the coordinator captures the latest pinned roots; workers read only
+versions below their own sequence. The coordinator installs each complete result with the
+crate-private VM installation hook, against the latest store, before satisfying any dependencies.
+Workers never publish stale roots or consume another transaction's tentative overlay.
+
+`F` is live visibility, `D` is the CURRENT-selected manifest's durable frontier, and `C` is the
+checkpoint. They are tracked separately. Each contiguous frontier advance publishes a checkpoint
+filtered at F before releasing receipts; one publication can cover several previously completed
+records. When F equals D, the live roots already satisfy that boundary, so checkpointing skips the
+pruning scan. Appends still publish individually. There is no log group commit, asynchronous
+checkpoint writer, or throughput claim based on the existing single-client benchmark. A failed
+checkpoint publication can leave F above C: the prefix through F is durable and resolved, but
+receipts remain uncertain and the writer requires reopening. Diagnostics retain that F rather than
+lowering it.
+
+Catalogue and policy requests stop later sequencing, drain the preceding prefix, then execute their
+durable barrier. Submissions queued behind a barrier are prepared against the resulting metadata.
+Snapshots and cursor/feed operations use a separate bounded control queue and can run at F while a
+worker or transaction admission is blocked. They serialize with coordinator I/O and installation, so
+they are not a hard latency guarantee. Cursor publication preserves current retention metadata while
+filtering the four logical checkpoint roots at C, including when `C < F < D`. On normal shutdown or
+a handled system failure, unread control requests receive `Error::Closed` without executing, rather
+than an uncertain result caused by dropping their replies.
+
+`status(&db)` reports the configured budgets, log tail, D/F/C, queue reservations, assigned backlog,
+reserved execution and preparation bytes, active workers, oldest unresolved sequence, dependency
+waiters, resolved-above-frontier count, pending administrative barrier, retention floors and
+shutdown or poison state. It also retains the last system error. Except for queue permits sampled at
+the call, these fields describe the last coordinator iteration and can lag during blocking I/O. They
+are diagnostics, not receipts. Worker system errors and caught panics stop dispatch and require
+reopening; they are never encoded as semantic aborts. Unwinding coordinator panics also close
+admission. A process configured to abort on panic must recover after process restart instead.
 
 The writer derives normalized point and table scopes using C.4 abstract value analysis. Known keys
 use canonical point scopes; unknown keys and scans use table scopes. Both sides of every branch
@@ -89,10 +176,11 @@ derivation. The writer retains its log and historical versions without rotation 
 
 `Ok(Receipt)` is a durability receipt, but its `Outcome` can be `Success` or `Aborted`. A semantic
 abort discards all business writes, records the abort durably and consumes its sequence.
-`Error::Rejected` means validation failed before sequencing; `Error::Storage` reports a startup or
-pre-append system failure. `Error::Uncertain` means the request may have committed. After a system
-failure, the writer stops; close and reopen it to recover before proceeding. `Error::Closed` on a
-submission means that request did not execute.
+`Error::Rejected` means validation failed before sequencing; `Error::OperationalLimit` is a definite
+pre-sequence process-capacity rejection. `Error::Storage` reports a startup or pre-append system
+failure. `Error::Uncertain` means the request may have committed. After a system failure, the writer
+stops; close and reopen it to recover before proceeding. `Error::Closed` on a submission means that
+request did not execute.
 
 Cancellation after enqueueing does not cancel a transaction. Never assume that a dropped future or
 an uncertain result means no writes occurred. Retrying submits a new transaction; applications
@@ -516,8 +604,8 @@ against those roots, rather than reuse later cached outcomes.
 
 The original byte-only reference execution APIs do not charge resource 7 because they have no
 manifest. Use the preparation API below for complete C.4 admission. Full logged Transaction bodies
-remain the database record layer's responsibility. There is no parallel scheduler or optimized
-execution path.
+remain the database record layer's responsibility. The production scheduler uses prepared
+interpretation and serial atomic installation rather than the serial `vm::execute` helper.
 
 ### Access Preparation
 
@@ -699,6 +787,24 @@ recovery without applying increments twice. Access-manifest tests cover canonica
 merging, per-mode suppression, zero-width points, conservative CFG joins and failures, historical
 schema checks, actual normalized resource-7 counts, point-manifest recovery and rejection before
 sequence allocation.
+
+Production scheduler tests hold real workers behind per-database test gates and check independent
+progress, inverted blind-write completion, omitted and aborted point/table predecessors, old
+snapshots, above-frontier dependent reads, window bounds and count/byte backpressure. Other tests
+cover queued catalogue/policy transitions, cursor publication at `C < F < D`, worker panic and
+injected I/O failure, and sequential recovery under smaller process settings. Seeded mixed logs
+compare receipts, complete stored outcomes, catalogue/policy history and final version trees with
+the serial commit helper; public snapshots are compared at sampled visible prefixes. Small
+point/table/scan logs enumerate all legal dependency schedules and compare outcomes and prefix
+states. These bounded tests are not an exhaustive proof for arbitrary programs or a hardware crash
+simulation.
+
+Gated lifecycle tests verify that close waits for workers and their dependents, dropping all handles
+drains both assigned and queued work, snapshots are revoked before releasing the directory lock, and
+repeated close preserves its success/closed semantics. Shutdown tests also check definite rejection
+of unread controls. A checkpoint failure test obstructs only unpublished temporary output after
+durable append and installation, then verifies F/C/D diagnostics and replay without damaging
+committed history.
 
 To check the Windows code without running it, install the target with
 `rustup target add x86_64-pc-windows-gnu`, then run

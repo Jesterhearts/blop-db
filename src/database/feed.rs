@@ -55,13 +55,14 @@ pub(super) fn batch(
     token: &CursorToken,
     after: Watermark,
     limits: BatchLimits,
+    frontier: u64,
 ) -> Result<FeedBatch> {
     let info = cursor::lookup(store, token)?.ok_or(Error::CursorReleased)?;
     if token.kind() != super::CursorKind::Resolved {
         return Err(Error::InvalidToken("resolved feed requires kind 1"));
     }
     cursor::check_watermark(store, after)?;
-    if after.sequence() < info.baseline || after.sequence() > store.manifest().checkpoint_sequence {
+    if after.sequence() < info.baseline || after.sequence() > frontier {
         return Err(Error::HistoryUnavailable);
     }
     if !(exchange::EMPTY_BATCH_BYTES..=exchange::MAX_BATCH_BYTES).contains(&limits.max_bytes) {
@@ -73,7 +74,7 @@ pub(super) fn batch(
     let mut records = Vec::new();
     let mut bytes = exchange::EMPTY_BATCH_BYTES;
     let mut end = after.sequence();
-    for sequence in after.sequence() + 1..=store.manifest().checkpoint_sequence {
+    for sequence in after.sequence() + 1..=frontier {
         if records.len() >= limits.max_records {
             break;
         }

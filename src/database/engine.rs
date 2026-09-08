@@ -49,14 +49,14 @@ pub(super) fn commit(
     Ok(Receipt { sequence, outcome })
 }
 
-fn rejection(error: vm::Error) -> Error {
+pub(super) fn rejection(error: vm::Error) -> Error {
     match error {
         vm::Error::Storage(error) => Error::Storage(error),
         error => Error::Rejected(error),
     }
 }
 
-fn envelope(
+pub(super) fn envelope(
     sequence: u64,
     predecessor: [u8; 32],
     kind: u8,
@@ -103,7 +103,7 @@ pub(super) fn segment_header(
     bytes
 }
 
-fn append(
+pub(super) fn append(
     store: &mut storage::Store,
     sequence: u64,
     bytes: &[u8],
@@ -168,7 +168,7 @@ fn append(
     Ok(digest)
 }
 
-fn publish_checkpoint(store: &mut storage::Store) -> storage::Result<()> {
+pub(super) fn publish_checkpoint(store: &mut storage::Store) -> storage::Result<()> {
     let mut manifest = store.manifest().clone();
     manifest.checkpoint_sequence = manifest.durable_sequence;
     manifest.checkpoint_digest = manifest.durable_digest;

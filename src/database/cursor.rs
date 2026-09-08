@@ -7,12 +7,12 @@ use std::io::Read;
 use std::ops::Bound;
 
 use super::BatchLimits;
+use super::Control;
 use super::CursorKind;
 use super::CursorToken;
 use super::Database;
 use super::Error;
 use super::FeedBatch;
-use super::Request;
 use super::Result;
 use super::Snapshot;
 use super::Watermark;
@@ -82,10 +82,17 @@ pub(super) async fn request(
     database: &Database,
     operation: Operation,
 ) -> Result<Response> {
+    if let Operation::Checkout { label, .. } | Operation::SnapshotTail { label, .. } = &operation
+        && (label.len() > 255 || label.as_bytes().contains(&0))
+    {
+        return Err(Error::InvalidInput(
+            "cursor label exceeds 255 UTF-8 bytes or contains NUL",
+        ));
+    }
     let (reply, result) = tokio::sync::oneshot::channel();
     database
-        .sender
-        .send(Request::Retention { operation, reply })
+        .control
+        .send(Control::Retention { operation, reply })
         .await
         .map_err(|_| Error::Closed)?;
     result.await.map_err(|_| Error::Uncertain {
@@ -237,7 +244,7 @@ fn decode(
         || id == 0
         || id >= store.manifest().next_cursor_id
         || baseline < store.manifest().history_floor
-        || baseline > store.manifest().checkpoint_sequence
+        || baseline > store.manifest().durable_sequence
         || (kind != CursorKind::Resolved && store.manifest().log_floor > baseline + 1)
     {
         return Err(invalid());
@@ -331,8 +338,10 @@ fn publish(
     .map_err(uncertain)?;
     let mut manifest = store.manifest().clone();
     manifest.next_cursor_id = next_id;
-    // The serial writer has C = F = D; this view includes the new cursor root.
-    let checkpoint = storage::view(store);
+    // Cursor metadata is current, but the four logical roots must remain at C.
+    // Live roots can contain both visible post-C and resolved above-F records.
+    let checkpoint =
+        storage::prepare_checkpoint(store, manifest.checkpoint_sequence).map_err(uncertain)?;
     storage::publish(store, &checkpoint, manifest).map_err(uncertain)
 }
 
@@ -341,6 +350,7 @@ fn checkout(
     baseline: Watermark,
     kind: CursorKind,
     label: String,
+    frontier: u64,
 ) -> Result<CursorToken> {
     check_watermark(store, baseline)?;
     if label.len() > 255 || label.as_bytes().contains(&0) {
@@ -350,7 +360,7 @@ fn checkout(
     }
     let id = store.manifest().next_cursor_id;
     let next_id = id.checked_add(1).ok_or(Error::CursorIdExhausted)?;
-    available(store, baseline.sequence(), kind)?;
+    available(store, baseline.sequence(), kind, frontier)?;
     let info = CursorInfo {
         token: token(store, id, kind),
         baseline: baseline.sequence(),
@@ -364,17 +374,22 @@ fn available(
     store: &Store,
     baseline: u64,
     kind: CursorKind,
+    frontier: u64,
 ) -> Result<()> {
     let manifest = store.manifest();
-    if baseline < manifest.history_floor || baseline > manifest.checkpoint_sequence {
+    if baseline < manifest.history_floor || baseline > frontier {
         return Err(Error::HistoryUnavailable);
     }
     let view = storage::view(store);
     // Check actual outcomes, exact versions and schemas, not just numeric G.
-    for sequence in baseline + 1..=manifest.checkpoint_sequence {
+    for sequence in baseline + 1..=frontier {
         feed::read_record(&view, sequence)?;
     }
-    vm::validate_history(&view, manifest, store.genesis()).map_err(Error::Read)?;
+    // Validate authoritative checkpoint history separately from live roots,
+    // which may contain holes above F. Installed post-C effects were validated
+    // by the interpreter and are checked against exact versions above.
+    vm::validate_history(&storage::checkpoint_view(store), manifest, store.genesis())
+        .map_err(Error::Read)?;
     if kind != CursorKind::Resolved {
         log_available(store, baseline)?;
     }
@@ -444,7 +459,7 @@ fn log_available(
         }
         next = segment.last_sequence + 1;
     }
-    if next != manifest.checkpoint_sequence + 1 {
+    if next != manifest.durable_sequence + 1 {
         return Err(Error::HistoryUnavailable);
     }
     Ok(())
@@ -455,10 +470,10 @@ fn log_available(
 pub(crate) fn retention_floors(
     store: &Store,
     registry: &mut snapshot::Registry,
+    frontier: u64,
 ) -> Result<(u64, u64)> {
-    let frontier = store.manifest().checkpoint_sequence;
     let mut history = snapshot::snapshot_floor(registry, frontier);
-    let mut log = frontier + 1;
+    let mut log = store.manifest().checkpoint_sequence + 1;
     for info in list(store)? {
         history = history.min(info.baseline);
         if info.token.kind != CursorKind::Resolved {
@@ -472,16 +487,17 @@ pub(super) fn handle(
     store: &mut Store,
     registry: &mut snapshot::Registry,
     operation: Operation,
+    frontier: u64,
 ) -> Result<Response> {
     match operation {
         Operation::Checkout {
             baseline,
             kind,
             label,
-        } => checkout(store, baseline, kind, label).map(Response::Token),
+        } => checkout(store, baseline, kind, label, frontier).map(Response::Token),
         Operation::SnapshotTail { kind, label } => {
-            let snapshot = snapshot::capture(registry, store);
-            let token = checkout(store, snapshot.watermark(), kind, label)?;
+            let snapshot = snapshot::capture(registry, store, frontier);
+            let token = checkout(store, snapshot.watermark(), kind, label, frontier)?;
             Ok(Response::SnapshotTail(snapshot, token))
         }
         Operation::Reopen(token) => lookup(store, &token)?
@@ -490,9 +506,7 @@ pub(super) fn handle(
         Operation::Ack { token, watermark } => {
             let mut info = lookup(store, &token)?.ok_or(Error::CursorReleased)?;
             check_watermark(store, watermark)?;
-            if watermark.sequence() < info.baseline
-                || watermark.sequence() > store.manifest().checkpoint_sequence
-            {
+            if watermark.sequence() < info.baseline || watermark.sequence() > frontier {
                 return Err(Error::InvalidInput(
                     "cursor acknowledgement is backwards or above frontier",
                 ));
@@ -521,14 +535,14 @@ pub(super) fn handle(
         }
         Operation::List => list(store).map(Response::List),
         Operation::Floors => {
-            let (history, log) = retention_floors(store, registry)?;
+            let (history, log) = retention_floors(store, registry, frontier)?;
             Ok(Response::Floors(RetentionFloors { history, log }))
         }
         Operation::Feed {
             token,
             after,
             limits,
-        } => feed::batch(store, &token, after, limits).map(Response::Batch),
+        } => feed::batch(store, &token, after, limits, frontier).map(Response::Batch),
     }
 }
 
@@ -588,7 +602,13 @@ mod tests {
             assert_eq!(store.manifest().history_floor, 0);
             let baseline = Watermark::new(store.genesis().database_id, 1).unwrap();
             assert!(matches!(
-                checkout(&mut store, baseline, CursorKind::Resolved, "missing".into()),
+                checkout(
+                    &mut store,
+                    baseline,
+                    CursorKind::Resolved,
+                    "missing".into(),
+                    2
+                ),
                 Err(Error::HistoryUnavailable)
             ));
             assert_eq!(store.manifest().next_cursor_id, 1);

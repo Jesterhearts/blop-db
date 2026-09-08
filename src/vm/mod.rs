@@ -1,7 +1,8 @@
 //! Single-threaded ISA 1 reference execution over the storage layer.
 //!
 //! The pipeline is bytes -> validated typed instructions -> private overlay ->
-//! outcome -> atomic storage batch. No scheduler or parallel execution is used.
+//! outcome -> atomic storage batch. The database scheduler can run prepared
+//! interpreters concurrently; the executing reference APIs remain serial.
 //!
 //! This is an engine-facing reference implementation, not a durable submission
 //! API. Callers must protect history and either use an isolated reference store
@@ -19,6 +20,7 @@ mod history;
 mod operations;
 mod outcome;
 mod program;
+mod resources;
 mod runtime;
 mod value;
 
@@ -36,6 +38,7 @@ pub use database::catalogue_version;
 pub use database::decode_catalogue;
 pub use database::decode_catalogue_key;
 pub use database::encode_catalogue;
+pub(crate) use database::install;
 pub(crate) use database::validate_catalogue;
 pub use history::History;
 pub(crate) use history::validate_catalogue_record;
@@ -214,6 +217,11 @@ impl PreparedTransaction {
     pub fn instruction_count(&self) -> usize {
         self.program.instructions.len()
     }
+
+    /// Conservative operational reservation, independent of semantic charges.
+    pub(crate) fn reservation_bytes(&self) -> u64 {
+        resources::reservation(&self.program, &self.claims, &self.manifest)
+    }
 }
 
 /// Validate bytecode, historical schemas/policy and C.4 access coverage without
@@ -237,6 +245,48 @@ pub fn prepare_transaction(
         transaction.argument_bytes(),
         claims,
     )?;
+    finish_preparation(prior, program, claims, manifest)
+}
+
+/// A pre-sequence operational limit, separate from validation and VM aborts.
+pub(crate) enum Preparation {
+    Ready(Box<PreparedTransaction>),
+    Capacity(u64),
+}
+
+pub(crate) fn prepare_transaction_bounded(
+    view: &View,
+    sequence: u64,
+    transaction: &Transaction,
+    claims: &LimitPolicy,
+    manifest: Option<&AccessManifest>,
+    capacity: u64,
+) -> Result<Preparation> {
+    let decoding = resources::decoding(transaction);
+    if decoding > capacity {
+        return Ok(Preparation::Capacity(decoding));
+    }
+    let (prior, program) = prepare_program(
+        view,
+        sequence,
+        transaction.program_bytes(),
+        transaction.argument_bytes(),
+        claims,
+    )?;
+    let analysis = resources::analysis(&program, decoding);
+    if analysis > capacity {
+        return Ok(Preparation::Capacity(analysis));
+    }
+    finish_preparation(prior, program, claims, manifest)
+        .map(|prepared| Preparation::Ready(Box::new(prepared)))
+}
+
+fn finish_preparation(
+    prior: u64,
+    program: program::Program,
+    claims: &LimitPolicy,
+    manifest: Option<&AccessManifest>,
+) -> Result<PreparedTransaction> {
     let required = access_analysis::derive(&program)?;
     let manifest = manifest.unwrap_or(&required);
     access::validate(manifest, &required, &program.tables, claims)?;

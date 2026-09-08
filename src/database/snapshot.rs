@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::Weak;
 
+use super::Control;
 use super::Database;
 use super::Error;
-use super::Request;
 use super::Result;
 use super::Watermark;
 use crate::storage::TreeId;
@@ -85,9 +85,9 @@ impl Drop for Registry {
 pub(crate) fn capture(
     registry: &mut Registry,
     store: &storage::Store,
+    sequence: u64,
 ) -> Snapshot {
     registry.claims.retain(|claim| claim.strong_count() != 0);
-    let sequence = store.manifest().checkpoint_sequence;
     let claim = Arc::new(Claim {
         sequence,
         view: RwLock::new(Some(storage::view(store))),
@@ -132,8 +132,8 @@ pub(crate) fn revoke_all(registry: &mut Registry) {
 pub async fn snapshot(database: &Database) -> Result<Snapshot> {
     let (reply, result) = tokio::sync::oneshot::channel();
     database
-        .sender
-        .send(Request::Snapshot { reply })
+        .control
+        .send(Control::Snapshot { reply })
         .await
         .map_err(|_| Error::Closed)?;
     result.await.map_err(|_| Error::Closed)?

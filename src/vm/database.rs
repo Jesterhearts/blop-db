@@ -542,7 +542,7 @@ pub(super) fn limits(policy: &LimitPolicy) -> Outcome {
 /// Install validated interpreter output once, with its complete D.3 outcome.
 /// The caller owns sequencing and must exclude speculative materialization when
 /// replaying from a checkpoint. This is not an idempotent replay API.
-pub(super) fn install(
+pub(crate) fn install(
     store: &mut Store,
     sequence: u64,
     digest: [u8; 32],

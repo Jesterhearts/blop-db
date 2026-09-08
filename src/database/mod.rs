@@ -1,11 +1,12 @@
-//! Async, durable transaction submission through a serial background writer.
+//! Async, durable transaction submission with bounded parallel interpretation.
 //!
 //! [`create`] and [`open`] return a cloneable handle. Submission I/O,
-//! validation, execution and recovery run on its dedicated thread, not the
+//! validation, installation and recovery run on a coordinator thread, not the
 //! caller's executor. Snapshot reads use synchronous caller-thread I/O.
 //! The futures use Tokio channels but need no Tokio
-//! runtime. Up to 64 requests can wait in the writer queue; further submissions
-//! await capacity. Each receipt follows log durability, execution and
+//! runtime. A persistent worker pool interprets independent transactions.
+//! Count and byte budgets apply backpressure before sequencing.
+//! Each receipt follows log durability, execution and
 //! checkpoint publication, including when its outcome is a semantic abort.
 //!
 //! Dropping a submission future after enqueueing does not cancel the request.
@@ -17,18 +18,24 @@
 //! claims and drains in-flight reads without waiting for idle handles or scans.
 //! Durable cursors survive close and are released only by explicit request.
 
+mod budget;
 pub(crate) mod cursor;
 mod engine;
 mod exchange;
 mod feed;
 mod record;
+mod scheduler;
 pub(crate) mod snapshot;
+mod workers;
 
 use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Arc;
 use std::thread;
 
+pub use budget::EngineOptions;
 pub use cursor::CursorInfo;
 pub use cursor::RetentionFloors;
 pub use cursor::acknowledge_cursor;
@@ -47,6 +54,7 @@ pub use exchange::LogicalRecord;
 pub use exchange::MAX_BATCH_BYTES;
 pub use exchange::Watermark;
 pub use feed::read_feed;
+pub use scheduler::EngineStatus;
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotScan;
 pub use snapshot::catalogue;
@@ -72,9 +80,14 @@ use crate::vm::Outcome;
 #[derive(Clone, Debug)]
 pub struct Database {
     sender: mpsc::Sender<Request>,
+    control: mpsc::Sender<Control>,
+    queue: budget::Queue,
+    status: watch::Receiver<EngineStatus>,
     stopped: watch::Receiver<()>,
     database_id: [u8; 16],
     cursor_namespace: [u8; 16],
+    #[cfg(test)]
+    hooks: Arc<workers::test_support::Hooks>,
 }
 
 impl Database {
@@ -142,6 +155,15 @@ pub enum Error {
     Read(vm::Error),
     /// Validation rejected the request before sequencing. Nothing was written.
     Rejected(vm::Error),
+    /// Definite pre-sequence rejection by this process's operational capacity,
+    /// not a semantic policy failure or a logged abort. Reopen with more
+    /// capacity or use a smaller transaction. Recovery does not apply these
+    /// settings.
+    OperationalLimit {
+        resource: &'static str,
+        required: u64,
+        limit: u64,
+    },
     /// A system failure during startup or before this request was appended.
     Storage(storage::Error),
     /// The request may be durable, even if its receipt was lost. The writer
@@ -173,6 +195,14 @@ impl fmt::Display for Error {
             ),
             Self::Read(error) => error.fmt(f),
             Self::Rejected(error) => write!(f, "transaction rejected: {error}"),
+            Self::OperationalLimit {
+                resource,
+                required,
+                limit,
+            } => write!(
+                f,
+                "operational limit {resource}: requires {required} bytes, configured {limit}"
+            ),
             Self::Storage(error) => error.fmt(f),
             Self::Uncertain { sequence, source } => {
                 f.write_str("submission outcome is uncertain")?;
@@ -214,7 +244,7 @@ fn persisted_read(error: vm::Error) -> Error {
     }
 }
 
-enum Request {
+enum Control {
     Snapshot {
         reply: oneshot::Sender<Result<Snapshot>>,
     },
@@ -222,9 +252,13 @@ enum Request {
         operation: cursor::Operation,
         reply: oneshot::Sender<Result<cursor::Response>>,
     },
+}
+
+enum Request {
     Execute {
         command: Box<Command>,
         reply: oneshot::Sender<Result<Receipt>>,
+        permit: budget::Permit,
     },
     Close,
 }
@@ -237,7 +271,17 @@ pub async fn create(
     path: impl AsRef<Path>,
     options: CreateOptions,
 ) -> Result<Database> {
-    start(path.as_ref().to_owned(), Some(options)).await
+    create_with_options(path, options, EngineOptions::default()).await
+}
+
+/// Create with separate, nonpersistent process limits. Existing CreateOptions
+/// initializers remain unchanged.
+pub async fn create_with_options(
+    path: impl AsRef<Path>,
+    options: CreateOptions,
+    engine: EngineOptions,
+) -> Result<Database> {
+    start(path.as_ref().to_owned(), Some(options), engine).await
 }
 
 /// Open an existing database and replay its durable post-checkpoint records
@@ -246,14 +290,44 @@ pub async fn create(
 /// against the historical catalogue and policy, including older broad
 /// manifests.
 pub async fn open(path: impl AsRef<Path>) -> Result<Database> {
-    start(path.as_ref().to_owned(), None).await
+    open_with_options(path, EngineOptions::default()).await
+}
+
+/// Replay sequentially under the logged historical policy, then start the
+/// bounded live scheduler. Operational limits do not reduce replay semantics.
+pub async fn open_with_options(
+    path: impl AsRef<Path>,
+    engine: EngineOptions,
+) -> Result<Database> {
+    start(path.as_ref().to_owned(), None, engine).await
+}
+
+/// Inspect the latest coordinator sample without waiting for a worker or I/O.
+/// Queue permits are sampled at the call; other fields describe one earlier
+/// coordinator iteration. This is diagnostic data, not a durability receipt.
+pub fn status(database: &Database) -> EngineStatus {
+    let mut status = database.status.borrow().clone();
+    status.queued_count = database.queue.max_count - database.queue.count.available_permits();
+    status.queued_bytes =
+        (database.queue.max_bytes - database.queue.bytes.available_permits()) as u64;
+    status
 }
 
 async fn start(
     path: PathBuf,
     options: Option<CreateOptions>,
+    engine_options: EngineOptions,
 ) -> Result<Database> {
-    let (sender, receiver) = mpsc::channel(64);
+    budget::validate(&engine_options)?;
+    let queue = budget::Queue::new(&engine_options);
+    let writer_queue = queue.clone();
+    let (sender, receiver) = mpsc::channel(engine_options.submission_queue_count);
+    let (control, controls) = mpsc::channel(64);
+    let (status, diagnostics) = watch::channel(scheduler::initial_status(engine_options.clone()));
+    #[cfg(test)]
+    let hooks = Arc::new(workers::test_support::Hooks::default());
+    #[cfg(test)]
+    let worker_hooks = hooks.clone();
     let (ready, initialized) = oneshot::channel();
     let (stopped, completion) = watch::channel(());
     thread::Builder::new()
@@ -269,14 +343,50 @@ async fn start(
                     Ok(store)
                 }),
             };
+            let store = store.and_then(|store| {
+                let pool = workers::start(
+                    engine_options.workers,
+                    #[cfg(test)]
+                    worker_hooks,
+                )?;
+                Ok((store, pool))
+            });
             match store {
-                Ok(store) => {
+                Ok((store, pool)) => {
+                    status.send_modify(|s| {
+                        s.log_tail = store.manifest().durable_sequence;
+                        s.durable_frontier = store.manifest().durable_sequence;
+                        s.visibility_frontier = store.manifest().checkpoint_sequence;
+                        s.checkpoint = store.manifest().checkpoint_sequence;
+                    });
                     let identities = (
                         store.genesis().database_id,
                         store.manifest().cursor_namespace,
                     );
                     if ready.send(Ok(identities)).is_ok() {
-                        run_writer(store, receiver);
+                        let panic_queue = writer_queue.clone();
+                        let panic_status = status.clone();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            scheduler::run(
+                                store,
+                                receiver,
+                                controls,
+                                writer_queue,
+                                engine_options,
+                                status,
+                                pool,
+                            );
+                        }));
+                        if result.is_err() {
+                            budget::close(&panic_queue);
+                            panic_status.send_modify(|s| {
+                                s.poisoned = true;
+                                s.closed = true;
+                                s.active_workers = 0;
+                                s.last_error =
+                                    Some("database coordinator panicked; reopen required".into());
+                            });
+                        }
                     }
                 }
                 Err(error) => {
@@ -288,9 +398,14 @@ async fn start(
     let (database_id, cursor_namespace) = initialized.await.map_err(|_| Error::Closed)??;
     Ok(Database {
         sender,
+        control,
+        queue,
+        status: diagnostics,
         stopped: completion,
         database_id,
         cursor_namespace,
+        #[cfg(test)]
+        hooks,
     })
 }
 
@@ -324,7 +439,8 @@ fn random_uuid() -> storage::Result<[u8; 16]> {
 /// Submit a bound transaction and wait for its durable, visible outcome.
 /// Claims are checked against the policy at its assigned sequence. The writer
 /// derives normalized C.4 scopes; resource 7 charges their actual entry count.
-/// Concurrent callers are serialized in queue order.
+/// Concurrent callers are sequenced in enqueue order. Independent transactions
+/// may interpret concurrently and finish out of order; visibility is a prefix.
 ///
 /// Cancellation before enqueueing submits nothing. After enqueueing, the
 /// transaction proceeds even if this future is dropped. An `Uncertain` error
@@ -398,12 +514,14 @@ async fn submit(
     database: &Database,
     command: Command,
 ) -> Result<Receipt> {
+    let permit = budget::reserve(&database.queue, &command).await?;
     let (reply, result) = oneshot::channel();
     database
         .sender
         .send(Request::Execute {
             command: Box::new(command),
             reply,
+            permit,
         })
         .await
         .map_err(|_| Error::Closed)?;
@@ -430,62 +548,6 @@ pub async fn close(database: &Database) -> Result<()> {
     let mut stopped = database.stopped.clone();
     let _ = stopped.changed().await;
     result
-}
-
-fn run_writer(
-    mut store: storage::Store,
-    mut receiver: mpsc::Receiver<Request>,
-) {
-    let mut failed = false;
-    let mut registry = snapshot::Registry::default();
-    while let Some(request) = receiver.blocking_recv() {
-        match request {
-            Request::Snapshot { reply } => {
-                let result = if failed {
-                    Err(Error::Closed)
-                } else {
-                    Ok(snapshot::capture(&mut registry, &store))
-                };
-                let _ = reply.send(result);
-            }
-            Request::Retention { operation, reply } => {
-                let result = if failed {
-                    Err(Error::Closed)
-                } else {
-                    cursor::handle(&mut store, &mut registry, operation)
-                };
-                if result.as_ref().is_err_and(|error| {
-                    matches!(
-                        error,
-                        Error::Storage(_) | Error::Uncertain { .. } | Error::Read(_)
-                    )
-                }) {
-                    failed = true;
-                    receiver.close();
-                }
-                let _ = reply.send(result);
-            }
-            Request::Execute { command, reply } => {
-                let result = if failed {
-                    Err(Error::Closed)
-                } else {
-                    engine::commit(&mut store, &command)
-                };
-                if result
-                    .as_ref()
-                    .is_err_and(|error| !matches!(error, Error::Rejected(_)))
-                {
-                    failed = true;
-                    receiver.close();
-                }
-                let _ = reply.send(result);
-            }
-            Request::Close => {
-                receiver.close();
-            }
-        }
-    }
-    snapshot::revoke_all(&mut registry);
 }
 
 #[cfg(test)]
@@ -779,15 +841,18 @@ mod tests {
     async fn cancelled_waiter_still_commits_and_close_drains_accepted_work() {
         let (directory, database) = fixture().await;
         let (reply, result) = oneshot::channel();
+        let command = Command::Transaction {
+            transaction: tx! { return 42; }.unwrap(),
+            claims: policy().try_into().unwrap(),
+            manifest: None,
+        };
+        let permit = budget::reserve(&database.queue, &command).await.unwrap();
         database
             .sender
             .send(Request::Execute {
-                command: Box::new(Command::Transaction {
-                    transaction: tx! { return 42; }.unwrap(),
-                    claims: policy().try_into().unwrap(),
-                    manifest: None,
-                }),
+                command: Box::new(command),
                 reply,
+                permit,
             })
             .await
             .unwrap();
@@ -807,6 +872,10 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(1);
         let database = Database {
             sender,
+            control: mpsc::channel(1).0,
+            queue: budget::Queue::new(&EngineOptions::default()),
+            status: watch::channel(scheduler::initial_status(EngineOptions::default())).1,
+            hooks: Arc::default(),
             stopped: watch::channel(()).1,
             database_id: [1; 16],
             cursor_namespace: [2; 16],
@@ -833,6 +902,10 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(1);
         let database = Database {
             sender,
+            control: mpsc::channel(1).0,
+            queue: budget::Queue::new(&EngineOptions::default()),
+            status: watch::channel(scheduler::initial_status(EngineOptions::default())).1,
+            hooks: Arc::default(),
             stopped: watch::channel(()).1,
             database_id: [1; 16],
             cursor_namespace: [2; 16],
