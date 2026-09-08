@@ -1,13 +1,109 @@
 # blop-db
 
-This repository contains a transaction compiler, a single-threaded reference VM and an engine-facing
-storage layer. The VM executes transactions and atomically materializes their outcomes. It is not
-yet a durable database submission API.
+This repository contains a transaction compiler, a single-threaded reference VM, an engine-facing
+storage layer and an async durable write API. The write API sequences transactions on a background
+thread, publishes their log records before execution and returns receipts after checkpoint
+publication.
 
 `tx!` compiles a small deterministic transaction program to the ISA 1 bytecode specified in
 [`DESIGN.md`](DESIGN.md), appendices A, B and C. Parsing, type checking, register allocation and
 branch resolution happen during Rust compilation. Runtime binding snapshots the captures and
 resolves table IDs. It does not evaluate the VM program.
+
+## Async Writes
+
+Use `blop_db::database` to create or open a database and submit bound `tx!` programs. Its free
+functions accept a cloneable `Database` handle:
+
+- `create(path, options).await` creates a new directory. `CreateOptions::default()` generates a UUID
+  database ID and cursor namespace, and supplies default named limits. The parent directory must
+  already exist.
+- `open(path).await` restores the checkpoint and replays any later durable records before accepting
+  work.
+- `execute(&db, transaction, claims).await` returns a `Receipt { sequence, outcome }` after the
+  transaction is durable, resolved and checkpointed.
+- `execute_catalogue(&db, operation).await` creates, renames or drops tables. A successful create
+  returns its table ID as `Value::U64` in the outcome.
+- `execute_limits(&db, limits).await` changes the policy for subsequent records, even when the old
+  policy prevents transaction submission.
+- `close(&db).await` stops submissions from every clone, drains accepted requests and waits for the
+  directory lock to be released. Dropping every handle also drains accepted work, but does not wait.
+
+Both transaction claims and creation limits use `Limits`, a struct with semantic names for all 17
+resources. Defaults are the generous, finite format ceilings. Override individual fields for your
+application, and keep each transaction's claims within the database's current policy:
+
+```rust
+# #[cfg(any(unix, windows))]
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use blop_db::{database, Limits, tx};
+use database::CreateOptions;
+
+let limits = Limits {
+    instructions: 1024,
+    writes: 100,
+    overlay_bytes: 8 * 1024 * 1024,
+    ..Limits::default()
+};
+# let temporary = tempfile::tempdir()?;
+# let path = temporary.path().join("database");
+let db = database::create(&path, CreateOptions {
+    limits,
+    ..CreateOptions::default()
+}).await?;
+let receipt = database::execute(&db, tx! { return 42; }?, limits).await?;
+println!("Sequence {}: {:?}", receipt.sequence, receipt.outcome);
+database::close(&db).await?;
+# Ok(())
+# }
+# #[cfg(not(any(unix, windows)))]
+# fn main() {}
+```
+
+Creation generates independent version-4 UUIDs using operating-system randomness. To supply existing
+identities, set `CreateOptions::database_id` or `cursor_namespace` to `Some([u8; 16])`; explicit IDs
+must be unique and nonzero. Inspect the selected identities with `db.database_id()` and
+`db.cursor_namespace()`. Reopening preserves both identities and the persisted policy. Defaults are
+never substituted during replay. For the low-level APIs, `LimitPolicy::try_from(limits)` validates
+the same named fields and `Limits::from(&policy)` exposes a stored policy by name.
+
+The API uses Tokio channels, but its futures can run on any executor. Blocking I/O, VM execution and
+recovery run on one dedicated thread per database. The queue holds at most 64 waiting requests;
+additional submissions await capacity. Execution is serial, with two durable publications per
+record, not a parallel scheduler or a group-commit implementation.
+
+The writer generates one conservative read/write table scope per declared table, including unused
+declarations. Resource 7 (`manifest_scopes`) must allow that count in both the claims and the
+policy. Recovery accepts this broad-table manifest profile; finer externally produced manifests are
+not yet supported. The writer retains its log and historical versions without rotation or
+reclamation.
+
+`Ok(Receipt)` is a durability receipt, but its `Outcome` can be `Success` or `Aborted`. A semantic
+abort discards all business writes, records the abort durably and consumes its sequence.
+`Error::Rejected` means validation failed before sequencing; `Error::Storage` reports a startup or
+pre-append system failure. `Error::Uncertain` means the request may have committed. After a system
+failure, the writer stops; close and reopen it to recover before proceeding. `Error::Closed` on a
+submission means that request did not execute.
+
+Cancellation after enqueueing does not cancel a transaction. Never assume that a dropped future or
+an uncertain result means no writes occurred. Retrying submits a new transaction; applications
+needing deduplication must encode their request-ID checks and business writes in the same `tx!`
+program.
+
+Run the complete [balance-transfer example](examples/transactions.rs) against a **new** directory:
+
+```sh
+cargo run --example transactions -- /tmp/blop-example-db
+```
+
+The example generates database identities, creates a balances table, inserts two accounts, transfers
+25 units atomically and reopens the database to verify both balances are 75. It uses Tokio's
+current-thread executor and explicitly handles semantic aborts. It refuses to overwrite an existing
+directory. A result-only verification transaction still enters the log; a public snapshot API is not
+yet available.
+
+## Transaction Construction
 
 ```rust
 use blop_db::tx;
@@ -72,8 +168,9 @@ callbacks.
 
 These two byte vectors are not the complete logged Transaction body. The reference VM independently
 validates bytecode, actual catalogue schemas and explicit resource claims before interpreting them.
-The macro alone cannot check whether a runtime table ID names a live table. Access manifest
-derivation, complete log-body admission and durable sequencing remain unimplemented.
+The macro alone cannot check whether a runtime table ID names a live table. The async writer adds
+conservative access manifests, complete log bodies and durable sequencing; the macro alone does not
+perform these steps.
 
 ## Types
 
@@ -358,11 +455,12 @@ engine's frontier, log descriptor and next-ID updates. Storage manages page iden
 count and manifest generation. Newly durable log prefixes must extend the previously published
 hash-chain anchor.
 
-When `durable_sequence > checkpoint_sequence`, reopening deliberately leaves the durable suffix
-unexecuted. A future recovery coordinator must read and validate that suffix and pass every record
-to the reference execution layer before serving public reads. No scheduler, logical log writer,
-recovery coordinator, cursor lifecycle API, changefeed, replication, GC or whole-file compaction is
-implemented here. Old manifests and unreferenced pages are retained rather than reclaimed unsafely.
+When `durable_sequence > checkpoint_sequence`, `storage::open` deliberately leaves the durable
+suffix unexecuted. The higher-level `database::open` reads and validates that suffix and passes
+every record to the reference execution layer before accepting new submissions. The storage layer
+itself provides no scheduler, logical log writer or recovery coordinator. Cursor lifecycle APIs,
+changefeeds, replication, GC and whole-file compaction remain unimplemented. Old manifests and
+unreferenced pages are retained rather than reclaimed unsafely.
 
 ### Platforms
 
@@ -400,7 +498,9 @@ read-your-writes, historical schemas and limits, scan merging, resource-limit pr
 repeatable replay from saved bytes. Storage tests also cover binary conformance, malformed and
 truncated objects, model-checked tree edits, retained roots, MVCC filtering and injected
 interruptions at publication boundaries. These filesystem interruption tests do not simulate
-hardware power loss.
+hardware power loss. Async writer tests cover concurrent submissions, queue backpressure,
+cancellation, shutdown, durable receipts, rejected requests, semantic rollback and post-checkpoint
+recovery without applying increments twice.
 
 To check the Windows code without running it, install the target with
 `rustup target add x86_64-pc-windows-gnu`, then run

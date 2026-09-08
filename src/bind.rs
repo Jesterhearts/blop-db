@@ -10,6 +10,15 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// Reconstruct replay input. The record layer must validate it before use.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn from_parts(
+        program: Vec<u8>,
+        arguments: Vec<u8>,
+    ) -> Self {
+        Self { program, arguments }
+    }
+
     /// Return the complete program container, including its header.
     pub fn program_bytes(&self) -> &[u8] {
         &self.program

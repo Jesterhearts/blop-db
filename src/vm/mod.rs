@@ -21,6 +21,7 @@ use std::fmt;
 use std::ops::Bound;
 
 pub use database::CatalogueOperation;
+pub(crate) use database::validate_catalogue;
 pub use value::Type;
 pub use value::Value;
 
@@ -154,6 +155,40 @@ pub fn interpret(
     arguments: &[u8],
     claims: &LimitPolicy,
 ) -> Result<Outcome> {
+    let (prior, program) = prepare_transaction(view, sequence, program, arguments, claims)?;
+    runtime::run(view, prior, &program, claims)
+}
+
+/// Validate admission without reading rows, running instructions, or installing
+/// an outcome. Manifest coverage and its scope claim belong to the record
+/// layer.
+pub(crate) fn validate_transaction(
+    view: &View,
+    sequence: u64,
+    transaction: &Transaction,
+    claims: &LimitPolicy,
+) -> Result<()> {
+    prepare_transaction(
+        view,
+        sequence,
+        transaction.program_bytes(),
+        transaction.argument_bytes(),
+        claims,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn transaction_tables(program: &[u8]) -> Result<Vec<u64>> {
+    program::table_ids(program)
+}
+
+fn prepare_transaction(
+    view: &View,
+    sequence: u64,
+    program: &[u8],
+    arguments: &[u8],
+    claims: &LimitPolicy,
+) -> Result<(u64, program::Program)> {
     let prior = prior_sequence(sequence)?;
     let policy = database::policy(view, prior)?;
     if claims
@@ -171,7 +206,7 @@ pub fn interpret(
         .map(|id| database::table(view, id, prior))
         .collect::<Result<Vec<_>>>()?;
     let program = program::decode(program, arguments, &tables, claims)?;
-    runtime::run(view, prior, &program, claims)
+    Ok((prior, program))
 }
 
 /// Interpret one transaction and atomically install its final versions and

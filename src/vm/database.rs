@@ -436,6 +436,24 @@ fn administrative_abort(reason: AbortReason) -> Outcome {
     })
 }
 
+/// Validate syntax only; name conflicts and table liveness are durable
+/// outcomes.
+pub(crate) fn validate_catalogue(operation: &CatalogueOperation) -> Result<()> {
+    match operation {
+        CatalogueOperation::Create { name, key, value } => {
+            valid_name(name)?;
+            schema_descriptor(key, true)?;
+            schema_descriptor(value, false)?;
+        }
+        CatalogueOperation::Rename { table, name } => {
+            valid_id(*table)?;
+            valid_name(name)?;
+        }
+        CatalogueOperation::Drop { table } => valid_id(*table)?,
+    }
+    Ok(())
+}
+
 /// Compute an administrative record at N against its historical state at N - 1.
 pub(super) fn catalogue(
     view: &View,
@@ -443,11 +461,9 @@ pub(super) fn catalogue(
     operation: &CatalogueOperation,
 ) -> Result<Outcome> {
     valid_id(sequence)?;
+    validate_catalogue(operation)?;
     let (version, result_type, value) = match operation {
         CatalogueOperation::Create { name, key, value } => {
-            valid_name(name)?;
-            schema_descriptor(key, true)?;
-            schema_descriptor(value, false)?;
             if name_in_use(view, sequence - 1, name, None)? {
                 return Ok(administrative_abort(AbortReason::NameInUse));
             }
@@ -466,8 +482,6 @@ pub(super) fn catalogue(
             )
         }
         CatalogueOperation::Rename { table, name } => {
-            valid_id(*table)?;
-            valid_name(name)?;
             let Some(mut version) =
                 catalogue_version(view, *table, sequence - 1)?.filter(|v| v.live)
             else {
@@ -480,7 +494,6 @@ pub(super) fn catalogue(
             (version, Type::Unit, Value::Unit)
         }
         CatalogueOperation::Drop { table } => {
-            valid_id(*table)?;
             let Some(mut version) =
                 catalogue_version(view, *table, sequence - 1)?.filter(|v| v.live)
             else {
