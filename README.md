@@ -152,9 +152,9 @@ Workers never publish stale roots or consume another transaction's tentative ove
 checkpoint. They are tracked separately. Each contiguous frontier advance publishes a checkpoint
 filtered at F before releasing receipts; one publication can cover several previously completed
 records. When F equals D, the live roots already satisfy that boundary, so checkpointing skips the
-pruning scan. Appends still publish individually. There is no log group commit, asynchronous
-checkpoint writer, or throughput claim based on the existing single-client benchmark. A failed
-checkpoint publication can leave F above C: the prefix through F is durable and resolved, but
+pruning scan. Appends still publish individually. There is no log group commit or asynchronous
+checkpoint writer. See [BENCHMARKS.md](BENCHMARKS.md) for measured independent-client workloads. A
+failed checkpoint publication can leave F above C: the prefix through F is durable and resolved, but
 receipts remain uncertain and the writer requires reopening. Diagnostics retain that F rather than
 lowering it.
 
@@ -971,11 +971,12 @@ mutations with `NeedsRecovery`; drop its handles and reopen to establish which p
 
 ## Benchmarks
 
-Run the single-client KV comparison against redb and SQLite with
-`cargo run --release --example kv_bench -- --dir /path/to/existing/directory`. See
-[BENCHMARKS.md](BENCHMARKS.md) for separate buffered and durable measurements, reproducible
-commands, local results and comparison limits. The harness uses temporary databases, not existing
-application data.
+Run the KV comparison against redb and SQLite with
+`cargo run --release --example kv_bench -- --dir /path/to/existing/directory --mode durable --clients 4 --workers 4`.
+The durable workload uses independent one-key transactions and public snapshot reads. See
+[BENCHMARKS.md](BENCHMARKS.md) for single-client controls, concurrency results, the separate
+buffered reference-VM diagnostic and comparison limits. The harness uses temporary databases, not
+existing application data.
 
 ## Development
 
