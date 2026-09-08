@@ -28,6 +28,7 @@ use super::RetentionFloors;
 use super::budget;
 use super::cursor;
 use super::engine;
+use super::maintenance;
 use super::record;
 use super::snapshot;
 use super::workers;
@@ -55,6 +56,9 @@ pub struct EngineStatus {
     pub active_workers: usize,
     pub dependency_waiting: usize,
     pub administrative_barrier: Option<u64>,
+    pub maintenance_pending: bool,
+    pub backup_jobs: usize,
+    pub last_maintenance: Option<super::MaintenanceReport>,
     pub retention: RetentionFloors,
     pub poisoned: bool,
     pub closed: bool,
@@ -79,6 +83,9 @@ pub(super) fn initial_status(options: EngineOptions) -> EngineStatus {
         active_workers: 0,
         dependency_waiting: 0,
         administrative_barrier: None,
+        maintenance_pending: false,
+        backup_jobs: 0,
+        last_maintenance: None,
         retention: RetentionFloors { history: 0, log: 1 },
         poisoned: false,
         closed: false,
@@ -499,6 +506,11 @@ pub(super) fn run(
     let mut prefer_requests = false;
     let mut failed = false;
     let mut last_error = None;
+    let mut pending_maintenance: Option<(
+        super::MaintenanceOptions,
+        oneshot::Sender<Result<super::MaintenanceReport>>,
+    )> = None;
+    let mut backups = maintenance::Backups::default();
     loop {
         if pool.poisoned.load(Ordering::Acquire) {
             failed = true;
@@ -526,11 +538,33 @@ pub(super) fn run(
             failed = true;
             break;
         }
+        status.send_modify(|s| {
+            s.maintenance_pending = pending_maintenance.is_some();
+            s.backup_jobs = backups.active();
+        });
+        if schedule.entries.is_empty()
+            && let Some((options, reply)) = pending_maintenance.take()
+        {
+            let result = maintenance::run(&mut store, &mut registry, schedule.frontier, options);
+            if let Ok(report) = &result {
+                status.send_modify(|s| s.last_maintenance = Some(report.clone()));
+            } else {
+                last_error = result.as_ref().err().map(ToString::to_string);
+                failed = true;
+            }
+            let _ = reply.send(result);
+            if failed {
+                break;
+            }
+            continue;
+        }
         if !requests && head.is_none() && schedule.entries.is_empty() {
             break;
         }
         let mut progress = false;
-        if let Some(pending) = &head {
+        if pending_maintenance.is_none()
+            && let Some(pending) = &head
+        {
             if let Some(prepared) = &pending.prepared {
                 if schedule.entries.len() < options.assigned_backlog_count
                     && prepared.bytes.len() as u64
@@ -578,8 +612,8 @@ pub(super) fn run(
             &mut pool,
             &mut receiver,
             &mut control,
-            requests && head.is_none(),
-            controls,
+            requests && head.is_none() && pending_maintenance.is_none(),
+            controls && pending_maintenance.is_none(),
             prefer_requests,
         ) {
             Event::Complete(Some(completion)) => {
@@ -594,6 +628,21 @@ pub(super) fn run(
                 break;
             }
             Event::Control(None) => controls = false,
+            Event::Control(Some(Control::Maintenance { options, reply })) => {
+                prefer_requests = true;
+                pending_maintenance = Some((options, reply));
+            }
+            Event::Control(Some(Control::Backup { destination, reply })) => {
+                prefer_requests = true;
+                maintenance::start_backup(
+                    &mut backups,
+                    &store,
+                    destination,
+                    reply,
+                    #[cfg(test)]
+                    pool.hooks.clone(),
+                );
+            }
             Event::Control(Some(Control::Snapshot { reply })) => {
                 prefer_requests = true;
                 let _ = reply.send(Ok(snapshot::capture(
@@ -631,6 +680,10 @@ pub(super) fn run(
                 permit,
             })) => {
                 prefer_requests = false;
+                if store.is_read_only() {
+                    let _ = reply.send(Err(Error::ReadOnly));
+                    continue;
+                }
                 status.send_modify(|s| s.prepared_head_bytes = options.preparation_bytes);
                 match prepare(&store, &mut command, &options) {
                     Ok(prepared) => {
@@ -685,6 +738,9 @@ pub(super) fn run(
     if let Some(head) = head {
         let _ = head.reply.send(Err(Error::Closed));
     }
+    if let Some((_, reply)) = pending_maintenance {
+        let _ = reply.send(Err(Error::Closed));
+    }
     for entry in schedule.entries {
         let _ = entry.reply.send(Err(Error::Uncertain {
             sequence: Some(entry.sequence),
@@ -702,6 +758,12 @@ pub(super) fn run(
     }
     while let Some(request) = control.blocking_recv() {
         match request {
+            Control::Maintenance { reply, .. } => {
+                let _ = reply.send(Err(Error::Closed));
+            }
+            Control::Backup { reply, .. } => {
+                let _ = reply.send(Err(Error::Closed));
+            }
             Control::Snapshot { reply } => {
                 let _ = reply.send(Err(Error::Closed));
             }
@@ -711,9 +773,12 @@ pub(super) fn run(
         }
     }
     drop(pool);
+    drop(backups);
     snapshot::revoke_all(&mut registry);
     status.send_modify(|s| {
         s.active_workers = 0;
+        s.backup_jobs = 0;
+        s.maintenance_pending = false;
     });
 }
 

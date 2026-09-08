@@ -32,7 +32,7 @@ use super::page::PageReader;
 use super::platform;
 use super::tree;
 
-const TREES: [TreeId; 5] = [
+pub(super) const TREES: [TreeId; 5] = [
     TreeId::State,
     TreeId::Catalogue,
     TreeId::Policy,
@@ -46,12 +46,14 @@ const TREES: [TreeId; 5] = [
 /// concurrently.
 pub struct Store {
     directory: PathBuf,
-    lease: Arc<File>,
-    pages: PageFile,
+    pub(super) lease: Arc<File>,
+    pub(super) pages: PageFile,
     genesis: Genesis,
     manifest: Manifest,
     roots: [u64; 5],
     poisoned: bool,
+    pub(crate) rotate_next: bool,
+    read_only: bool,
     #[cfg(test)]
     fail_after: Option<usize>,
 }
@@ -68,15 +70,19 @@ impl Store {
     pub fn directory(&self) -> &Path {
         &self.directory
     }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
 }
 
 /// An immutable, pinned physical root set. It may contain versions above the
 /// public frontier.
 #[derive(Clone)]
 pub struct View {
-    reader: PageReader,
-    lease: Arc<File>,
-    roots: [u64; 5],
+    pub(super) reader: PageReader,
+    pub(super) lease: Arc<File>,
+    pub(super) roots: [u64; 5],
 }
 
 /// One physical edit. `None` removes an entry, rather than installing an MVCC
@@ -175,6 +181,8 @@ pub fn create(
         roots: manifest.roots,
         manifest,
         poisoned: false,
+        rotate_next: false,
+        read_only: false,
         #[cfg(test)]
         fail_after: None,
     };
@@ -192,8 +200,19 @@ pub fn create(
 /// durable_sequence]`; the engine must do that before serving public reads or
 /// resuming transaction execution.
 pub fn open(path: impl AsRef<Path>) -> Result<Store> {
+    open_directory(path.as_ref(), false)
+}
+
+pub(super) fn open_directory(
+    path: &Path,
+    attaching: bool,
+) -> Result<Store> {
     let directory = fs::canonicalize(path)?;
     let lease = lock(&directory)?;
+    if !attaching && directory.join("ATTACH_REQUIRED").try_exists()? {
+        return Err(Error::AttachRequired);
+    }
+    let read_only = directory.join("READ_ONLY").try_exists()?;
     let current = Current::decode(&read_bounded(&directory.join("CURRENT"), 64)?)?;
     let bytes = read_bounded(
         &directory.join(format!("manifest-{:020}.bin", current.generation)),
@@ -241,6 +260,10 @@ pub fn open(path: impl AsRef<Path>) -> Result<Store> {
         roots: manifest.roots,
         manifest,
         poisoned: false,
+        // A reopened owner always starts a new segment. No empty segment needs
+        // to be persisted to make a requested rotation survive restart.
+        rotate_next: true,
+        read_only,
         #[cfg(test)]
         fail_after: None,
     })
@@ -378,7 +401,9 @@ pub fn publish(
     mut manifest: Manifest,
 ) -> Result<()> {
     writable(store)?;
-    if !Arc::ptr_eq(&store.lease, &checkpoint.lease) {
+    if !Arc::ptr_eq(&store.lease, &checkpoint.lease)
+        || !store.pages.reader().same_file(&checkpoint.reader)
+    {
         return Err(Error::InvalidInput(
             "checkpoint belongs to a different storage owner",
         ));
@@ -404,7 +429,7 @@ pub fn publish(
     Ok(())
 }
 
-fn writable(store: &Store) -> Result<()> {
+pub(super) fn writable(store: &Store) -> Result<()> {
     if store.poisoned {
         Err(Error::NeedsRecovery)
     } else {
@@ -490,7 +515,7 @@ fn validate_anchors(
     Ok(())
 }
 
-fn entry_sequence(
+pub(super) fn entry_sequence(
     tree: TreeId,
     key: &[u8],
 ) -> Result<u64> {
@@ -602,7 +627,7 @@ fn persisted(error: Error) -> Error {
     }
 }
 
-fn lock(directory: &Path) -> Result<Arc<File>> {
+pub(super) fn lock(directory: &Path) -> Result<Arc<File>> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -624,7 +649,7 @@ fn authoritative_error(error: std::io::Error) -> Error {
     }
 }
 
-fn read_bounded(
+pub(super) fn read_bounded(
     path: &Path,
     maximum: u64,
 ) -> Result<Vec<u8>> {
@@ -657,7 +682,7 @@ fn next_generation(store: &Store) -> Result<u64> {
     }
 }
 
-fn write_new(
+pub(super) fn write_new(
     path: &Path,
     bytes: &[u8],
 ) -> Result<()> {
@@ -732,6 +757,91 @@ fn publication_step(_store: &mut Store) -> Result<()> {
         *remaining -= 1;
     }
     Ok(())
+}
+
+/// The caller has drained installations and validated logical correspondence.
+/// Ordinary publication deliberately cannot change file identity or live roots.
+pub(super) fn adopt(
+    store: &mut Store,
+    checkpoint: View,
+    mut manifest: Manifest,
+    pages: Option<PageFile>,
+    source_roots: [u64; 5],
+) -> Result<()> {
+    writable(store)?;
+    if !Arc::ptr_eq(&store.lease, &checkpoint.lease)
+        || manifest.checkpoint_sequence != manifest.durable_sequence
+        || manifest.checkpoint_sequence != store.manifest.checkpoint_sequence
+        || source_roots != store.roots
+    {
+        return Err(Error::InvalidInput(
+            "handover requires a current drained checkpoint",
+        ));
+    }
+    let mut ordinary = manifest.clone();
+    ordinary.page_file_id = store.manifest.page_file_id;
+    ordinary.next_page_file_id = store.manifest.next_page_file_id;
+    validate_transition(store, &ordinary)?;
+    match &pages {
+        Some(pages)
+            if manifest.page_file_id >= store.manifest.next_page_file_id
+                && manifest.page_file_id != u64::MAX
+                && manifest.next_page_file_id == manifest.page_file_id + 1
+                && pages.reader().same_file(&checkpoint.reader) => {}
+        None if manifest.page_file_id == store.manifest.page_file_id
+            && manifest.next_page_file_id == store.manifest.next_page_file_id
+            && store.pages.reader().same_file(&checkpoint.reader) => {}
+        _ => return Err(Error::InvalidInput("invalid page file handover")),
+    }
+    manifest.generation = next_generation(store)?;
+    manifest.roots = checkpoint.roots;
+    manifest.page_count = pages.as_ref().unwrap_or(&store.pages).page_count();
+    manifest.encode()?;
+    validate_checkpoint(&checkpoint.reader, &manifest, &store.genesis)?;
+    metadata::validate_logs(&store.directory, &manifest)?;
+    validate_anchors(store, &manifest)?;
+    if let Err(error) = pages
+        .as_ref()
+        .map_or(Ok(()), PageFile::sync)
+        .and_then(|()| publish_files(store, &manifest))
+    {
+        store.poisoned = true;
+        return Err(error);
+    }
+    if let Some(pages) = pages {
+        store.pages = pages;
+    }
+    store.roots = manifest.roots;
+    store.manifest = manifest;
+    Ok(())
+}
+
+pub(super) fn renew_namespace(
+    store: &mut Store,
+    namespace: [u8; 16],
+) -> Result<()> {
+    writable(store)?;
+    if namespace == [0; 16] || namespace == store.manifest.cursor_namespace {
+        return Err(Error::InvalidInput(
+            "attachment requires a fresh cursor namespace",
+        ));
+    }
+    let mut manifest = store.manifest.clone();
+    manifest.cursor_namespace = namespace;
+    manifest.generation = next_generation(store)?;
+    if let Err(error) = publish_files(store, &manifest) {
+        store.poisoned = true;
+        return Err(error);
+    }
+    store.manifest = manifest;
+    Ok(())
+}
+
+pub(super) fn set_read_only(
+    store: &mut Store,
+    read_only: bool,
+) {
+    store.read_only = read_only;
 }
 
 #[cfg(test)]
@@ -1297,5 +1407,72 @@ mod tests {
             open(&path),
             Err(Error::Corrupt("missing authoritative storage file"))
         ));
+    }
+
+    #[test]
+    fn interrupted_file_handover_never_reclaims_before_selection_and_poisons() {
+        for step in 0..8 {
+            let (_directory, mut store) = new_store();
+            let path = store.directory.clone();
+            let (mut manifest, digests) = write_log(&store, 1);
+            manifest.checkpoint_sequence = 1;
+            manifest.checkpoint_digest = digests[1];
+            let checkpoint = view(&store);
+            publish(&mut store, &checkpoint, manifest).unwrap();
+            drop(checkpoint);
+            let candidate =
+                super::super::maintenance::prepare(&mut store, 1, 2, true, true).unwrap();
+            store.fail_after = Some(step);
+            assert!(super::super::maintenance::install(&mut store, candidate).is_err());
+            assert!(matches!(
+                super::super::maintenance::reclaim(&store),
+                Err(Error::NeedsRecovery)
+            ));
+            assert!(matches!(apply(&mut store, &[]), Err(Error::NeedsRecovery)));
+            assert!(path.join("pages-00000000000000000001.bin").exists());
+            assert!(path.join("pages-00000000000000000002.bin").exists());
+            assert!(path.join("log-00000000000000000001.bin").exists());
+            drop(store);
+            let recovered = open(&path).unwrap();
+            assert_eq!(
+                recovered.manifest.page_file_id,
+                if step >= 6 { 2 } else { 1 }
+            );
+            super::super::maintenance::reclaim(&recovered).unwrap();
+            assert!(
+                path.join(format!("pages-{:020}.bin", recovered.manifest.page_file_id))
+                    .exists()
+            );
+            assert_eq!(path.join("log-00000000000000000001.bin").exists(), step < 6);
+        }
+    }
+
+    #[test]
+    fn interrupted_namespace_publication_preserves_claims_and_requires_attach_retry() {
+        for step in 0..8 {
+            let (_directory, mut store) = new_store();
+            let path = store.directory.clone();
+            apply(&mut store, &[cursor(1, 0)]).unwrap();
+            publish_cursors(&mut store, 2).unwrap();
+            write_new(&path.join("ATTACH_REQUIRED"), b"attach").unwrap();
+            store.fail_after = Some(step);
+            assert!(renew_namespace(&mut store, [3; 16]).is_err());
+            assert!(matches!(
+                renew_namespace(&mut store, [4; 16]),
+                Err(Error::NeedsRecovery)
+            ));
+            drop(store);
+            assert!(matches!(open(&path), Err(Error::AttachRequired)));
+            let store = super::super::backup::attach(&path, [4; 16], true).unwrap();
+            assert_eq!(store.manifest.cursor_namespace, [4; 16]);
+            assert_eq!(store.manifest.next_cursor_id, 2);
+            assert_eq!(
+                get(&view(&store), TreeId::Cursors, &1_u64.to_be_bytes()).unwrap(),
+                cursor(1, 0).value
+            );
+            assert!(store.is_read_only());
+            drop(store);
+            assert!(open(&path).unwrap().is_read_only());
+        }
     }
 }

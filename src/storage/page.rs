@@ -219,6 +219,13 @@ impl PageFile {
 }
 
 impl PageReader {
+    pub(super) fn same_file(
+        &self,
+        other: &Self,
+    ) -> bool {
+        Arc::ptr_eq(&self.file, &other.file)
+    }
+
     pub(super) fn node(
         &self,
         tree: TreeId,

@@ -110,7 +110,9 @@ pub(super) fn append(
 ) -> storage::Result<[u8; 32]> {
     let mut manifest = store.manifest().clone();
     let digest = Sha256::digest(bytes).into();
-    if let Some(segment) = manifest.segments.last_mut() {
+    if !store.rotate_next
+        && let Some(segment) = manifest.segments.last_mut()
+    {
         let committed_bytes = segment
             .committed_bytes
             .checked_add(bytes.len() as u64)
@@ -132,22 +134,9 @@ pub(super) fn append(
         segment.last_digest = digest;
         segment.committed_bytes = committed_bytes;
     } else {
-        let (mut file, segment_id) = loop {
-            let segment_id = manifest.next_segment_id;
-            manifest.next_segment_id =
-                segment_id.checked_add(1).ok_or(storage::Error::Exhausted)?;
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(store.directory().join(format!("log-{segment_id:020}.bin")))
-            {
-                Ok(file) => break (file, segment_id),
-                // An unlisted crash file does not allocate an identity, but its
-                // contents must not be overwritten while finding a free name.
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-        };
+        let (mut file, segment_id) =
+            storage::maintenance::allocate(store, "log", manifest.next_segment_id)?;
+        manifest.next_segment_id = segment_id + 1;
         let segment = storage::SegmentDescriptor {
             segment_id,
             first_sequence: sequence,
@@ -165,6 +154,7 @@ pub(super) fn append(
     let checkpoint = storage::checkpoint_view(store);
     // Publication flushes log files and directory entries before selecting D.
     storage::publish(store, &checkpoint, manifest)?;
+    store.rotate_next = false;
     Ok(digest)
 }
 
@@ -253,7 +243,7 @@ pub(super) fn recover(store: &mut storage::Store) -> storage::Result<()> {
     Ok(())
 }
 
-fn validate_checkpoint_record(
+pub(super) fn validate_checkpoint_record(
     view: &storage::View,
     history: &vm::History,
     sequence: u64,

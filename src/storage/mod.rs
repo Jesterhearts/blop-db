@@ -13,7 +13,9 @@
 //! process owns the directory until its store, views and scans have all been
 //! dropped. No VM, sequencer, logical log writer or changefeed is included.
 
+pub(crate) mod backup;
 pub mod encoding;
+pub(crate) mod maintenance;
 mod metadata;
 pub mod mvcc;
 mod page;
@@ -71,6 +73,7 @@ pub enum Error {
     InvalidInput(&'static str),
     Unsupported { format: &'static str, version: u16 },
     Locked,
+    AttachRequired,
     NeedsRecovery,
     Exhausted,
 }
@@ -88,6 +91,7 @@ impl fmt::Display for Error {
                 write!(f, "unsupported {format} version {version}")
             }
             Self::Locked => f.write_str("database directory already has an owner"),
+            Self::AttachRequired => f.write_str("copied directory requires explicit attachment"),
             Self::NeedsRecovery => {
                 f.write_str("storage must be reopened after an uncertain failure")
             }

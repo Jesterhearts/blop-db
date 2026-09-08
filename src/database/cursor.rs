@@ -54,6 +54,10 @@ pub(super) enum Operation {
         label: String,
     },
     Reopen(CursorToken),
+    Rebind {
+        id: u64,
+        watermark: Watermark,
+    },
     Ack {
         token: CursorToken,
         watermark: Watermark,
@@ -155,6 +159,21 @@ pub async fn reopen_cursor(
 ) -> Result<CursorInfo> {
     match request(database, Operation::Reopen(*token)).await? {
         Response::Info(info) => Ok(info),
+        _ => unreachable!("writer reply type"),
+    }
+}
+
+/// Administratively select an existing numeric registration after validating
+/// the consumer's saved watermark. Labels and old tokens are never selectors.
+/// The watermark must belong to this database and lie in [baseline, F]. Rebind
+/// does not advance or release the copied claim.
+pub async fn rebind_cursor(
+    database: &Database,
+    id: u64,
+    watermark: Watermark,
+) -> Result<CursorToken> {
+    match request(database, Operation::Rebind { id, watermark }).await? {
+        Response::Token(token) => Ok(token),
         _ => unreachable!("writer reply type"),
     }
 }
@@ -503,6 +522,21 @@ pub(super) fn handle(
         Operation::Reopen(token) => lookup(store, &token)?
             .ok_or(Error::CursorReleased)
             .map(Response::Info),
+        Operation::Rebind { id, watermark } => {
+            check_watermark(store, watermark)?;
+            if id == 0 || id >= store.manifest().next_cursor_id {
+                return Err(Error::InvalidToken("cursor ID was not issued"));
+            }
+            let bytes = storage::get(&storage::view(store), TreeId::Cursors, &id.to_be_bytes())
+                .map_err(Error::Storage)?
+                .ok_or(Error::CursorReleased)?;
+            let info = decode(store, id, &bytes)?;
+            if watermark.sequence() < info.baseline || watermark.sequence() > frontier {
+                return Err(Error::HistoryUnavailable);
+            }
+            available(store, watermark.sequence(), info.token.kind, frontier)?;
+            Ok(Response::Token(info.token))
+        }
         Operation::Ack { token, watermark } => {
             let mut info = lookup(store, &token)?.ok_or(Error::CursorReleased)?;
             check_watermark(store, watermark)?;

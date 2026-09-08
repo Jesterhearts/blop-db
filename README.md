@@ -1,10 +1,11 @@
 # blop-db
 
 This repository contains a transaction compiler, a single-threaded reference VM, an engine-facing
-storage layer and an async database API with revocable snapshots, durable retention cursors and
-resolved feeds. A coordinator sequences transactions, publishes their log records before dispatch,
-and installs complete worker outcomes against the latest storage roots. A persistent worker pool
-interprets independent transactions in parallel. Receipts follow prefix checkpoint publication.
+storage layer and an async database API with revocable snapshots, durable retention cursors,
+resolved feeds, manual maintenance and pinned physical backups. A coordinator sequences
+transactions, publishes their log records before dispatch, and installs complete worker outcomes
+against the latest storage roots. A persistent worker pool interprets independent transactions in
+parallel. Receipts follow prefix checkpoint publication.
 
 `tx!` compiles a small deterministic transaction program to the ISA 1 bytecode specified in
 [`DESIGN.md`](DESIGN.md), appendices A, B and C. Parsing, type checking, register allocation and
@@ -123,8 +124,8 @@ Reservations are accounting bounds, not an RSS or total disk-space cap. Storage 
 thread stacks, allocator/OS overhead, public read/feed results and retained visible history are
 separate. Administrative operations drain transactions and use fixed format-bounded scratch rather
 than transaction execution reservations. Their canonical record must still fit the assigned byte
-limit. History, old manifests and unreachable copy-on-write pages are not reclaimed yet, so total
-disk usage can continue to grow even when all backlog budgets are respected.
+limit. Retained history and maintenance scratch are separate from these budgets. Manual maintenance
+can reclaim eligible history and obsolete files; without it, total disk usage continues to grow.
 
 Dependency registration follows durable sequence order. A reader waits for **all** unresolved
 earlier possible writers that overlap its reads, including table-wide declarations, aborted
@@ -172,7 +173,7 @@ manifest entry count, with a read/write entry counted once.
 Recovery supports the full C.4 codec, including older broad-table manifests. It validates supplied
 coverage, canonical key encodings, table-array membership and counts under the historical catalogue
 and policy. It preserves the recorded declarations rather than replacing them with a narrower
-derivation. The writer retains its log and historical versions without rotation or reclamation.
+derivation. Log rotation and retention-aware reclamation are explicit local maintenance operations.
 
 `Ok(Receipt)` is a durability receipt, but its `Outcome` can be `Success` or `Aborted`. A semantic
 abort discards all business writes, records the abort durably and consumes its sequence.
@@ -325,6 +326,112 @@ validation: logical body validation, the first predecessor's local anchor, and o
 require the real historical VM context before import. Logical feed production and replica import
 remain future work. Never treat successful codec decoding as permission to install effects or append
 log bytes.
+
+## Maintenance
+
+`maintain(&db, MaintenanceOptions::default()).await` collects eligible MVCC versions and outcomes,
+retires eligible whole log segments, compacts all five trees and seals the current log. No canonical
+sequence is consumed. Maintenance pauses assignment, finishes every durably logged record, and
+builds a checkpoint at `C = F = D`. Snapshot, cursor and other controls wait during the synchronous
+handover. Already queued but unassigned transactions resume afterwards. Cancelling the maintenance
+waiter after enqueue does not cancel the operation.
+
+Read-only replicas intentionally permit local GC and compaction. Read-only means no new canonical
+submissions, not immutable files: G.5 permits a replica to apply its own local retention policy.
+Maintenance can change local roots, file IDs and retained-history floors without advancing the
+canonical sequence or changing its resolved state and hash-chain anchors. The original source
+directory and its cursor registrations are not affected by maintenance or explicit cursor release on
+the replica.
+
+`MaintenanceOptions` has three independent switches: `collect_history`, `compact` and `rotate_log`.
+Set only `rotate_log` to seal a segment without collecting history. The next canonical record
+creates a new nonempty segment with a fresh, noncolliding ID; reopening also starts a new segment.
+Empty log segments are never published. Existing canonical record bytes and hash-chain anchors do
+not change. Set all switches to false to validate the checkpoint and retry obsolete-file cleanup
+without GC or compaction. There is no automatic history policy or background maintenance scheduler
+yet.
+
+GC selects `G = min(F, current unrevoked snapshot floors, durable cursor baselines)`. It retains
+every version above G, including every installed version above F, and the newest version at or below
+G per key, including tombstones. Outcomes above G and all version-1 catalogue and policy history
+remain. Resolved cursors do not require source bytecode; logical and replica cursors additionally
+pin log coverage from baseline + 1. Only whole segments below the safe log floor retire, so physical
+log retention can be more conservative than the claim floor. Old cursor checkout reports
+`HistoryUnavailable` after the published floors advance.
+
+The coordinator validates the source and candidate history and checks correspondence with retained
+canonical records before retiring sources. Compaction copies reachable nodes into a fresh page file,
+rewriting child and overflow references without inserting each entry through the COW tree. It
+flushes and publishes the new file, then adopts its roots as the live roots before resuming
+assignment. Published page and file identities are not recycled. An uncertain publication failure
+stops the coordinator and reclamation until reopen establishes the selected manifest.
+
+File deletion uses a conservative shared directory lease: **any** storage view, snapshot read, idle
+unrevoked snapshot, worker, checkpoint or backup pin prevents deletion of **all** obsolete page, log
+and manifest files, even unrelated ones. Durable cursors constrain logical floors but do not hold
+physical files open. Revoking or dropping snapshots and finishing backups releases physical pins;
+run maintenance again to retry deletion. Current files are never deleted. There is no in-place page
+reuse. GC without compaction can append unreachable COW pages rather than reduce disk usage.
+
+`MaintenanceReport` reports the frontier, selected generation, old and new floors, removed version
+and outcome counts, retired segment count, page file IDs and page counts, rotation state, and
+deleted or deferred file counts and bytes. `status(&db)` exposes `maintenance_pending`, sampled
+`backup_jobs` and the last successful report. These counts are not a total storage or memory budget:
+validation uses history indexes, GC appends temporary COW paths, and direct compaction holds a
+traversal stack and at most one decoded overflow value at a time.
+
+## Backup and Attach
+
+**Explicit `attach` always renews the cursor namespace, even on an unmarked or already attached
+path. Use `open` for normal crash recovery.** `ATTACH_REQUIRED` is not a prerequisite for
+attachment: arbitrary explicit filesystem copies and attach retries are supported. The caller must
+choose the actual copied directory, or the intended writable restore path after retiring the source
+primary. Calling `attach` on the wrong closed directory will invalidate that directory's old cursor
+tokens; the implementation cannot determine which copy the caller intended.
+
+`backup(&db, new_directory).await` captures and pins one published manifest on the coordinator, then
+copies on a blocking worker while the source continues executing. It returns the exact copied
+`storage::Manifest`, including its potentially earlier C and D. The image contains exact GENESIS and
+manifest bytes, exactly `page_count` complete pages, and exactly the listed committed log prefixes.
+Destination files and directory entries are flushed before a matching CURRENT is selected last. The
+destination must not exist; a failed copy may leave an incomplete directory and is never silently
+overwritten. At most four backup workers run per database; excess requests receive
+`OperationalLimit` for `backup_jobs`.
+
+Backup workers own their pins, not the waiting future. Cancellation after enqueue cannot release
+files while I/O continues. Close joins active backup workers before releasing the source directory
+lock. An idle result or cancelled waiter cannot hold the lock indefinitely, although slow or stalled
+filesystem I/O can delay close. Destination I/O failures do not poison the source database.
+
+Produced images contain a flushed implementation-local `ATTACH_REQUIRED` marker before CURRENT is
+written. Ordinary `open` refuses them. Use an explicit attachment mode:
+
+- `attach(path, AttachMode::ReadOnlyReplica).await` preserves the canonical database identity but
+  rejects transaction, catalogue and policy submissions. Local cursor operations, snapshots,
+  maintenance and backups remain available. The local `READ_ONLY` marker preserves this role on
+  normal reopen. Phase 6 replica import is not implemented.
+- `attach(path, AttachMode::RestorePrimarySourceRetired).await` makes the explicit caller assertion
+  that the source primary has been retired and permits canonical submissions. The library cannot
+  fence a primary on another machine. Never run independent writable primaries with the same GENESIS
+  identity. Promoting a read-only copy requires this same explicit choice.
+- `attach_with_options(path, mode, engine_options).await` selects local worker and capacity
+  settings.
+
+Every explicit attach durably publishes a fresh random cursor namespace through the normal G.3
+publication protocol before enabling APIs. It preserves GENESIS, copied registrations, baselines and
+next-ID counters. It removes the attach-required marker only after namespace and role publication.
+An interrupted attach can be retried explicitly; an extra namespace renewal is safe. Ordinary reopen
+preserves the attached namespace and role. Arbitrary external filesystem copies cannot be recognised
+automatically: attach them explicitly rather than using normal reopen, and do not remove or bypass
+the implementation-local role and attachment markers.
+
+Old tokens are invalid, even when the copied counter later issues the same numeric ID. After the
+consumer has selected the correct copied registration and validated its saved watermark, use
+`rebind_cursor(&db, existing_numeric_id, watermark).await` to obtain a token in the new namespace.
+Rebind checks database identity, registration presence, the protected interval `[baseline, F]` and
+required retained history. It does not select by label or old token, advance the baseline, or clear
+registrations. Labels are nonunique diagnostics, and tokens are not authentication credentials. The
+caller must validate that its derived data actually corresponds to the supplied watermark.
 
 ## Transaction Construction
 
@@ -726,9 +833,10 @@ When `durable_sequence > checkpoint_sequence`, `storage::open` deliberately leav
 suffix unexecuted. The higher-level `database::open` reads and validates that suffix and passes
 every record to the reference execution layer before accepting new submissions. The storage layer
 itself provides no scheduler, logical log writer or recovery coordinator. The database layer
-provides cursor lifecycle APIs and resolved feeds. Logical feed production, replication, backups, GC
-and whole-file compaction remain unimplemented. Old manifests and unreferenced pages are retained
-rather than reclaimed unsafely.
+provides cursor lifecycle APIs, resolved feeds, retention-aware GC, whole-file compaction, log
+rotation and pinned backup with explicit attachment. Logical feed production and replica import
+remain future work. Obsolete files stay retained until durable selection and physical pin
+retirement.
 
 Database recovery also validates retained logical checkpoint history before accepting work, even
 when there is no replay suffix. It checks catalogue lifecycles and immutable schemas, historical row
@@ -745,11 +853,13 @@ publication sequence are unchanged. An OS lock protects the directory until the 
 and scans have been dropped.
 
 **Windows support is experimental and has not been runtime-tested.** No Windows machine was
-available. The workspace, including test targets, has been checked from Linux with
-`cargo check --workspace --all-targets --target x86_64-pc-windows-gnu`. This checks compilation, not
-linking, execution, filesystem behaviour or crash durability. Tests have run on Linux only; other
-Unix platforms have not been runtime-tested either. Do not rely on the Windows backend for important
-data until its filesystem and recovery behaviour has been tested on Windows.
+available. The production libraries have been checked from Linux with
+`cargo check --workspace --lib --target x86_64-pc-windows-gnu`. The current all-target cross-check
+is blocked by the missing `x86_64-w64-mingw32-gcc` compiler needed by the bundled SQLite benchmark
+dependency. A cross-check does not test linking, execution, filesystem behaviour or crash
+durability. Tests have run on Linux only; other Unix platforms have not been runtime-tested either.
+Do not rely on the Windows backend for important data until its filesystem and recovery behaviour
+has been tested on Windows.
 
 The Windows backend uses synchronous offset I/O, writable directory handles opened with
 `FILE_FLAG_BACKUP_SEMANTICS`, and `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` and
@@ -787,6 +897,16 @@ recovery without applying increments twice. Access-manifest tests cover canonica
 merging, per-mode suppression, zero-width points, conservative CFG joins and failures, historical
 schema checks, actual normalized resource-7 counts, point-manifest recovery and rejection before
 sequence allocation.
+
+Maintenance tests cover snapshots and durable cursors across GC and rotation, tombstone baselines,
+metadata retention, exact feeds and recovery after source logs are deleted, and direct
+reachable-node copying with internal and overflow references. Gated-worker tests drain
+above-frontier installations before compaction and verify writes after live-root handover. Pinned
+backup tests copy an earlier `C < D` image while the source writes and compacts, replay its exact
+suffix, reject old namespace tokens despite numeric-ID reuse, validate administrative rebind,
+preserve read-only roles, and join cancelled backup waiters during close. Publication faults check
+old/new CURRENT selection and forbid reclamation after uncertain handover. A separate native-process
+test checks directory-lock exclusion.
 
 Production scheduler tests hold real workers behind per-database test gates and check independent
 progress, inverted blind-write completion, omitted and aborted point/table predecessors, old

@@ -27,6 +27,8 @@ pub(super) struct Completion {
 }
 
 pub(super) struct Pool {
+    #[cfg(test)]
+    pub hooks: Arc<test_support::Hooks>,
     senders: Vec<mpsc::SyncSender<Job>>,
     threads: Vec<JoinHandle<()>>,
     pub completed: tokio::sync::mpsc::Receiver<Completion>,
@@ -52,6 +54,8 @@ pub(super) fn start(
 ) -> std::io::Result<Pool> {
     let (complete, completed) = tokio::sync::mpsc::channel(count);
     let mut pool = Pool {
+        #[cfg(test)]
+        hooks: hooks.clone(),
         senders: Vec::new(),
         threads: Vec::new(),
         completed,

@@ -23,6 +23,7 @@ pub(crate) mod cursor;
 mod engine;
 mod exchange;
 mod feed;
+mod maintenance;
 mod record;
 mod scheduler;
 pub(crate) mod snapshot;
@@ -41,6 +42,7 @@ pub use cursor::RetentionFloors;
 pub use cursor::acknowledge_cursor;
 pub use cursor::checkout_cursor;
 pub use cursor::list_cursors;
+pub use cursor::rebind_cursor;
 pub use cursor::release_cursor;
 pub use cursor::reopen_cursor;
 pub use cursor::retention_status;
@@ -54,6 +56,14 @@ pub use exchange::LogicalRecord;
 pub use exchange::MAX_BATCH_BYTES;
 pub use exchange::Watermark;
 pub use feed::read_feed;
+pub use maintenance::AttachMode;
+pub use maintenance::MaintenanceOptions;
+pub use maintenance::MaintenanceReport;
+pub use maintenance::Reclaimed;
+pub use maintenance::attach;
+pub use maintenance::attach_with_options;
+pub use maintenance::backup;
+pub use maintenance::maintain;
 pub use scheduler::EngineStatus;
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotScan;
@@ -86,6 +96,7 @@ pub struct Database {
     stopped: watch::Receiver<()>,
     database_id: [u8; 16],
     cursor_namespace: [u8; 16],
+    read_only: bool,
     #[cfg(test)]
     hooks: Arc<workers::test_support::Hooks>,
 }
@@ -99,6 +110,10 @@ impl Database {
     /// The persistent namespace used for cursor identities.
     pub fn cursor_namespace(&self) -> [u8; 16] {
         self.cursor_namespace
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 }
 
@@ -141,6 +156,7 @@ impl Default for BatchLimits {
 /// Submission and system errors, separate from deterministic VM aborts.
 #[derive(Debug)]
 pub enum Error {
+    ReadOnly,
     SnapshotRevoked,
     HistoryUnavailable,
     CursorReleased,
@@ -182,6 +198,7 @@ impl fmt::Display for Error {
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
         match self {
+            Self::ReadOnly => f.write_str("read-only replica cannot accept canonical submissions"),
             Self::SnapshotRevoked => f.write_str("snapshot has been revoked"),
             Self::HistoryUnavailable => f.write_str("required history is unavailable"),
             Self::CursorReleased => f.write_str("cursor has been released"),
@@ -201,7 +218,7 @@ impl fmt::Display for Error {
                 limit,
             } => write!(
                 f,
-                "operational limit {resource}: requires {required} bytes, configured {limit}"
+                "operational limit {resource}: requires {required}, configured {limit}"
             ),
             Self::Storage(error) => error.fmt(f),
             Self::Uncertain { sequence, source } => {
@@ -245,6 +262,14 @@ fn persisted_read(error: vm::Error) -> Error {
 }
 
 enum Control {
+    Maintenance {
+        options: MaintenanceOptions,
+        reply: oneshot::Sender<Result<MaintenanceReport>>,
+    },
+    Backup {
+        destination: PathBuf,
+        reply: oneshot::Sender<Result<storage::Manifest>>,
+    },
     Snapshot {
         reply: oneshot::Sender<Result<Snapshot>>,
     },
@@ -281,7 +306,7 @@ pub async fn create_with_options(
     options: CreateOptions,
     engine: EngineOptions,
 ) -> Result<Database> {
-    start(path.as_ref().to_owned(), Some(options), engine).await
+    start(path.as_ref().to_owned(), Some(options), engine, None).await
 }
 
 /// Open an existing database and replay its durable post-checkpoint records
@@ -299,7 +324,7 @@ pub async fn open_with_options(
     path: impl AsRef<Path>,
     engine: EngineOptions,
 ) -> Result<Database> {
-    start(path.as_ref().to_owned(), None, engine).await
+    start(path.as_ref().to_owned(), None, engine, None).await
 }
 
 /// Inspect the latest coordinator sample without waiting for a worker or I/O.
@@ -317,6 +342,7 @@ async fn start(
     path: PathBuf,
     options: Option<CreateOptions>,
     engine_options: EngineOptions,
+    attachment: Option<AttachMode>,
 ) -> Result<Database> {
     budget::validate(&engine_options)?;
     let queue = budget::Queue::new(&engine_options);
@@ -338,7 +364,17 @@ async fn start(
             let _stopped = stopped;
             let store = match options {
                 Some(options) => initialize(path, options),
-                None => storage::open(path).and_then(|mut store| {
+                None => (match attachment {
+                    Some(mode) => random_uuid().and_then(|namespace| {
+                        storage::backup::attach(
+                            &path,
+                            namespace,
+                            mode == AttachMode::ReadOnlyReplica,
+                        )
+                    }),
+                    None => storage::open(path),
+                })
+                .and_then(|mut store| {
                     engine::recover(&mut store)?;
                     Ok(store)
                 }),
@@ -362,6 +398,7 @@ async fn start(
                     let identities = (
                         store.genesis().database_id,
                         store.manifest().cursor_namespace,
+                        store.is_read_only(),
                     );
                     if ready.send(Ok(identities)).is_ok() {
                         let panic_queue = writer_queue.clone();
@@ -395,7 +432,8 @@ async fn start(
             }
         })
         .map_err(|error| Error::Storage(storage::Error::Io(error)))?;
-    let (database_id, cursor_namespace) = initialized.await.map_err(|_| Error::Closed)??;
+    let (database_id, cursor_namespace, read_only) =
+        initialized.await.map_err(|_| Error::Closed)??;
     Ok(Database {
         sender,
         control,
@@ -404,6 +442,7 @@ async fn start(
         stopped: completion,
         database_id,
         cursor_namespace,
+        read_only,
         #[cfg(test)]
         hooks,
     })
@@ -514,6 +553,9 @@ async fn submit(
     database: &Database,
     command: Command,
 ) -> Result<Receipt> {
+    if database.read_only {
+        return Err(Error::ReadOnly);
+    }
     let permit = budget::reserve(&database.queue, &command).await?;
     let (reply, result) = oneshot::channel();
     database
@@ -539,6 +581,8 @@ async fn submit(
 /// All snapshots and their iterators are revoked before this returns. In-flight
 /// reads finish at their original view; idle handles do not delay close. Cursor
 /// registrations remain durable and can be reopened using their saved tokens.
+/// Active backup workers finish before the lock is released, even when their
+/// waiting futures have been cancelled. Stalled filesystem I/O can delay close.
 pub async fn close(database: &Database) -> Result<()> {
     let result = database
         .sender
@@ -879,6 +923,7 @@ mod tests {
             stopped: watch::channel(()).1,
             database_id: [1; 16],
             cursor_namespace: [2; 16],
+            read_only: false,
         };
         database.sender.try_send(Request::Close).unwrap();
         {
@@ -909,6 +954,7 @@ mod tests {
             stopped: watch::channel(()).1,
             database_id: [1; 16],
             cursor_namespace: [2; 16],
+            read_only: false,
         };
         let mut future = pin!(execute(&database, tx! { return 42; }.unwrap(), policy()));
         assert!(matches!(
