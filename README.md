@@ -488,6 +488,14 @@ same-directory replacement and durable file and directory synchronization. Write
 are not proof of those guarantees. After a publication I/O error, the store rejects further
 mutations with `NeedsRecovery`; drop its handles and reopen to establish which publication survived.
 
+## Benchmarks
+
+Run the single-client KV comparison against redb and SQLite with
+`cargo run --release --example kv_bench -- --dir /path/to/existing/directory`. See
+[BENCHMARKS.md](BENCHMARKS.md) for separate buffered and durable measurements, reproducible
+commands, local results and comparison limits. The harness uses temporary databases, not existing
+application data.
+
 ## Development
 
 Run `cargo test --workspace`, `cargo +nightly fmt --all -- --check` and
