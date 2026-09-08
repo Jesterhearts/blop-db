@@ -70,6 +70,11 @@ pub(super) enum Operation {
         after: Watermark,
         limits: BatchLimits,
     },
+    LogicalFeed {
+        token: CursorToken,
+        after: Watermark,
+        limits: BatchLimits,
+    },
 }
 
 pub(super) enum Response {
@@ -577,6 +582,11 @@ pub(super) fn handle(
             after,
             limits,
         } => feed::batch(store, &token, after, limits, frontier).map(Response::Batch),
+        Operation::LogicalFeed {
+            token,
+            after,
+            limits,
+        } => super::replica::batch(store, &token, after, limits, frontier).map(Response::Batch),
     }
 }
 

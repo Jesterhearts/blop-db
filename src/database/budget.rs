@@ -65,6 +65,7 @@ pub(super) fn validate(options: &EngineOptions) -> Result<()> {
 
 #[derive(Clone, Debug)]
 pub(super) struct Queue {
+    pub import: Arc<Semaphore>,
     pub count: Arc<Semaphore>,
     pub bytes: Arc<Semaphore>,
     pub max_count: usize,
@@ -74,6 +75,7 @@ pub(super) struct Queue {
 impl Queue {
     pub fn new(options: &EngineOptions) -> Self {
         Self {
+            import: Arc::new(Semaphore::new(1)),
             count: Arc::new(Semaphore::new(options.submission_queue_count)),
             bytes: Arc::new(Semaphore::new(options.submission_queue_bytes)),
             max_count: options.submission_queue_count,
@@ -92,6 +94,21 @@ pub(super) async fn reserve(
     command: &Command,
 ) -> Result<Permit> {
     let bytes = input_bytes(command)?;
+    reserve_batch(queue, 1, bytes).await
+}
+
+pub(super) async fn reserve_batch(
+    queue: &Queue,
+    count: usize,
+    bytes: u64,
+) -> Result<Permit> {
+    if count > queue.max_count {
+        return Err(Error::OperationalLimit {
+            resource: "submission_queue_count",
+            required: count as u64,
+            limit: queue.max_count as u64,
+        });
+    }
     if bytes > queue.max_bytes as u64 {
         return Err(Error::OperationalLimit {
             resource: "submission_queue_bytes",
@@ -102,7 +119,7 @@ pub(super) async fn reserve(
     let count = queue
         .count
         .clone()
-        .acquire_owned()
+        .acquire_many_owned(count as u32)
         .await
         .map_err(|_| Error::Closed)?;
     let bytes = queue
@@ -155,6 +172,7 @@ pub(super) fn input_bytes(command: &Command) -> Result<u64> {
 }
 
 pub(super) fn close(queue: &Queue) {
+    queue.import.close();
     queue.count.close();
     queue.bytes.close();
 }

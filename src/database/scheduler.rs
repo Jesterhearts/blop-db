@@ -30,6 +30,7 @@ use super::cursor;
 use super::engine;
 use super::maintenance;
 use super::record;
+use super::replica;
 use super::snapshot;
 use super::workers;
 use crate::storage;
@@ -674,6 +675,59 @@ pub(super) fn run(
                 receiver.close();
                 budget::close(&queue);
             }
+            Event::Request(Some(Request::Import {
+                batch,
+                reply,
+                permit,
+                slot,
+            })) => {
+                prefer_requests = false;
+                // Imports are restricted to replicas, which cannot have a
+                // prepared local head or unresolved local canonical work.
+                let result = if !store.is_read_only() {
+                    Err(Error::InvalidInput(
+                        "logical import requires a read-only replica",
+                    ))
+                } else if head.is_some()
+                    || !schedule.entries.is_empty()
+                    || schedule.frontier != store.manifest().durable_sequence
+                {
+                    Err(Error::Storage(storage::Error::NeedsRecovery))
+                } else {
+                    replica::install(
+                        &mut store,
+                        &batch,
+                        &options,
+                        &status,
+                        #[cfg(test)]
+                        &pool.hooks,
+                    )
+                };
+                failed = result.as_ref().is_err_and(|error| {
+                    matches!(
+                        error,
+                        Error::Storage(_) | Error::Read(_) | Error::Uncertain { .. }
+                    )
+                });
+                if failed {
+                    last_error = result.as_ref().err().map(ToString::to_string);
+                }
+                if let Ok(watermark) = &result {
+                    schedule.frontier = watermark.sequence();
+                    status.send_modify(|s| {
+                        s.visibility_frontier = schedule.frontier;
+                        s.checkpoint = store.manifest().checkpoint_sequence;
+                        s.durable_frontier = store.manifest().durable_sequence;
+                        s.log_tail = s.durable_frontier;
+                    });
+                }
+                drop(batch);
+                drop((permit, slot));
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+            }
             Event::Request(Some(Request::Execute {
                 mut command,
                 reply,
@@ -752,8 +806,14 @@ pub(super) fn run(
         }));
     }
     while let Some(request) = receiver.blocking_recv() {
-        if let Request::Execute { reply, .. } = request {
-            let _ = reply.send(Err(Error::Closed));
+        match request {
+            Request::Execute { reply, .. } => {
+                let _ = reply.send(Err(Error::Closed));
+            }
+            Request::Import { reply, .. } => {
+                let _ = reply.send(Err(Error::Closed));
+            }
+            Request::Close => {}
         }
     }
     while let Some(request) = control.blocking_recv() {

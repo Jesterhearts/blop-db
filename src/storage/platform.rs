@@ -52,6 +52,17 @@ pub(super) fn write_all_at(
     mut offset: u64,
 ) -> io::Result<()> {
     check_range(offset, bytes.len())?;
+    #[cfg(test)]
+    let operation = faults::Operation::Write {
+        offset,
+        length: bytes.len(),
+    };
+    #[cfg(test)]
+    if faults::hit(operation.clone(), faults::Phase::Before)? {
+        let _guard = faults::Guard::suspend();
+        write_all_at(file, &bytes[..bytes.len().div_ceil(2)], offset)?;
+        return Err(faults::error());
+    }
     while !bytes.is_empty() {
         #[cfg(unix)]
         let result = file.write_at(bytes, offset);
@@ -67,6 +78,8 @@ pub(super) fn write_all_at(
             Err(error) => return Err(error),
         }
     }
+    #[cfg(test)]
+    faults::hit(operation, faults::Phase::After)?;
     Ok(())
 }
 
@@ -88,7 +101,12 @@ fn check_range(
 
 /// File handles passed here must have write access on Windows.
 pub(super) fn sync_file(file: &File) -> io::Result<()> {
-    file.sync_all()
+    #[cfg(test)]
+    faults::hit(faults::Operation::SyncFile, faults::Phase::Before)?;
+    file.sync_all()?;
+    #[cfg(test)]
+    faults::hit(faults::Operation::SyncFile, faults::Phase::After)?;
+    Ok(())
 }
 
 pub(super) fn sync_file_path(path: &Path) -> io::Result<()> {
@@ -119,7 +137,12 @@ pub(super) fn open_directory(path: &Path) -> io::Result<File> {
 /// Never substitute a no-op when a filesystem does not support directory
 /// flushing.
 pub(super) fn sync_directory(directory: &File) -> io::Result<()> {
-    directory.sync_all()
+    #[cfg(test)]
+    faults::hit(faults::Operation::SyncDirectory, faults::Phase::Before)?;
+    directory.sync_all()?;
+    #[cfg(test)]
+    faults::hit(faults::Operation::SyncDirectory, faults::Phase::After)?;
+    Ok(())
 }
 
 /// Replace a name without a delete-first gap or cross-volume copy fallback.
@@ -137,9 +160,18 @@ pub(super) fn rename(
             "publication rename must stay in one directory",
         ));
     }
+    #[cfg(test)]
+    let operation = faults::Operation::Rename(
+        destination
+            .file_name()
+            .unwrap_or(destination.as_os_str())
+            .to_owned(),
+    );
+    #[cfg(test)]
+    faults::hit(operation.clone(), faults::Phase::Before)?;
     #[cfg(unix)]
     {
-        std::fs::rename(source, destination)
+        std::fs::rename(source, destination)?;
     }
     #[cfg(windows)]
     {
@@ -158,11 +190,12 @@ pub(super) fn rename(
             )
         };
         if result == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+            return Err(io::Error::last_os_error());
         }
     }
+    #[cfg(test)]
+    faults::hit(operation, faults::Phase::After)?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -178,11 +211,132 @@ fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
     Ok(encoded)
 }
 
+/// Scoped errors on real I/O, not a simulation of power loss or write
+/// reordering.
+#[cfg(test)]
+pub(crate) mod faults {
+    use std::cell::RefCell;
+    use std::ffi::OsString;
+    use std::marker::PhantomData;
+    use std::rc::Rc;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum Operation {
+        Write { offset: u64, length: usize },
+        SyncFile,
+        SyncDirectory,
+        Rename(OsString),
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Phase {
+        Before,
+        After,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct Event(pub Operation, pub Phase);
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Failure {
+        Error,
+        PartialWrite,
+    }
+
+    struct State {
+        failure: Option<(usize, Failure)>,
+        trace: Vec<Event>,
+    }
+
+    thread_local! {
+        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    // A scope must be dropped on its originating thread to restore that
+    // thread's state.
+    pub(crate) struct Guard {
+        previous: Option<State>,
+        _local: PhantomData<Rc<()>>,
+    }
+
+    impl Guard {
+        pub(crate) fn new(failure: Option<(usize, Failure)>) -> Self {
+            Self {
+                previous: STATE.replace(Some(State {
+                    failure,
+                    trace: Vec::new(),
+                })),
+                _local: PhantomData,
+            }
+        }
+
+        pub(super) fn suspend() -> Self {
+            Self {
+                previous: STATE.replace(None),
+                _local: PhantomData,
+            }
+        }
+
+        pub(crate) fn trace(&self) -> Vec<Event> {
+            STATE.with_borrow(|state| state.as_ref().unwrap().trace.clone())
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STATE.replace(self.previous.take());
+        }
+    }
+
+    pub(super) fn error() -> std::io::Error {
+        std::io::Error::other("injected filesystem boundary failure")
+    }
+
+    pub(super) fn hit(
+        operation: Operation,
+        phase: Phase,
+    ) -> std::io::Result<bool> {
+        STATE.with_borrow_mut(|state| {
+            let Some(state) = state else { return Ok(false) };
+            let index = state.trace.len();
+            let partial = matches!(operation, Operation::Write { .. }) && phase == Phase::Before;
+            state.trace.push(Event(operation, phase));
+            match state.failure {
+                Some((target, failure)) if target == index => match failure {
+                    Failure::PartialWrite if partial => Ok(true),
+                    _ => Err(error()),
+                },
+                _ => Ok(false),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn fault_scopes_restore_nested_state_on_unwind_and_do_not_cross_threads() {
+        let file = tempfile::tempfile().unwrap();
+        let outer = faults::Guard::new(Some((2, faults::Failure::Error)));
+        sync_file(&file).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let _inner = faults::Guard::new(Some((0, faults::Failure::Error)));
+            assert!(sync_file(&file).is_err());
+            panic!("unwind nested scope");
+        });
+        assert!(result.is_err());
+        std::thread::scope(|scope| {
+            scope.spawn(|| sync_file(&file).unwrap()).join().unwrap();
+        });
+        assert_eq!(outer.trace().len(), 2);
+        assert!(sync_file(&file).is_err());
+        drop(outer);
+        sync_file(&file).unwrap();
+    }
 
     #[test]
     fn offset_io_reports_partial_eof_and_does_not_touch_other_bytes() {

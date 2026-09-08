@@ -40,13 +40,24 @@ pub(super) const TREES: [TreeId; 5] = [
     TreeId::Cursors,
 ];
 
+pub(super) struct DirectoryLease(File);
+
+impl Drop for DirectoryLease {
+    fn drop(&mut self) {
+        // Closing alone can leave a flock held by a descriptor transiently
+        // inherited across fork. Release when the last registered owner
+        // retires.
+        let _ = self.0.unlock();
+    }
+}
+
 /// The exclusive directory owner and its latest installed physical roots.
 ///
 /// Mutating functions require exclusive access. Views and scans can be read
 /// concurrently.
 pub struct Store {
     directory: PathBuf,
-    pub(super) lease: Arc<File>,
+    pub(super) lease: Arc<DirectoryLease>,
     pub(super) pages: PageFile,
     genesis: Genesis,
     manifest: Manifest,
@@ -81,7 +92,7 @@ impl Store {
 #[derive(Clone)]
 pub struct View {
     pub(super) reader: PageReader,
-    pub(super) lease: Arc<File>,
+    pub(super) lease: Arc<DirectoryLease>,
     pub(super) roots: [u64; 5],
 }
 
@@ -101,7 +112,7 @@ pub struct Mutation {
 /// A lazy ordered physical scan which also pins exclusive directory ownership.
 pub struct Scan {
     inner: tree::Scan,
-    _lease: Arc<File>,
+    _lease: Arc<DirectoryLease>,
 }
 
 impl Iterator for Scan {
@@ -627,7 +638,7 @@ fn persisted(error: Error) -> Error {
     }
 }
 
-pub(super) fn lock(directory: &Path) -> Result<Arc<File>> {
+pub(super) fn lock(directory: &Path) -> Result<Arc<DirectoryLease>> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -635,7 +646,7 @@ pub(super) fn lock(directory: &Path) -> Result<Arc<File>> {
         .truncate(false)
         .open(directory.join("LOCK"))?;
     match file.try_lock() {
-        Ok(()) => Ok(Arc::new(file)),
+        Ok(()) => Ok(Arc::new(DirectoryLease(file))),
         Err(TryLockError::WouldBlock) => Err(Error::Locked),
         Err(TryLockError::Error(error)) => Err(error.into()),
     }
@@ -1104,6 +1115,18 @@ mod tests {
     }
 
     #[test]
+    fn inherited_descriptor_does_not_extend_the_logical_directory_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let lease = lock(directory.path()).unwrap();
+        let inherited = lease.0.try_clone().unwrap();
+        drop(lease);
+        // A subprocess can briefly inherit the open file description before
+        // exec closes CLOEXEC descriptors. Only registered roots own the lease.
+        assert!(lock(directory.path()).is_ok());
+        drop(inherited);
+    }
+
+    #[test]
     fn checkpoint_filters_future_versions_without_changing_live_roots() {
         let (_directory, mut store) = new_store();
         let (manifest, digests) = write_log(&store, 3);
@@ -1475,4 +1498,6 @@ mod tests {
             assert!(open(&path).unwrap().is_read_only());
         }
     }
+
+    mod fault_tests;
 }

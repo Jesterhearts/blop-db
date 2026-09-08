@@ -2,15 +2,18 @@
 
 This repository contains a transaction compiler, a single-threaded reference VM, an engine-facing
 storage layer and an async database API with revocable snapshots, durable retention cursors,
-resolved feeds, manual maintenance and pinned physical backups. A coordinator sequences
-transactions, publishes their log records before dispatch, and installs complete worker outcomes
-against the latest storage roots. A persistent worker pool interprets independent transactions in
-parallel. Receipts follow prefix checkpoint publication.
+resolved and logical feeds, verified replica import, manual maintenance and pinned physical backups.
+A coordinator sequences transactions, publishes their log records before dispatch, and installs
+complete worker outcomes against the latest storage roots. A persistent worker pool interprets
+independent transactions in parallel. Receipts follow prefix checkpoint publication.
 
 `tx!` compiles a small deterministic transaction program to the ISA 1 bytecode specified in
 [`DESIGN.md`](DESIGN.md), appendices A, B and C. Parsing, type checking, register allocation and
 branch resolution happen during Rust compilation. Runtime binding snapshots the captures and
 resolves table IDs. It does not evaluate the VM program.
+
+See [CONFORMANCE.md](CONFORMANCE.md) for the implementation map, verification commands, optional
+implementation choices and platform qualification limits.
 
 ## Async Writes
 
@@ -102,6 +105,16 @@ those inputs have not been accepted by the engine. Count permits can also be hel
 byte permits, so diagnostics report admission reservations rather than only channel occupancy.
 Cancelling such a wait releases its permits. The writer never drops a sequenced transaction to make
 space.
+
+Logical imports share these count and byte budgets. At most one import is parsing, queued or running
+per database; other callers wait with their own borrowed input. An accepted batch reserves its total
+record count (one for an empty poll), canonical bytes, decoded commands, supplied outcomes and codec
+scratch until completion. Its canonical record count and bytes must also fit the assigned-backlog
+limits. Reference execution is sequential, so preparation and execution capacity cover the retained
+batch plus one record's interpreter reservation, not concurrent interpreters for the whole batch.
+H.1 decoding is format-bounded and runs on the caller before enqueueing; historical validation and
+reference execution run on the coordinator. Prefix-copy disk space and retained history are separate
+from these accounting budgets.
 
 Before assigning a transaction, the coordinator reserves its decoded program, scopes, dependency
 list, registers, distinct-address set, overlay, pending outcome and above-frontier logical versions.
@@ -319,13 +332,97 @@ history. A cancelled checkout can still leave a durable registration; inspect th
 assuming cancellation released it.
 
 All three cursor kinds are supported: resolved feed (1), logical feed (2) and log replica (3). Kinds
-2 and 3 additionally check and protect original log availability from baseline + 1. H.1 codecs
-support both `FeedRecords::Resolved` and `FeedRecords::Logical`, checking CRCs, bounded counts,
-consecutive sequences and logical envelope/outcome hash-chain agreement. This is only exchange
-validation: logical body validation, the first predecessor's local anchor, and outcome comparison
-require the real historical VM context before import. Logical feed production and replica import
-remain future work. Never treat successful codec decoding as permission to install effects or append
-log bytes.
+2 and 3 additionally check and protect original log availability from baseline + 1.
+`read_logical_feed(&db, &cursor, after, limits).await` accepts either kind and returns
+`FeedRecords::Logical`: the exact canonical record bytes together with each resolved outcome. It
+uses the same complete-record limits, visible-only prefix and no-acknowledgement rules as
+`read_feed`. Local log segments may have different IDs and boundaries on a replica; the canonical
+record bytes, source sequences and SHA256 digests do not change.
+
+H.1 codecs support both feed kinds, checking CRCs, bounded counts, consecutive sequences and logical
+envelope/outcome hash-chain agreement, including decode-side inter-record chaining. Codec validation
+alone does not prove that supplied effects match VM execution or the destination's prefix.
+
+## Logical Replication
+
+Use a retained kind-2 or kind-3 source cursor, `backup`, and
+`attach(path, AttachMode::ReadOnlyReplica)` to establish a replica with the same database identity.
+Read its actual recovered `snapshot(&replica).await?.watermark()`, request the source's logical
+suffix from that position, encode the batch and call `import_logical(&replica, &encoded).await`. The
+source must have made that baseline visible before it can serve the suffix. Acknowledge the source
+cursor only after the replica returns its durable visible watermark. Reading or importing does not
+acknowledge any source or local cursor automatically.
+
+Import has two separate execution stages:
+
+1. Parse the entire bounded H.1 batch and its record bodies before enqueueing. On the coordinator,
+   require a read-only replica at `C = F = D`, the matching database identity and baseline, and a
+   first predecessor matching the local durable anchor. Copy the pinned prefix into a private
+   disposable directory. Validate historical schemas, policies and C.4 scopes, then execute every
+   record with the sequential reference VM in that copy. Compare every generated canonical outcome
+   byte-for-byte with the supplied outcome, including returned values, effects and abort details.
+1. Only after every comparison succeeds, append the exact validated canonical bytes through normal
+   G.3 publication. Then use the normal durable replay and installation path, publish a checkpoint
+   and return the new H.2 watermark. No supplied effects are substituted for VM execution.
+
+The coordinator serializes the whole import. Local canonical submissions are prohibited by the
+persisted read-only role; snapshots, feeds, cursor changes, backups and maintenance controls wait
+until the import finishes. Previously captured snapshots keep their original views and existing
+cursors keep their baselines. A malformed, gapped, wrong-anchor or divergent batch is rejected
+without changing the live prefix, and the replica remains usable. An empty logical batch still
+checks its database identity and exact local baseline.
+
+Validation uses real copied files, not snapshots that share mutable storage. Temporary copies are
+removed on normal completion, rejection and unwinding. A process crash can leave a `blop-import-*`
+directory in the OS temporary directory; it is not authoritative and database recovery never opens
+it. Such orphans may be removed after establishing that their process has stopped. Import currently
+copies the whole selected physical prefix per batch, so it favours a simple isolation boundary over
+large-database replication throughput. It needs sufficient temporary disk space and working file and
+directory synchronization there as well as at the replica.
+
+All outcomes are checked before the first append, but appends publish D individually. A system error
+or crash can therefore leave a shorter, already verified durable prefix. System failures stop the
+replica until reopen. `Error::Uncertain` and cancellation after enqueueing do not mean that nothing
+was imported. Close and reopen, inspect the recovered snapshot watermark, and request only the
+remaining source suffix. Do not blindly retry the previous batch. There is no pending-verification
+journal, group commit or raw-segment transport API.
+
+## Derived SQLite
+
+[`examples/derived_sqlite.rs`](examples/derived_sqlite.rs) is a persisted resolved-feed consumer:
+
+```sh
+cargo run --example derived_sqlite -- /path/to/source-db /path/to/index.sqlite
+```
+
+It maintains a SQLite mirror of live source keys and values as opaque canonical blobs, a typed table
+catalogue with names and liveness, and a deterministic secondary index on SHA256 of each encoded
+value. Table IDs and source sequences use eight-byte big-endian blobs, avoiding SQLite's signed
+integer limit. The hash is a lookup aid, not a substitute for comparing complete values. An audit
+table retains the canonical outcome at every source record boundary, including aborts and ignored
+policy events. This demonstration retains that audit history without compaction.
+
+Each SQLite transaction applies complete source records and writes their final H.2 watermark blob in
+the same durable commit. Only then does it acknowledge the source cursor. SQLite uses rollback
+journalling and `synchronous = FULL`; keep its file and any journals together. On startup it reads
+the committed watermark and token from SQLite, checks the source identity and conservative cursor
+baseline, advances an older cursor and resumes after the committed position. An uncertain SQLite
+commit requires reopening SQLite and inspecting that committed watermark, not repeating staged
+effects based on a guessed commit result.
+
+Initial creation requires source history from sequence zero. Missing history, a wrong database or
+cursor namespace, a cursor ahead of the derived watermark, and an unsupported saved format are
+errors, not reasons to publish an empty mirror. This example deliberately does not implement a
+snapshot rebuild. It uses one consumer process per index, processes bounded batches until it reaches
+the current source frontier, and can be invoked again to consume later records. An interrupted
+initial cursor checkout may leave an unused source registration; use the cursor administration APIs
+to release it explicitly.
+
+Derived-consumer retry safety is separate from business-request deduplication. A retried `execute`
+still enters the canonical log at a new sequence. To deduplicate a business operation, atomically
+check its request ID, verify that a previously stored payload matches, and store its result
+alongside the business writes. A business abort rolls back that request-ID write too; the engine
+does not automatically cache the aborted request as completed.
 
 ## Maintenance
 
@@ -409,7 +506,7 @@ written. Ordinary `open` refuses them. Use an explicit attachment mode:
 - `attach(path, AttachMode::ReadOnlyReplica).await` preserves the canonical database identity but
   rejects transaction, catalogue and policy submissions. Local cursor operations, snapshots,
   maintenance and backups remain available. The local `READ_ONLY` marker preserves this role on
-  normal reopen. Phase 6 replica import is not implemented.
+  normal reopen. Verified logical import is permitted only in this role.
 - `attach(path, AttachMode::RestorePrimarySourceRetired).await` makes the explicit caller assertion
   that the source primary has been retired and permits canonical submissions. The library cannot
   fence a primary on another machine. Never run independent writable primaries with the same GENESIS
@@ -833,10 +930,9 @@ When `durable_sequence > checkpoint_sequence`, `storage::open` deliberately leav
 suffix unexecuted. The higher-level `database::open` reads and validates that suffix and passes
 every record to the reference execution layer before accepting new submissions. The storage layer
 itself provides no scheduler, logical log writer or recovery coordinator. The database layer
-provides cursor lifecycle APIs, resolved feeds, retention-aware GC, whole-file compaction, log
-rotation and pinned backup with explicit attachment. Logical feed production and replica import
-remain future work. Obsolete files stay retained until durable selection and physical pin
-retirement.
+provides cursor lifecycle APIs, resolved and logical feeds, verified replica import, retention-aware
+GC, whole-file compaction, log rotation and pinned backup with explicit attachment. Obsolete files
+stay retained until durable selection and physical pin retirement.
 
 Database recovery also validates retained logical checkpoint history before accepting work, even
 when there is no replay suffix. It checks catalogue lifecycles and immutable schemas, historical row
@@ -907,6 +1003,17 @@ suffix, reject old namespace tokens despite numeric-ID reuse, validate administr
 preserve read-only roles, and join cancelled backup waiters during close. Publication faults check
 old/new CURRENT selection and forbid reclamation after uncertain handover. A separate native-process
 test checks directory-lock exclusion.
+
+Logical replication tests compare exact source bytes and outcomes and typed state at each imported
+prefix, including computed scopes, semantic aborts, catalogue changes, policy crossings, different
+segment packaging, retained snapshots and cursor-protected GC. They reject malformed chains with
+recomputed CRCs and digests, wrong anchors and divergent results before publication. Per-replica
+gates cover shared admission and deferred controls. Injected errors and subprocess exits before
+validation, after comparison, during multi-record publication and before live replay verify old/new
+CURRENT selection and recovery of only preverified prefixes. SQLite subprocess tests exit before
+commit, after commit before acknowledgement and after acknowledgement, then reopen both databases
+and verify no missing or duplicate derived records. These tests cover software interruption and lost
+completion, not arbitrary hardware power loss or every SQLite internal commit fault.
 
 Production scheduler tests hold real workers behind per-database test gates and check independent
 progress, inverted blind-write completion, omitted and aborted point/table predecessors, old

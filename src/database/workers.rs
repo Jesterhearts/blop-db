@@ -152,6 +152,7 @@ pub(super) mod test_support {
         Gate(Arc<Gate>),
         Panic,
         Error,
+        Exit,
         Delay(Duration),
     }
 
@@ -186,6 +187,7 @@ pub(super) mod test_support {
             }
             Some(Action::Panic) => panic!("injected worker panic"),
             Some(Action::Error) => return Err(super::failure("injected worker I/O failure")),
+            Some(Action::Exit) => std::process::exit(77),
             Some(Action::Delay(duration)) => std::thread::sleep(duration),
             None => {}
         }

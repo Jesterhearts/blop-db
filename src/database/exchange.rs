@@ -360,7 +360,7 @@ fn check_frame(
     Ok(())
 }
 
-fn read_blob<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
+pub(super) fn read_blob<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
     let (length, rest) = input
         .split_at_checked(4)
         .ok_or(Error::InvalidFormat("truncated blob length"))?;

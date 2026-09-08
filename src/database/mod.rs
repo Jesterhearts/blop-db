@@ -25,6 +25,7 @@ mod exchange;
 mod feed;
 mod maintenance;
 mod record;
+mod replica;
 mod scheduler;
 pub(crate) mod snapshot;
 mod workers;
@@ -64,6 +65,8 @@ pub use maintenance::attach;
 pub use maintenance::attach_with_options;
 pub use maintenance::backup;
 pub use maintenance::maintain;
+pub use replica::import_logical;
+pub use replica::read_logical_feed;
 pub use scheduler::EngineStatus;
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotScan;
@@ -280,6 +283,12 @@ enum Control {
 }
 
 enum Request {
+    Import {
+        batch: replica::ParsedBatch,
+        reply: oneshot::Sender<Result<Watermark>>,
+        permit: budget::Permit,
+        slot: tokio::sync::OwnedSemaphorePermit,
+    },
     Execute {
         command: Box<Command>,
         reply: oneshot::Sender<Result<Receipt>>,
@@ -610,6 +619,100 @@ mod tests {
 
     fn policy() -> Limits {
         Limits::default()
+    }
+
+    fn deduplicated(
+        request: u64,
+        payload: u64,
+        fail: bool,
+    ) -> Transaction {
+        tx! {
+            captures { request: u64 = request, payload: u64 = payload, fail: bool = fail }
+            tables { data: u64 => u64 = 1, requests: u64 => (u64, u64) = 2 }
+            if exists(requests[request]) {
+                let saved = requests[request];
+                require(saved.0 == payload, 90);
+                return saved.1;
+            }
+            let result = data[0] + payload;
+            data[0] = result;
+            requests[request] = (payload, result);
+            require(!fail, 91);
+            return result;
+        }
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn caller_request_ids_deduplicate_success_not_business_aborts_or_different_payloads() {
+        let (directory, database) = fixture().await;
+        for (name, value) in [
+            ("data", Type::U64),
+            ("requests", Type::Tuple(vec![Type::U64, Type::U64])),
+        ] {
+            execute_catalogue(
+                &database,
+                CatalogueOperation::Create {
+                    name: name.into(),
+                    key: Type::U64,
+                    value,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        execute(
+            &database,
+            tx! { tables { data: u64 => u64 = 1 } data[0] = 0; }.unwrap(),
+            policy(),
+        )
+        .await
+        .unwrap();
+        let first = execute(&database, deduplicated(100, 10, false), policy())
+            .await
+            .unwrap();
+        assert_eq!(value(first.clone()), Value::U64(10));
+        close(&database).await.unwrap();
+        let database = open(directory.path().join("db")).await.unwrap();
+        let retry = execute(&database, deduplicated(100, 10, false), policy())
+            .await
+            .unwrap();
+        assert_eq!(retry.sequence, first.sequence + 1);
+        assert!(matches!(&retry.outcome, Outcome::Success { effects, .. } if effects.is_empty()));
+        assert_eq!(value(retry), Value::U64(10));
+        let mismatch = execute(&database, deduplicated(100, 11, false), policy())
+            .await
+            .unwrap();
+        assert!(matches!(
+            mismatch.outcome,
+            Outcome::Aborted(vm::Abort { user_code: 90, .. })
+        ));
+        let aborted = execute(&database, deduplicated(200, 20, true), policy())
+            .await
+            .unwrap();
+        assert!(matches!(
+            aborted.outcome,
+            Outcome::Aborted(vm::Abort { user_code: 91, .. })
+        ));
+        let after_abort = snapshot(&database).await.unwrap();
+        assert_eq!(get(&after_abort, 2, &Value::U64(200)).unwrap(), None);
+        assert_eq!(
+            get(&after_abort, 1, &Value::U64(0)).unwrap(),
+            Some(Value::U64(10))
+        );
+        // The aborted request did not durably claim its ID. A different payload
+        // can succeed, because deduplication is business data, not an engine
+        // cache.
+        let retry = execute(&database, deduplicated(200, 30, false), policy())
+            .await
+            .unwrap();
+        assert_eq!(value(retry), Value::U64(40));
+        let latest = snapshot(&database).await.unwrap();
+        assert_eq!(
+            get(&latest, 1, &Value::U64(0)).unwrap(),
+            Some(Value::U64(40))
+        );
+        close(&database).await.unwrap();
     }
 
     async fn fixture() -> (tempfile::TempDir, Database) {

@@ -14,16 +14,20 @@ too_many_arguments = "allow"
 name = "kv_bench"
 test = true
 
+[[example]]
+name = "derived_sqlite"
+test = true
+
 [dependencies]
 blop-db-macros = { path = "crates/blop-db-macros", version = "0.1.0" }
 crc32c         = "0.6.8"
 sha2           = "0.11.0"
+tempfile       = "3.27.0"
 tokio          = { version = "1.53.1", features = ["sync"] }
 
 [dev-dependencies]
 redb     = "4.2.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-tempfile = "3.27.0"
 tokio    = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread"] }
 
 [target."cfg(any(unix, windows))".dependencies]

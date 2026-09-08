@@ -25,7 +25,7 @@ pub(crate) struct Image {
     selected: Vec<u8>,
     current: Vec<u8>,
     directory: PathBuf,
-    _lease: Arc<File>,
+    _lease: Arc<store::DirectoryLease>,
 }
 
 /// Called on the sequencer, never by a worker independently reading CURRENT.
