@@ -35,8 +35,8 @@ pub(super) fn commit(
         .checked_add(1)
         .filter(|&sequence| sequence != u64::MAX)
         .ok_or(Error::Storage(storage::Error::Exhausted))?;
-    record::validate(&storage::view(store), sequence, command).map_err(rejection)?;
-    let (kind, body) = record::encode(command).map_err(rejection)?;
+    let command = record::prepare(&storage::view(store), sequence, command).map_err(rejection)?;
+    let (kind, body) = record::encode(&command).map_err(rejection)?;
     let bytes = envelope(sequence, manifest.durable_digest, kind, &body).map_err(rejection)?;
     let uncertain = |source| Error::Uncertain {
         sequence: Some(sequence),
@@ -44,7 +44,7 @@ pub(super) fn commit(
     };
     let digest =
         append(store, sequence, &bytes).map_err(|error| uncertain(vm::Error::Storage(error)))?;
-    let outcome = record::execute(store, sequence, digest, command).map_err(uncertain)?;
+    let outcome = record::execute(store, sequence, digest, &command).map_err(uncertain)?;
     publish_checkpoint(store).map_err(|error| uncertain(vm::Error::Storage(error)))?;
     Ok(Receipt { sequence, outcome })
 }
@@ -278,6 +278,7 @@ fn validate_checkpoint_record(
         record::Command::Transaction {
             transaction,
             claims,
+            ..
         } => {
             if let Some(outcome) = &outcome {
                 vm::validate_transaction_outcome(view, sequence, transaction, claims, outcome)?;
@@ -408,9 +409,17 @@ mod tests {
     }
 
     fn transaction(transaction: Transaction) -> record::Command {
+        let manifest = vm::AccessManifest::new(
+            vm::transaction_tables(transaction.program_bytes())
+                .unwrap()
+                .into_iter()
+                .map(|id| (vm::Scope::Table(id), vm::AccessMode::ReadWrite)),
+        )
+        .unwrap();
         record::Command::Transaction {
             transaction,
             claims: policy(),
+            manifest: Some(manifest),
         }
     }
 
@@ -430,6 +439,7 @@ mod tests {
         let command = record::Command::Transaction {
             transaction: Transaction::from_parts(bytes, vec![0; 4]),
             claims: LimitPolicy::new([79, 2, 1, 0, 4, 0, 0, 0, 0, 0, 8, 8, 0, 0, 0, 0, 8]).unwrap(),
+            manifest: Some(vm::AccessManifest::default()),
         };
         let (_directory, mut store) = create();
         let (kind, body) = record::encode(&command).unwrap();
@@ -477,6 +487,215 @@ mod tests {
         let (kind, body) = record::encode(command).unwrap();
         let bytes = envelope(sequence, store.manifest().durable_digest, kind, &body).unwrap();
         append(store, sequence, &bytes).unwrap()
+    }
+
+    #[test]
+    fn writer_logs_derived_modes_without_unnecessarily_broadening_reads() {
+        let (_directory, mut store) = create();
+        commit(
+            &mut store,
+            &record::Command::Catalogue(CatalogueOperation::Create {
+                name: "data".into(),
+                key: Type::U64,
+                value: Type::U64,
+            }),
+        )
+        .unwrap();
+        let command = record::Command::Transaction {
+            transaction: tx! { tables { data: u64 => u64 = 1 } data[7] = 42; data[data[7]] = 1; }
+                .unwrap(),
+            claims: policy(),
+            manifest: None,
+        };
+        commit(&mut store, &command).unwrap();
+        let log = fs::read(store.directory().join("log-00000000000000000001.bin")).unwrap();
+        let length = u32::from_le_bytes(log[log.len() - 4..].try_into().unwrap()) as usize;
+        let body = &log[log.len() - length + RECORD_HEADER_LENGTH..log.len() - 8];
+        let decoded = record::decode(1, body).unwrap();
+        assert_eq!(record::encode(&decoded).unwrap().1, body);
+        let record::Command::Transaction { manifest, .. } = decoded else {
+            unreachable!()
+        };
+        assert_eq!(
+            manifest.unwrap().entries(),
+            [
+                (vm::Scope::Table(1), vm::AccessMode::Write),
+                (
+                    vm::Scope::Key(1, 7_u64.to_be_bytes().to_vec()),
+                    vm::AccessMode::Read
+                ),
+            ]
+        );
+        reopen_recovery(store).unwrap();
+    }
+
+    #[test]
+    fn point_manifests_replay_durably_with_original_counts_and_historical_policy() {
+        let (_directory, mut store) = create();
+        commit(
+            &mut store,
+            &record::Command::Catalogue(CatalogueOperation::Create {
+                name: "counter".into(),
+                key: Type::U64,
+                value: Type::U64,
+            }),
+        )
+        .unwrap();
+        let supplied = vm::AccessManifest::new([
+            (
+                vm::Scope::Key(1, 7_u64.to_be_bytes().to_vec()),
+                vm::AccessMode::ReadWrite,
+            ),
+            (
+                vm::Scope::Key(1, 8_u64.to_be_bytes().to_vec()),
+                vm::AccessMode::Read,
+            ),
+        ])
+        .unwrap();
+        let mut values = *policy().values();
+        values[6] = 2;
+        let claims = LimitPolicy::new(values).unwrap();
+        for transaction in [
+            tx! { tables { counter: u64 => u64 = 1 } insert(counter[7], 40); }.unwrap(),
+            tx! { tables { counter: u64 => u64 = 1 } counter[7] += 2; return counter[7]; }.unwrap(),
+        ] {
+            let command = record::Command::Transaction {
+                transaction,
+                claims: claims.clone(),
+                manifest: Some(supplied.clone()),
+            };
+            record::validate(
+                &storage::view(&store),
+                store.manifest().durable_sequence + 1,
+                &command,
+            )
+            .unwrap();
+            append_command(&mut store, &command);
+        }
+        values[6] = 1;
+        append_command(
+            &mut store,
+            &record::Command::Limits(LimitPolicy::new(values).unwrap()),
+        );
+        let path = store.directory().to_owned();
+        let original = fs::read(path.join("log-00000000000000000001.bin")).unwrap();
+        assert!(entries(&store, TreeId::State).is_empty());
+        drop(store);
+        let mut store = storage::open(&path).unwrap();
+        recover(&mut store).unwrap();
+        let outcome = vm::read_outcome(&storage::view(&store), 3)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            outcome.outcome,
+            Outcome::Success {
+                value: Value::U64(42),
+                ..
+            }
+        ));
+        assert_eq!(store.manifest().checkpoint_sequence, 4);
+        assert_eq!(
+            fs::read(path.join("log-00000000000000000001.bin")).unwrap(),
+            original
+        );
+        // Also validate the retained point manifests after they are
+        // checkpointed.
+        reopen_recovery(store).unwrap();
+    }
+
+    #[test]
+    fn invalid_manifests_do_not_append_consume_sequences_or_install_outcomes() {
+        let (_directory, mut store) = create();
+        commit(
+            &mut store,
+            &record::Command::Catalogue(CatalogueOperation::Create {
+                name: "data".into(),
+                key: Type::Boolean,
+                value: Type::U64,
+            }),
+        )
+        .unwrap();
+        let before = store.manifest().clone();
+        let path = store.directory().join("log-00000000000000000001.bin");
+        let log = fs::read(&path).unwrap();
+        let outcomes = entries(&store, TreeId::Outcomes);
+        for scopes in [
+            vec![],
+            vec![(vm::Scope::Key(1, vec![0]), vm::AccessMode::Write)],
+            vec![(vm::Scope::Key(1, vec![1]), vm::AccessMode::ReadWrite)],
+            vec![(vm::Scope::Key(1, vec![2]), vm::AccessMode::ReadWrite)],
+            vec![(vm::Scope::Table(2), vm::AccessMode::ReadWrite)],
+        ] {
+            let command = record::Command::Transaction {
+                transaction: tx! { tables { data: bool => u64 = 1 } insert(data[false], 42); }
+                    .unwrap(),
+                claims: policy(),
+                manifest: Some(vm::AccessManifest::new(scopes).unwrap()),
+            };
+            assert!(matches!(
+                commit(&mut store, &command),
+                Err(Error::Rejected(_))
+            ));
+            assert_eq!(store.manifest(), &before);
+            assert_eq!(fs::read(&path).unwrap(), log);
+            assert_eq!(entries(&store, TreeId::Outcomes), outcomes);
+        }
+        assert_eq!(
+            commit(&mut store, &transaction(tx! { return 42; }.unwrap()))
+                .unwrap()
+                .sequence,
+            2
+        );
+    }
+
+    #[test]
+    fn insufficient_or_schema_invalid_durable_manifests_are_corruption() {
+        for checkpointed in [false, true] {
+            for scope in [
+                vm::Scope::Key(1, vec![0]),
+                vm::Scope::Key(1, vec![2]),
+                vm::Scope::Table(2),
+            ] {
+                let (_directory, mut store) = create();
+                commit(
+                    &mut store,
+                    &record::Command::Catalogue(CatalogueOperation::Create {
+                        name: "data".into(),
+                        key: Type::Boolean,
+                        value: Type::U64,
+                    }),
+                )
+                .unwrap();
+                let command = record::Command::Transaction {
+                    transaction: tx! { tables { data: bool => u64 = 1 } insert(data[false], 42); }
+                        .unwrap(),
+                    claims: policy(),
+                    manifest: Some(
+                        vm::AccessManifest::new([(scope, vm::AccessMode::Write)]).unwrap(),
+                    ),
+                };
+                let digest = append_command(&mut store, &command);
+                if checkpointed {
+                    let outcome = Outcome::Success {
+                        result_type: Type::Unit,
+                        value: Value::Unit,
+                        effects: vec![],
+                    };
+                    checkpoint_changes(
+                        &mut store,
+                        &[change(
+                            TreeId::Outcomes,
+                            2_u64.to_be_bytes().to_vec(),
+                            Some(vm::encode_outcome(2, digest, 1, &outcome).unwrap()),
+                        )],
+                    );
+                }
+                assert!(matches!(
+                    reopen_recovery(store),
+                    Err(storage::Error::Corrupt(_))
+                ));
+            }
+        }
     }
 
     #[test]

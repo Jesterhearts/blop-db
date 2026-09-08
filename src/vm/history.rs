@@ -414,7 +414,7 @@ pub(crate) fn validate_transaction_outcome(
     claims: &LimitPolicy,
     record: &OutcomeRecord,
 ) -> Result<()> {
-    let (_, program) = super::prepare_transaction(
+    let (_, program) = super::prepare_program(
         view,
         sequence,
         transaction.program_bytes(),

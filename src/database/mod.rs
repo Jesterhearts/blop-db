@@ -136,7 +136,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 enum Request {
     Execute {
-        command: Command,
+        command: Box<Command>,
         reply: oneshot::Sender<Result<Receipt>>,
     },
     Close,
@@ -155,8 +155,9 @@ pub async fn create(
 
 /// Open an existing database and replay its durable post-checkpoint records
 /// before accepting submissions. Corruption is an error, not a reason to fall
-/// back to an older checkpoint. Recovery supports this writer's broad-table
-/// manifest profile, not arbitrary externally produced access manifests.
+/// back to an older checkpoint. Recovery validates full C.4 access manifests
+/// against the historical catalogue and policy, including older broad
+/// manifests.
 pub async fn open(path: impl AsRef<Path>) -> Result<Database> {
     start(path.as_ref().to_owned(), None).await
 }
@@ -234,9 +235,9 @@ fn random_uuid() -> storage::Result<[u8; 16]> {
 }
 
 /// Submit a bound transaction and wait for its durable, visible outcome.
-/// Claims are checked against the policy at its assigned sequence. Resource 7
-/// must allow one read/write table scope per declared table, including unused
-/// declarations. Concurrent callers are serialized in queue order.
+/// Claims are checked against the policy at its assigned sequence. The writer
+/// derives normalized C.4 scopes; resource 7 charges their actual entry count.
+/// Concurrent callers are serialized in queue order.
 ///
 /// Cancellation before enqueueing submits nothing. After enqueueing, the
 /// transaction proceeds even if this future is dropped. An `Uncertain` error
@@ -252,6 +253,29 @@ pub async fn execute(
         Command::Transaction {
             transaction,
             claims,
+            manifest: None,
+        },
+    )
+    .await
+}
+
+/// Submit explicit normalized C.4 declarations. The writer independently proves
+/// coverage under the historical schemas and policy before sequencing. Broader
+/// declarations are allowed and retained exactly, including their resource-7
+/// count. `AccessManifest::decode` accepts canonical wire manifests; `new`
+/// normalizes application-constructed scopes before submission.
+pub async fn execute_with_manifest(
+    database: &Database,
+    transaction: Transaction,
+    claims: Limits,
+    manifest: vm::AccessManifest,
+) -> Result<Receipt> {
+    submit(
+        database,
+        Command::Transaction {
+            transaction,
+            claims: validate_limits(claims)?,
+            manifest: Some(manifest),
         },
     )
     .await
@@ -290,7 +314,10 @@ async fn submit(
     let (reply, result) = oneshot::channel();
     database
         .sender
-        .send(Request::Execute { command, reply })
+        .send(Request::Execute {
+            command: Box::new(command),
+            reply,
+        })
         .await
         .map_err(|_| Error::Closed)?;
     result.await.map_err(|_| Error::Uncertain {
@@ -590,16 +617,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supplied_manifests_are_verified_before_sequencing_and_survive_open() {
+        let (directory, database) = fixture().await;
+        let id = table(&database).await;
+        let transaction =
+            tx! { tables { balances: u64 => i64 = id } insert(balances[7], 42); }.unwrap();
+        let scope = vm::Scope::Key(id, 7_u64.to_be_bytes().to_vec());
+        for manifest in [
+            vm::AccessManifest::default(),
+            vm::AccessManifest::new([(scope.clone(), vm::AccessMode::Write)]).unwrap(),
+        ] {
+            assert!(matches!(
+                execute_with_manifest(&database, transaction.clone(), policy(), manifest).await,
+                Err(Error::Rejected(_))
+            ));
+        }
+        let manifest = vm::AccessManifest::new([(scope, vm::AccessMode::ReadWrite)]).unwrap();
+        let claims = Limits {
+            manifest_scopes: 1,
+            ..policy()
+        };
+        assert_eq!(
+            execute_with_manifest(&database, transaction, claims, manifest)
+                .await
+                .unwrap()
+                .sequence,
+            2
+        );
+        close(&database).await.unwrap();
+        let database = open(directory.path().join("db")).await.unwrap();
+        let receipt = execute(
+            &database,
+            tx! { tables { balances: u64 => i64 = id } return balances[7]; }.unwrap(),
+            claims,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.sequence, 3);
+        assert_eq!(value(receipt), Value::I64(42));
+        close(&database).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelled_waiter_still_commits_and_close_drains_accepted_work() {
         let (directory, database) = fixture().await;
         let (reply, result) = oneshot::channel();
         database
             .sender
             .send(Request::Execute {
-                command: Command::Transaction {
+                command: Box::new(Command::Transaction {
                     transaction: tx! { return 42; }.unwrap(),
                     claims: policy().try_into().unwrap(),
-                },
+                    manifest: None,
+                }),
                 reply,
             })
             .await

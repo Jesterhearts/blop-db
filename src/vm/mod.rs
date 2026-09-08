@@ -8,9 +8,12 @@
 //! or establish log durability before execution. These functions do not append
 //! logs, publish checkpoints, advance public visibility, or perform recovery.
 //! Recovery must restore checkpoint roots before replaying every later record.
-//! Access manifests and complete logged transaction bodies are not handled
-//! here.
+//! `prepare_transaction` additionally derives or validates C.4 access
+//! manifests. Complete logged transaction bodies belong to the database record
+//! layer.
 
+mod access;
+mod access_analysis;
 mod database;
 mod history;
 mod operations;
@@ -22,6 +25,10 @@ mod value;
 use std::fmt;
 use std::ops::Bound;
 
+pub use access::AccessManifest;
+pub use access::AccessMode;
+pub use access::Scope;
+pub use access::overlap;
 pub use database::CatalogueOperation;
 pub use database::CatalogueVersion;
 pub use database::catalogue_key;
@@ -166,6 +173,9 @@ pub struct Table {
 /// branch are validated before any instruction runs. Semantic failures return
 /// `Ok(Outcome::Aborted(..))`; rejected input and storage failures return
 /// `Err`.
+/// This byte-only reference API has no manifest and does not charge resource 7.
+/// Use [`prepare_transaction`] and [`interpret_prepared`] for full C.4
+/// admission.
 pub fn interpret(
     view: &View,
     sequence: u64,
@@ -173,34 +183,91 @@ pub fn interpret(
     arguments: &[u8],
     claims: &LimitPolicy,
 ) -> Result<Outcome> {
-    let (prior, program) = prepare_transaction(view, sequence, program, arguments, claims)?;
+    let (prior, program) = prepare_program(view, sequence, program, arguments, claims)?;
     runtime::run(view, prior, &program, claims)
 }
 
-/// Validate admission without reading rows, running instructions, or installing
-/// an outcome. Manifest coverage and its scope claim belong to the record
-/// layer.
-pub(crate) fn validate_transaction(
+/// A typed program and its verified scheduling declarations. Fields are private
+/// so callers cannot replace instructions or claims after validation.
+#[derive(Debug)]
+pub struct PreparedTransaction {
+    prior: u64,
+    program: program::Program,
+    claims: LimitPolicy,
+    manifest: AccessManifest,
+}
+
+impl PreparedTransaction {
+    pub fn sequence(&self) -> u64 {
+        self.prior + 1
+    }
+
+    pub fn manifest(&self) -> &AccessManifest {
+        &self.manifest
+    }
+
+    pub fn tables(&self) -> &[Table] {
+        &self.program.tables
+    }
+
+    pub fn instruction_count(&self) -> usize {
+        self.program.instructions.len()
+    }
+}
+
+/// Validate bytecode, historical schemas/policy and C.4 access coverage without
+/// reading rows or installing outcomes. With no supplied manifest, use the
+/// derived normalized scopes. With one, retain its exact declarations and
+/// charge its actual normalized count, even if a narrower set could be derived.
+///
+/// The view must protect the catalogue and policy strictly below `sequence`.
+/// Reprepare if an administrative barrier changes them before sequencing.
+pub fn prepare_transaction(
     view: &View,
     sequence: u64,
     transaction: &Transaction,
     claims: &LimitPolicy,
-) -> Result<()> {
-    prepare_transaction(
+    manifest: Option<&AccessManifest>,
+) -> Result<PreparedTransaction> {
+    let (prior, program) = prepare_program(
         view,
         sequence,
         transaction.program_bytes(),
         transaction.argument_bytes(),
         claims,
     )?;
-    Ok(())
+    let required = access_analysis::derive(&program)?;
+    let manifest = manifest.unwrap_or(&required);
+    access::validate(manifest, &required, &program.tables, claims)?;
+    Ok(PreparedTransaction {
+        prior,
+        program,
+        claims: claims.clone(),
+        manifest: manifest.clone(),
+    })
 }
 
+/// Interpret a prepared program without changing storage. The caller must
+/// establish durability and resolved dependencies and supply a protected prior
+/// view with the same catalogue and policy used during preparation.
+pub fn interpret_prepared(
+    view: &View,
+    transaction: &PreparedTransaction,
+) -> Result<Outcome> {
+    runtime::run(
+        view,
+        transaction.prior,
+        &transaction.program,
+        &transaction.claims,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn transaction_tables(program: &[u8]) -> Result<Vec<u64>> {
     program::table_ids(program)
 }
 
-fn prepare_transaction(
+fn prepare_program(
     view: &View,
     sequence: u64,
     program: &[u8],

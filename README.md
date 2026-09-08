@@ -22,6 +22,8 @@ functions accept a cloneable `Database` handle:
   work.
 - `execute(&db, transaction, claims).await` returns a `Receipt { sequence, outcome }` after the
   transaction is durable, resolved and checkpointed.
+- `execute_with_manifest(&db, transaction, claims, manifest).await` independently validates supplied
+  C.4 declarations before sequencing. Broader declarations are allowed and retained exactly.
 - `execute_catalogue(&db, operation).await` creates, renames or drops tables. A successful create
   returns its table ID as `Value::U64` in the outcome.
 - `execute_limits(&db, limits).await` changes the policy for subsequent records, even when the old
@@ -73,11 +75,17 @@ recovery run on one dedicated thread per database. The queue holds at most 64 wa
 additional submissions await capacity. Execution is serial, with two durable publications per
 record, not a parallel scheduler or a group-commit implementation.
 
-The writer generates one conservative read/write table scope per declared table, including unused
-declarations. Resource 7 (`manifest_scopes`) must allow that count in both the claims and the
-policy. Recovery accepts this broad-table manifest profile; finer externally produced manifests are
-not yet supported. The writer retains its log and historical versions without rotation or
-reclamation.
+The writer derives normalized point and table scopes using C.4 abstract value analysis. Known keys
+use canonical point scopes; unknown keys and scans use table scopes. Both sides of every branch
+contribute, even when a condition or runtime failure is predictable. Reads and writes remain
+separate: a table-wide write does not broaden a point read. Unused table declarations add no scopes,
+but must still name live tables. Resource 7 (`manifest_scopes`) charges the actual normalized
+manifest entry count, with a read/write entry counted once.
+
+Recovery supports the full C.4 codec, including older broad-table manifests. It validates supplied
+coverage, canonical key encodings, table-array membership and counts under the historical catalogue
+and policy. It preserves the recorded declarations rather than replacing them with a narrower
+derivation. The writer retains its log and historical versions without rotation or reclamation.
 
 `Ok(Receipt)` is a durability receipt, but its `Outcome` can be `Success` or `Aborted`. A semantic
 abort discards all business writes, records the abort durably and consumes its sequence.
@@ -379,9 +387,53 @@ digest against a log, append log records, advance public visibility or orchestra
 Reopening storage restores checkpoint roots; replay must execute every subsequent durable record
 against those roots, rather than reuse later cached outcomes.
 
-Access manifests, their resource-7 count and full logged Transaction body validation are not part of
-this layer. Other admission and runtime claims are checked against the historical policy. There is
-no parallel scheduler or optimized execution path.
+The original byte-only reference execution APIs do not charge resource 7 because they have no
+manifest. Use the preparation API below for complete C.4 admission. Full logged Transaction bodies
+remain the database record layer's responsibility. There is no parallel scheduler or optimized
+execution path.
+
+### Access Preparation
+
+`vm::prepare_transaction(&view, sequence, &transaction, &claims, supplied_manifest)` returns an
+opaque `PreparedTransaction` containing a validated typed program and verified scopes. It reads
+historical catalogue and policy metadata, not database rows. Pass `None` to derive declarations or
+`Some(&manifest)` to verify and retain supplied declarations. A broader supplied manifest can fit a
+scope-count budget that the derived points would exceed. Reprepare if an administrative barrier
+changes the catalogue or policy before sequencing.
+
+- `prepared.manifest()` exposes the verified `AccessManifest`; `tables()`, `sequence()` and
+  `instruction_count()` expose preparation metadata.
+- `vm::interpret_prepared(&view, &prepared)` reuses the typed program without decoding it again. It
+  returns an outcome without installing effects. The caller must protect the prior view and
+  establish durability and resolved dependencies, or use an isolated reference store.
+- `AccessManifest::new` accepts `(Scope, AccessMode)` pairs and normalizes their order, aliases and
+  per-mode table suppression. `entries()`, `reads()` and `writes()` expose the normalized
+  declarations.
+- `AccessManifest::decode` rejects noncanonical wire declarations instead of silently normalizing
+  them. `encode` preserves their exact canonical encoding. Historical key-schema and coverage checks
+  happen during preparation.
+- `vm::overlap(&earlier_write, &later_read)` implements the section 8 address overlap rules,
+  including absent keys. It does not introduce read/write or write/write scheduling dependencies on
+  its own.
+
+```rust
+use blop_db::vm::{AccessManifest, AccessMode, Scope};
+
+let manifest = AccessManifest::new([
+    (Scope::Table(3), AccessMode::Write),
+    (Scope::Key(3, 7_u64.to_be_bytes().to_vec()), AccessMode::Read),
+])?;
+assert_eq!(manifest.len(), 2);
+assert_eq!(AccessManifest::decode(&manifest.encode()?)?, manifest);
+# Ok::<(), blop_db::vm::Error>(())
+```
+
+Abstract evaluation reuses the VM's pure operations, without application callbacks. ARG and CONST
+seed known values. Pure operations retain known results only when intrinsic computation and
+destination bounds succeed. LOAD, EXISTS and scans produce Unknown, even after overlay writes or for
+predictably empty scans. Joins retain only values that agree on every predecessor. Predictable
+failures do not reject the transaction or prune later access declarations; execution still
+determines the first semantic abort and applies the original runtime resource charges.
 
 ## Storage
 
@@ -515,7 +567,10 @@ truncated objects, model-checked tree edits, retained roots, MVCC filtering and 
 interruptions at publication boundaries. These filesystem interruption tests do not simulate
 hardware power loss. Async writer tests cover concurrent submissions, queue backpressure,
 cancellation, shutdown, durable receipts, rejected requests, semantic rollback and post-checkpoint
-recovery without applying increments twice.
+recovery without applying increments twice. Access-manifest tests cover canonical modes, alias
+merging, per-mode suppression, zero-width points, conservative CFG joins and failures, historical
+schema checks, actual normalized resource-7 counts, point-manifest recovery and rejection before
+sequence allocation.
 
 To check the Windows code without running it, install the target with
 `rustup target add x86_64-pc-windows-gnu`, then run

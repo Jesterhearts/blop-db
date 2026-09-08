@@ -1,13 +1,9 @@
 //! Canonical record bodies for the serial writer and replay.
 //!
-//! This API profile uses exactly one read/write table scope for every declared
-//! program table, including unused declarations. C.4 permits these broader
-//! scopes, so coverage needs no value analysis or row reads. Decoding rejects
-//! every other manifest, including finer valid C.4 manifests, rather than
-//! discarding or trusting unverified access declarations.
-//!
 //! Decoding checks the body format; validation checks the complete program and
 //! arguments against the historical catalogue and policy before execution.
+//! Preparation fills absent manifests. Decoded declarations are never replaced
+//! with a narrower derivation: the recorded count defines resource 7 usage.
 
 use crate::Transaction;
 use crate::storage;
@@ -23,6 +19,7 @@ pub(super) enum Command {
     Transaction {
         transaction: Transaction,
         claims: LimitPolicy,
+        manifest: Option<vm::AccessManifest>,
     },
     Catalogue(CatalogueOperation),
     Limits(LimitPolicy),
@@ -33,6 +30,15 @@ pub(super) fn validate(
     sequence: u64,
     command: &Command,
 ) -> Result<()> {
+    prepare(view, sequence, command)?;
+    Ok(())
+}
+
+pub(super) fn prepare(
+    view: &storage::View,
+    sequence: u64,
+    command: &Command,
+) -> Result<Command> {
     if sequence == 0 || sequence == u64::MAX {
         return Err(Error::Invalid("reserved record sequence"));
     }
@@ -40,13 +46,25 @@ pub(super) fn validate(
         Command::Transaction {
             transaction,
             claims,
+            manifest,
         } => {
-            access_manifest(transaction, claims)?;
-            vm::validate_transaction(view, sequence, transaction, claims)
+            if let Some(manifest) = manifest {
+                manifest.check_count(claims.values()[6])?;
+            }
+            let prepared =
+                vm::prepare_transaction(view, sequence, transaction, claims, manifest.as_ref())?;
+            Ok(Command::Transaction {
+                transaction: transaction.clone(),
+                claims: claims.clone(),
+                manifest: Some(prepared.manifest().clone()),
+            })
         }
-        Command::Catalogue(operation) => vm::validate_catalogue(operation),
+        Command::Catalogue(operation) => {
+            vm::validate_catalogue(operation)?;
+            Ok(command.clone())
+        }
         // LimitPolicy construction enforces the fixed administrative ceilings.
-        Command::Limits(_) => Ok(()),
+        Command::Limits(_) => Ok(command.clone()),
     }
 }
 
@@ -55,8 +73,13 @@ pub(super) fn encode(command: &Command) -> Result<(u8, Vec<u8>)> {
         Command::Transaction {
             transaction,
             claims,
+            manifest,
         } => {
-            let manifest = access_manifest(transaction, claims)?;
+            let manifest = manifest
+                .as_ref()
+                .ok_or(Error::Invalid("transaction needs manifest preparation"))?;
+            manifest.check_count(claims.values()[6])?;
+            let manifest = manifest.encode()?;
             let mut body = vec![1, 0, 0, 0];
             blob(&mut body, transaction.program_bytes())?;
             blob(&mut body, transaction.argument_bytes())?;
@@ -126,14 +149,12 @@ pub(super) fn decode(
                 return Err(Error::Invalid("transaction bytes exceed claims"));
             }
             let transaction = Transaction::from_parts(program.to_vec(), arguments.to_vec());
-            if manifest != access_manifest(&transaction, &claims)? {
-                return Err(Error::Invalid(
-                    "manifest does not match broad table profile",
-                ));
-            }
+            let manifest = vm::AccessManifest::decode(manifest)?;
+            manifest.check_count(claims.values()[6])?;
             Command::Transaction {
                 transaction,
                 claims,
+                manifest: Some(manifest),
             }
         }
         2 => {
@@ -184,32 +205,11 @@ pub(super) fn execute(
         Command::Transaction {
             transaction,
             claims,
+            ..
         } => vm::execute(store, sequence, digest, transaction, claims),
         Command::Catalogue(operation) => vm::execute_catalogue(store, sequence, digest, operation),
         Command::Limits(policy) => vm::execute_limits(store, sequence, digest, policy),
     }
-}
-
-fn access_manifest(
-    transaction: &Transaction,
-    claims: &LimitPolicy,
-) -> Result<Vec<u8>> {
-    if transaction.program_bytes().len() as u64 > claims.values()[0]
-        || transaction.argument_bytes().len() as u64 > claims.values()[4]
-    {
-        return Err(Error::Invalid("transaction bytes exceed claims"));
-    }
-    let tables = vm::transaction_tables(transaction.program_bytes())?;
-    if tables.len() as u64 > claims.values()[6] {
-        return Err(Error::Invalid("manifest_scopes exceeds claim"));
-    }
-    let mut manifest = Vec::with_capacity(4 + 16 * tables.len());
-    manifest.extend_from_slice(&(tables.len() as u32).to_le_bytes());
-    for table in tables {
-        manifest.extend_from_slice(&table.to_le_bytes());
-        manifest.extend_from_slice(&[0, 3, 0, 0, 0, 0, 0, 0]);
-    }
-    Ok(manifest)
 }
 
 fn take<'a>(
@@ -279,9 +279,17 @@ mod tests {
     }
 
     fn transaction(transaction: Transaction) -> Command {
+        let manifest = vm::AccessManifest::new(
+            vm::transaction_tables(transaction.program_bytes())
+                .unwrap()
+                .into_iter()
+                .map(|id| (vm::Scope::Table(id), vm::AccessMode::ReadWrite)),
+        )
+        .unwrap();
         Command::Transaction {
             transaction,
             claims: policy(),
+            manifest: Some(manifest),
         }
     }
 
@@ -344,14 +352,17 @@ mod tests {
                     Command::Transaction {
                         transaction: a,
                         claims: ac,
+                        manifest: am,
                     },
                     Command::Transaction {
                         transaction: b,
                         claims: bc,
+                        manifest: bm,
                     },
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!(ac, bc);
+                    assert_eq!(am, bm);
                 }
                 (Command::Catalogue(a), Command::Catalogue(b)) => assert_eq!(a, b),
                 (Command::Limits(a), Command::Limits(b)) => assert_eq!(a, b),
@@ -366,6 +377,7 @@ mod tests {
         let Command::Transaction {
             transaction: input,
             claims,
+            ..
         } = &command
         else {
             unreachable!()
@@ -467,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn decoding_rejects_nonmatching_manifests_lengths_and_claim_ceilings() {
+    fn decoding_rejects_noncanonical_manifests_lengths_and_claim_ceilings() {
         let [command, ..] = commands();
         let Command::Transaction { transaction, .. } = &command else {
             unreachable!()
@@ -484,10 +496,9 @@ mod tests {
         for (offset, value) in [
             (0, 0),
             (0, 3),
-            (4, 4),
-            (12, 1),
-            (13, 1),
-            (13, 2),
+            (12, 2),
+            (13, 0),
+            (13, 4),
             (14, 1),
             (15, 1),
             (16, 1),
@@ -505,13 +516,16 @@ mod tests {
         bytes[manifest + 20..manifest + 36].copy_from_slice(&original[manifest + 4..manifest + 20]);
         assert!(matches!(decode(1, &bytes), Err(Error::Invalid(_))));
 
-        // Even a canonical point scope is outside this selected API profile.
+        // Canonical point scopes and all three modes retain their exact bytes.
         let mut bytes = original.clone();
         bytes[manifest_length..manifest].copy_from_slice(&44_u32.to_le_bytes());
         bytes[manifest + 12] = 1;
         bytes[manifest + 16..manifest + 20].copy_from_slice(&8_u32.to_le_bytes());
         bytes.splice(manifest + 20..manifest + 20, 7_u64.to_be_bytes());
-        assert!(matches!(decode(1, &bytes), Err(Error::Invalid(_))));
+        for mode in 1..=3 {
+            bytes[manifest + 13] = mode;
+            assert_eq!(encode(&decode(1, &bytes).unwrap()).unwrap().1, bytes);
+        }
 
         for command in [command, Command::Limits(policy())] {
             let (kind, original) = encode(&command).unwrap();
@@ -569,6 +583,10 @@ mod tests {
         let command = Command::Transaction {
             transaction: tx! { tables { data: u64 => i64 = 1 } return 42; }.unwrap(),
             claims: LimitPolicy::new(values).unwrap(),
+            manifest: Some(
+                vm::AccessManifest::new([(vm::Scope::Table(1), vm::AccessMode::ReadWrite)])
+                    .unwrap(),
+            ),
         };
         assert!(matches!(
             encode(&command),
@@ -677,6 +695,260 @@ mod tests {
             execute(&mut store, 4, [4; 32], &missing).unwrap(),
             Outcome::Aborted(vm::Abort {
                 reason: AbortReason::TableNotLive,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn preparation_derives_points_and_retains_supplied_counts_after_decode() {
+        let (_directory, mut store) = create();
+        execute(
+            &mut store,
+            1,
+            [1; 32],
+            &Command::Catalogue(CatalogueOperation::Create {
+                name: "data".into(),
+                key: Type::U64,
+                value: Type::U64,
+            }),
+        )
+        .unwrap();
+        let transaction =
+            tx! { tables { data: u64 => u64 = 1 } data[40 + 2] = 7; return data[42]; }.unwrap();
+        let raw = Command::Transaction {
+            transaction: transaction.clone(),
+            claims: policy(),
+            manifest: None,
+        };
+        assert!(encode(&raw).is_err());
+        let view = storage::view(&store);
+        let prepared = prepare(&view, 2, &raw).unwrap();
+        let expected = vm::AccessManifest::new([(
+            vm::Scope::Key(1, 42_u64.to_be_bytes().to_vec()),
+            vm::AccessMode::ReadWrite,
+        )])
+        .unwrap();
+        let Command::Transaction { manifest, .. } = prepared else {
+            unreachable!()
+        };
+        assert_eq!(manifest, Some(expected));
+
+        let supplied = vm::AccessManifest::new([
+            (
+                vm::Scope::Key(1, 42_u64.to_be_bytes().to_vec()),
+                vm::AccessMode::ReadWrite,
+            ),
+            (
+                vm::Scope::Key(1, 99_u64.to_be_bytes().to_vec()),
+                vm::AccessMode::Read,
+            ),
+        ])
+        .unwrap();
+        let command = Command::Transaction {
+            transaction,
+            claims: policy(),
+            manifest: Some(supplied.clone()),
+        };
+        let (kind, bytes) = encode(&command).unwrap();
+        let decoded = decode(kind, &bytes).unwrap();
+        let prepared = prepare(&view, 2, &decoded).unwrap();
+        assert_eq!(encode(&prepared).unwrap(), (kind, bytes.clone()));
+        let Command::Transaction { manifest, .. } = prepared else {
+            unreachable!()
+        };
+        assert_eq!(manifest, Some(supplied));
+        let mut invalid_count = bytes;
+        let offset = invalid_count.len() - 17 * 8 + 6 * 8;
+        invalid_count[offset..offset + 8].copy_from_slice(&1_u64.to_le_bytes());
+        assert!(matches!(
+            decode(kind, &invalid_count),
+            Err(Error::Invalid("manifest_scopes exceeds claim"))
+        ));
+    }
+
+    #[test]
+    fn supplied_table_scope_can_fit_when_derived_points_exceed_resource_seven() {
+        let (_directory, mut store) = create();
+        execute(
+            &mut store,
+            1,
+            [1; 32],
+            &Command::Catalogue(CatalogueOperation::Create {
+                name: "data".into(),
+                key: Type::U64,
+                value: Type::U64,
+            }),
+        )
+        .unwrap();
+        let mut values = *policy().values();
+        values[6] = 1;
+        let command = Command::Transaction {
+            transaction: tx! { tables { data: u64 => u64 = 1 } data[1] = 42; data[2] = 42; }
+                .unwrap(),
+            claims: LimitPolicy::new(values).unwrap(),
+            manifest: None,
+        };
+        assert!(matches!(
+            validate(&storage::view(&store), 2, &command),
+            Err(Error::Invalid("manifest_scopes exceeds claim"))
+        ));
+        let Command::Transaction {
+            transaction,
+            claims,
+            ..
+        } = command
+        else {
+            unreachable!()
+        };
+        let command = Command::Transaction {
+            transaction,
+            claims,
+            manifest: Some(
+                vm::AccessManifest::new([(vm::Scope::Table(1), vm::AccessMode::Write)]).unwrap(),
+            ),
+        };
+        validate(&storage::view(&store), 2, &command).unwrap();
+        assert!(matches!(
+            execute(&mut store, 2, [2; 32], &command).unwrap(),
+            Outcome::Success { .. }
+        ));
+        let mut values = *policy().values();
+        values[6] = 0;
+        let unused = Command::Transaction {
+            transaction: tx! { tables { data: u64 => u64 = 1 } return 42; }.unwrap(),
+            claims: LimitPolicy::new(values).unwrap(),
+            manifest: None,
+        };
+        let prepared = prepare(&storage::view(&store), 3, &unused).unwrap();
+        let Command::Transaction { manifest, .. } = prepared else {
+            unreachable!()
+        };
+        assert!(manifest.unwrap().is_empty());
+    }
+
+    #[test]
+    fn point_validation_uses_historical_schemas_not_recreated_names() {
+        let (_directory, mut store) = create();
+        execute(
+            &mut store,
+            1,
+            [1; 32],
+            &Command::Catalogue(CatalogueOperation::Create {
+                name: "data".into(),
+                key: Type::Unit,
+                value: Type::U64,
+            }),
+        )
+        .unwrap();
+        execute(
+            &mut store,
+            2,
+            [2; 32],
+            &Command::Catalogue(CatalogueOperation::Drop { table: 1 }),
+        )
+        .unwrap();
+        execute(
+            &mut store,
+            3,
+            [3; 32],
+            &Command::Catalogue(CatalogueOperation::Create {
+                name: "data".into(),
+                key: Type::Boolean,
+                value: Type::U64,
+            }),
+        )
+        .unwrap();
+        let command = Command::Transaction {
+            transaction: tx! { tables { data: () => u64 = 1 } delete(data[()]); }.unwrap(),
+            claims: policy(),
+            manifest: Some(
+                vm::AccessManifest::new([(vm::Scope::Key(1, vec![]), vm::AccessMode::Write)])
+                    .unwrap(),
+            ),
+        };
+        let view = storage::view(&store);
+        validate(&view, 2, &command).unwrap();
+        assert!(validate(&view, 4, &command).is_err());
+        let mut wrong_key = command.clone();
+        let Command::Transaction { manifest, .. } = &mut wrong_key else {
+            unreachable!()
+        };
+        *manifest = Some(
+            vm::AccessManifest::new([(vm::Scope::Key(1, vec![0]), vm::AccessMode::Write)]).unwrap(),
+        );
+        assert!(validate(&view, 2, &wrong_key).is_err());
+        let mut wrong_table = command;
+        let Command::Transaction { manifest, .. } = &mut wrong_table else {
+            unreachable!()
+        };
+        *manifest =
+            Some(vm::AccessManifest::new([(vm::Scope::Table(3), vm::AccessMode::Write)]).unwrap());
+        assert!(matches!(
+            validate(&view, 2, &wrong_table),
+            Err(Error::Invalid(
+                "manifest table is not in program table array"
+            ))
+        ));
+    }
+
+    #[test]
+    fn prepared_program_is_reusable_and_runtime_failures_do_not_prune_scopes() {
+        let (_directory, mut store) = create();
+        execute(
+            &mut store,
+            1,
+            [1; 32],
+            &Command::Catalogue(CatalogueOperation::Create {
+                name: "data".into(),
+                key: Type::U64,
+                value: Type::U64,
+            }),
+        )
+        .unwrap();
+        let view = storage::view(&store);
+        let transaction =
+            tx! { tables { data: u64 => u64 = 1 } data[7] = 42; return data[7]; }.unwrap();
+        let prepared = vm::prepare_transaction(&view, 2, &transaction, &policy(), None).unwrap();
+        assert_eq!(prepared.sequence(), 2);
+        assert_eq!(prepared.tables()[0].id, 1);
+        assert!(prepared.instruction_count() > 0);
+        assert_eq!(prepared.manifest().len(), 1);
+        let outcome = vm::interpret_prepared(&view, &prepared).unwrap();
+        assert_eq!(vm::interpret_prepared(&view, &prepared).unwrap(), outcome);
+        assert!(matches!(
+            outcome,
+            Outcome::Success {
+                value: vm::Value::U64(42),
+                ..
+            }
+        ));
+        assert!(entries(&view, TreeId::State).is_empty());
+
+        let mut values = *policy().values();
+        values[11] = 0;
+        let claims = LimitPolicy::new(values).unwrap();
+        let limited = vm::prepare_transaction(&view, 2, &transaction, &claims, None).unwrap();
+        assert_eq!(limited.manifest(), prepared.manifest());
+        assert!(matches!(
+            vm::interpret_prepared(&view, &limited).unwrap(),
+            Outcome::Aborted(vm::Abort {
+                reason: AbortReason::ResourceLimit,
+                detail: 12,
+                ..
+            })
+        ));
+
+        let transaction = tx! { tables { data: u64 => u64 = 1 } let failed = 1_u64 / 0_u64; delete(data[failed]); }.unwrap();
+        let failed = vm::prepare_transaction(&view, 2, &transaction, &policy(), None).unwrap();
+        assert_eq!(
+            failed.manifest().entries(),
+            [(vm::Scope::Table(1), vm::AccessMode::Write)]
+        );
+        assert!(matches!(
+            vm::interpret_prepared(&view, &failed).unwrap(),
+            Outcome::Aborted(vm::Abort {
+                reason: AbortReason::DivisionByZero,
                 ..
             })
         ));
