@@ -86,7 +86,7 @@ fn envelope(
     Ok(bytes)
 }
 
-fn segment_header(
+pub(super) fn segment_header(
     database_id: [u8; 16],
     segment: &storage::SegmentDescriptor,
 ) -> [u8; SEGMENT_HEADER_LENGTH] {
@@ -314,7 +314,7 @@ fn replay_error(error: vm::Error) -> storage::Error {
     }
 }
 
-fn read_record(
+pub(super) fn read_record(
     reader: &mut impl Read,
     remaining: u64,
     sequence: u64,

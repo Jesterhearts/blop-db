@@ -48,6 +48,7 @@ pub use outcome::encode_outcome;
 pub use outcome::read_outcome;
 pub use value::Type;
 pub use value::Value;
+pub(crate) use value::decode_value;
 
 use crate::Transaction;
 use crate::storage;

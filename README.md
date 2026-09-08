@@ -1,9 +1,9 @@
 # blop-db
 
 This repository contains a transaction compiler, a single-threaded reference VM, an engine-facing
-storage layer and an async durable write API. The write API sequences transactions on a background
-thread, publishes their log records before execution and returns receipts after checkpoint
-publication.
+storage layer and an async database API with revocable snapshots, durable retention cursors and
+resolved feeds. The writer sequences transactions on a background thread, publishes their log
+records before execution and returns receipts after checkpoint publication.
 
 `tx!` compiles a small deterministic transaction program to the ISA 1 bytecode specified in
 [`DESIGN.md`](DESIGN.md), appendices A, B and C. Parsing, type checking, register allocation and
@@ -108,8 +108,135 @@ cargo run --example transactions -- /tmp/blop-example-db
 The example generates database identities, creates a balances table, inserts two accounts, transfers
 25 units atomically and reopens the database to verify both balances are 75. It uses Tokio's
 current-thread executor and explicitly handles semantic aborts. It refuses to overwrite an existing
-directory. A result-only verification transaction still enters the log; a public snapshot API is not
-yet available.
+directory. Its result-only verification transaction still enters the log. Use the snapshot API below
+for external reads that do not consume a transaction sequence.
+
+## Snapshots and Feeds
+
+`snapshot(&db).await` captures the durable visible frontier. The free `get`, `scan` and `catalogue`
+functions read that fixed sequence, including its original table names, liveness and schemas. Reads
+perform synchronous local I/O on the calling thread; use your executor's blocking facility for large
+reads. Keys and range endpoints are `vm::Value` values, not raw canonical-key bytes. The actual
+stored key schema is checked before encoding. Scans return typed `(Value, Value)` pairs in key
+order. `catalogue` returns metadata for live and dropped tables at the snapshot sequence.
+
+```rust
+# #[cfg(any(unix, windows))]
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use std::ops::Bound::Unbounded;
+use blop_db::{database, Limits, tx};
+use blop_db::vm::{CatalogueOperation, Outcome, Type, Value};
+# let directory = tempfile::tempdir()?;
+# let db = database::create(directory.path().join("db"), Default::default()).await?;
+let created = database::execute_catalogue(&db, CatalogueOperation::Create {
+    name: "balances".into(), key: Type::U64, value: Type::I64,
+}).await?;
+let Outcome::Success { value: Value::U64(table), .. } = created.outcome else {
+    return Err("table creation aborted".into());
+};
+database::execute(&db, tx! {
+    tables { balances: u64 => i64 = table }
+    balances[7] = 100;
+}?, Limits::default()).await?;
+
+let snapshot = database::snapshot(&db).await?;
+assert_eq!(database::get(&snapshot, table, &Value::U64(7))?, Some(Value::I64(100)));
+for row in database::scan(&snapshot, table, Unbounded, Unbounded)? {
+    let (key, value) = row?;
+    println!("{key:?}: {value:?}");
+}
+database::revoke(&snapshot);
+assert!(matches!(database::catalogue(&snapshot), Err(database::Error::SnapshotRevoked)));
+database::close(&db).await?;
+# Ok(())
+# }
+# #[cfg(not(any(unix, windows)))]
+# fn main() {}
+```
+
+Snapshot clones and iterators share one revocable claim. `revoke(&snapshot)` releases its view once,
+after in-flight reads finish safely at their original sequence. New reads report `SnapshotRevoked`.
+An iterator reports `Some(Err(SnapshotRevoked))`, not ordinary exhaustion, even if it previously
+returned `None`. It is not a fused iterator. An iterator retains no separate permanent storage view;
+each `next()` seeks within the guarded original view. This trades an extra tree seek per row for
+bounded revocation and close behaviour.
+
+`close(&db).await` revokes all snapshots and drains in-flight reads before releasing the directory
+lock. Idle snapshots and iterators do not delay close and cannot read after it. Dropping the last
+database handle also shuts down and revokes snapshots asynchronously. There is no automatic
+pressure-based revocation policy yet.
+
+For a rebuild, `snapshot_and_cursor` atomically selects F and durably registers its tail at F. The
+cursor survives snapshot revocation, handle loss, close and ordinary restart. If the snapshot is
+revoked, discard the incomplete build and explicitly release any cursor you no longer need.
+
+```rust
+# #[cfg(any(unix, windows))]
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use blop_db::database::{self, BatchLimits, CursorKind, CursorToken, FeedBatch, Watermark};
+# let directory = tempfile::tempdir()?;
+# let db = database::create(directory.path().join("db"), Default::default()).await?;
+let (snapshot, cursor) = database::snapshot_and_cursor(
+    &db, CursorKind::Resolved, "search-index-build",
+).await?;
+let baseline = snapshot.watermark();
+let saved_token = cursor.encode(); // Exactly 56 bytes; persist for restart.
+// Build unpublished derived data from the snapshot. Publish the complete build
+// and baseline.encode() (or baseline.to_hex()) in one atomic durable index commit.
+database::revoke(&snapshot);
+
+let cursor = CursorToken::decode(&saved_token)?;
+database::reopen_cursor(&db, &cursor).await?;
+let batch = database::read_feed(&db, &cursor, baseline, BatchLimits::default()).await?;
+let wire = batch.encode()?;
+assert_eq!(FeedBatch::decode(&wire)?, batch);
+let next = batch.watermark()?;
+let payload = next.to_hex(); // Exactly 80 lowercase ASCII hex characters.
+let recovered = Watermark::from_hex(&payload)?;
+// Apply every complete record, then commit derived data and payload atomically.
+// Only after that durable consumer commit may its watermark be acknowledged:
+database::acknowledge_cursor(&db, &cursor, recovered).await?;
+database::release_cursor(&db, &cursor).await?;
+database::close(&db).await?;
+# Ok(())
+# }
+# #[cfg(not(any(unix, windows)))]
+# fn main() {}
+```
+
+An existing consumer uses `checkout_cursor(&db, recovered_watermark, kind, label)` to establish a
+claim when sufficient history remains, or `reopen_cursor` with its saved token to use an existing
+claim. Tokens check the database ID, local cursor namespace, issued ID and registered kind. They are
+identity references, not secrets or authorization credentials. Watermarks identify source state, not
+an index library's internal operation stamp. A watermark alone does not reserve history.
+
+`read_feed` does not acknowledge progress. It returns consecutive, complete `vm::OutcomeRecord`
+values, including aborts, successful no-write transactions, catalogue events and policy events.
+Effects are canonical encoded keys and values checked against exact sequence-tagged versions, not
+current values. Consumers need the baseline catalogue and subsequent catalogue events to interpret
+them. No table filtering omits source sequences. Limits include the complete batch header and CRC;
+the maximum is 256 MiB. A first record that cannot fit reports `BatchTooSmall { required }` rather
+than returning an empty batch. A zero record limit or a poll at F returns a valid empty batch.
+
+Acknowledgements are monotonic, bounded by F, and require the matching database identity. Repeating
+the current acknowledgement succeeds. Releasing an absent, previously issued ID succeeds; reopening
+or acknowledging it reports `CursorReleased`. IDs are never reused. `list_cursors` exposes tokens,
+baselines and nonunique diagnostic labels for abandoned-claim administration. Use an explicit listed
+token with `release_cursor`, never a label. `retention_status` reports the current conservative
+history and log claim floors. None of these operations consumes a transaction sequence or deletes
+history. A cancelled checkout can still leave a durable registration; inspect the list rather than
+assuming cancellation released it.
+
+All three cursor kinds are supported: resolved feed (1), logical feed (2) and log replica (3). Kinds
+2 and 3 additionally check and protect original log availability from baseline + 1. H.1 codecs
+support both `FeedRecords::Resolved` and `FeedRecords::Logical`, checking CRCs, bounded counts,
+consecutive sequences and logical envelope/outcome hash-chain agreement. This is only exchange
+validation: logical body validation, the first predecessor's local anchor, and outcome comparison
+require the real historical VM context before import. Logical feed production and replica import
+remain future work. Never treat successful codec decoding as permission to install effects or append
+log bytes.
 
 ## Transaction Construction
 
@@ -510,9 +637,10 @@ hash-chain anchor.
 When `durable_sequence > checkpoint_sequence`, `storage::open` deliberately leaves the durable
 suffix unexecuted. The higher-level `database::open` reads and validates that suffix and passes
 every record to the reference execution layer before accepting new submissions. The storage layer
-itself provides no scheduler, logical log writer or recovery coordinator. Cursor lifecycle APIs,
-changefeeds, replication, GC and whole-file compaction remain unimplemented. Old manifests and
-unreferenced pages are retained rather than reclaimed unsafely.
+itself provides no scheduler, logical log writer or recovery coordinator. The database layer
+provides cursor lifecycle APIs and resolved feeds. Logical feed production, replication, backups, GC
+and whole-file compaction remain unimplemented. Old manifests and unreferenced pages are retained
+rather than reclaimed unsafely.
 
 Database recovery also validates retained logical checkpoint history before accepting work, even
 when there is no replay suffix. It checks catalogue lifecycles and immutable schemas, historical row

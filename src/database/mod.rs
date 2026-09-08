@@ -1,8 +1,9 @@
 //! Async, durable transaction submission through a serial background writer.
 //!
-//! [`create`] and [`open`] return a cloneable handle. All filesystem
-//! operations, validation, execution and recovery run on its dedicated thread,
-//! not the caller's executor. The futures use Tokio channels but need no Tokio
+//! [`create`] and [`open`] return a cloneable handle. Submission I/O,
+//! validation, execution and recovery run on its dedicated thread, not the
+//! caller's executor. Snapshot reads use synchronous caller-thread I/O.
+//! The futures use Tokio channels but need no Tokio
 //! runtime. Up to 64 requests can wait in the writer queue; further submissions
 //! await capacity. Each receipt follows log durability, execution and
 //! checkpoint publication, including when its outcome is a semantic abort.
@@ -12,17 +13,47 @@
 //! any required request-ID deduplication inside the transaction itself.
 //! [`close`] drains accepted requests and releases the directory lock for all
 //! handle clones. Dropping every handle also drains the queue, but does not
-//! wait for the writer to finish. No snapshot, retention or parallel scheduler
-//! API is provided here.
+//! wait for the writer to finish. Snapshots are revocable; close revokes all
+//! claims and drains in-flight reads without waiting for idle handles or scans.
+//! Durable cursors survive close and are released only by explicit request.
 
+pub(crate) mod cursor;
 mod engine;
+mod exchange;
+mod feed;
 mod record;
+pub(crate) mod snapshot;
 
 use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
 
+pub use cursor::CursorInfo;
+pub use cursor::RetentionFloors;
+pub use cursor::acknowledge_cursor;
+pub use cursor::checkout_cursor;
+pub use cursor::list_cursors;
+pub use cursor::release_cursor;
+pub use cursor::reopen_cursor;
+pub use cursor::retention_status;
+pub use cursor::snapshot_and_cursor;
+pub use exchange::CursorKind;
+pub use exchange::CursorToken;
+pub use exchange::EMPTY_BATCH_BYTES;
+pub use exchange::FeedBatch;
+pub use exchange::FeedRecords;
+pub use exchange::LogicalRecord;
+pub use exchange::MAX_BATCH_BYTES;
+pub use exchange::Watermark;
+pub use feed::read_feed;
+pub use snapshot::Snapshot;
+pub use snapshot::SnapshotScan;
+pub use snapshot::catalogue;
+pub use snapshot::get;
+pub use snapshot::revoke;
+pub use snapshot::scan;
+pub use snapshot::snapshot;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -78,9 +109,37 @@ pub struct Receipt {
     pub outcome: Outcome,
 }
 
+/// Limits include the complete H.1 header and CRC. Records are never split.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchLimits {
+    pub max_records: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for BatchLimits {
+    fn default() -> Self {
+        Self {
+            max_records: 1024,
+            max_bytes: MAX_BATCH_BYTES,
+        }
+    }
+}
+
 /// Submission and system errors, separate from deterministic VM aborts.
 #[derive(Debug)]
 pub enum Error {
+    SnapshotRevoked,
+    HistoryUnavailable,
+    CursorReleased,
+    CursorIdExhausted,
+    InvalidToken(&'static str),
+    InvalidFormat(&'static str),
+    InvalidInput(&'static str),
+    BatchTooSmall {
+        required: usize,
+    },
+    /// Read or exchange failure, never a semantic transaction abort.
+    Read(vm::Error),
     /// Validation rejected the request before sequencing. Nothing was written.
     Rejected(vm::Error),
     /// A system failure during startup or before this request was appended.
@@ -101,6 +160,18 @@ impl fmt::Display for Error {
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
         match self {
+            Self::SnapshotRevoked => f.write_str("snapshot has been revoked"),
+            Self::HistoryUnavailable => f.write_str("required history is unavailable"),
+            Self::CursorReleased => f.write_str("cursor has been released"),
+            Self::CursorIdExhausted => f.write_str("cursor ID space is exhausted"),
+            Self::InvalidToken(reason) => write!(f, "invalid cursor token or watermark: {reason}"),
+            Self::InvalidFormat(reason) => write!(f, "invalid exchange format: {reason}"),
+            Self::InvalidInput(reason) => write!(f, "invalid database input: {reason}"),
+            Self::BatchTooSmall { required } => write!(
+                f,
+                "batch requires at least {required} bytes for its first complete record"
+            ),
+            Self::Read(error) => error.fmt(f),
             Self::Rejected(error) => write!(f, "transaction rejected: {error}"),
             Self::Storage(error) => error.fmt(f),
             Self::Uncertain { sequence, source } => {
@@ -121,7 +192,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Rejected(error) => Some(error),
+            Self::Rejected(error) | Self::Read(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::Uncertain {
                 source: Some(error),
@@ -134,7 +205,23 @@ impl std::error::Error for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+fn persisted_read(error: vm::Error) -> Error {
+    match error {
+        vm::Error::Invalid(reason) | vm::Error::Storage(storage::Error::InvalidInput(reason)) => {
+            Error::Storage(storage::Error::Corrupt(reason))
+        }
+        other => Error::Read(other),
+    }
+}
+
 enum Request {
+    Snapshot {
+        reply: oneshot::Sender<Result<Snapshot>>,
+    },
+    Retention {
+        operation: cursor::Operation,
+        reply: oneshot::Sender<Result<cursor::Response>>,
+    },
     Execute {
         command: Box<Command>,
         reply: oneshot::Sender<Result<Receipt>>,
@@ -331,6 +418,9 @@ async fn submit(
 /// individual transactions still report their own results. A repeated close
 /// after shutdown returns `Error::Closed`. Even that result waits for the
 /// writer to release its storage handles, so the directory can be reopened.
+/// All snapshots and their iterators are revoked before this returns. In-flight
+/// reads finish at their original view; idle handles do not delay close. Cursor
+/// registrations remain durable and can be reopened using their saved tokens.
 pub async fn close(database: &Database) -> Result<()> {
     let result = database
         .sender
@@ -347,8 +437,34 @@ fn run_writer(
     mut receiver: mpsc::Receiver<Request>,
 ) {
     let mut failed = false;
+    let mut registry = snapshot::Registry::default();
     while let Some(request) = receiver.blocking_recv() {
         match request {
+            Request::Snapshot { reply } => {
+                let result = if failed {
+                    Err(Error::Closed)
+                } else {
+                    Ok(snapshot::capture(&mut registry, &store))
+                };
+                let _ = reply.send(result);
+            }
+            Request::Retention { operation, reply } => {
+                let result = if failed {
+                    Err(Error::Closed)
+                } else {
+                    cursor::handle(&mut store, &mut registry, operation)
+                };
+                if result.as_ref().is_err_and(|error| {
+                    matches!(
+                        error,
+                        Error::Storage(_) | Error::Uncertain { .. } | Error::Read(_)
+                    )
+                }) {
+                    failed = true;
+                    receiver.close();
+                }
+                let _ = reply.send(result);
+            }
             Request::Execute { command, reply } => {
                 let result = if failed {
                     Err(Error::Closed)
@@ -369,6 +485,7 @@ fn run_writer(
             }
         }
     }
+    snapshot::revoke_all(&mut registry);
 }
 
 #[cfg(test)]

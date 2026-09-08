@@ -12,7 +12,17 @@ pub use limits::Limits;
 pub mod database;
 
 #[cfg(any(unix, windows))]
+pub use database::CursorKind;
+#[cfg(any(unix, windows))]
+pub use database::CursorToken;
+#[cfg(any(unix, windows))]
 pub use database::Database;
+#[cfg(any(unix, windows))]
+pub use database::FeedBatch;
+#[cfg(any(unix, windows))]
+pub use database::Snapshot;
+#[cfg(any(unix, windows))]
+pub use database::Watermark;
 
 #[cfg(any(unix, windows))]
 pub mod storage;

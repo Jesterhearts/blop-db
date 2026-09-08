@@ -340,7 +340,7 @@ fn min_value_bytes(ty: &Type) -> usize {
 }
 
 /// Decode exactly one value under a type validated by `Type::decode`.
-pub(super) fn decode_value(
+pub(crate) fn decode_value(
     ty: &Type,
     bytes: &[u8],
 ) -> Result<Value> {
