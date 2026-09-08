@@ -12,7 +12,9 @@
 //! here.
 
 mod database;
+mod history;
 mod operations;
+mod outcome;
 mod program;
 mod runtime;
 mod value;
@@ -21,7 +23,22 @@ use std::fmt;
 use std::ops::Bound;
 
 pub use database::CatalogueOperation;
+pub use database::CatalogueVersion;
+pub use database::catalogue_key;
+pub use database::catalogue_version;
+pub use database::decode_catalogue;
+pub use database::decode_catalogue_key;
+pub use database::encode_catalogue;
 pub(crate) use database::validate_catalogue;
+pub use history::History;
+pub(crate) use history::validate_catalogue_record;
+pub use history::validate_history;
+pub(crate) use history::validate_limits_record;
+pub(crate) use history::validate_transaction_outcome;
+pub use outcome::OutcomeRecord;
+pub use outcome::decode_outcome;
+pub use outcome::encode_outcome;
+pub use outcome::read_outcome;
 pub use value::Type;
 pub use value::Value;
 
@@ -133,11 +150,12 @@ pub enum Outcome {
     Aborted(Abort),
 }
 
+/// Stable table identity and its immutable storage types.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Table {
-    id: u64,
-    key: Type,
-    value: Type,
+pub struct Table {
+    pub id: u64,
+    pub key: Type,
+    pub value: Type,
 }
 
 /// Validate and interpret bytes without changing storage.

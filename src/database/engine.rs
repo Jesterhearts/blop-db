@@ -180,9 +180,9 @@ fn publish_checkpoint(store: &mut storage::Store) -> storage::Result<()> {
 /// a store left partially materialized by a failed recovery attempt.
 pub(super) fn recover(store: &mut storage::Store) -> storage::Result<()> {
     let manifest = store.manifest().clone();
-    if manifest.checkpoint_sequence == manifest.durable_sequence {
-        return Ok(());
-    }
+    let checkpoint = storage::checkpoint_view(store);
+    let history =
+        vm::validate_history(&checkpoint, &manifest, store.genesis()).map_err(replay_error)?;
     let mut resolved = manifest.checkpoint_sequence;
     for segment in &manifest.segments {
         let file = File::open(
@@ -212,6 +212,8 @@ pub(super) fn recover(store: &mut storage::Store) -> storage::Result<()> {
             if sequence == manifest.checkpoint_sequence && digest != manifest.checkpoint_digest {
                 return Err(storage::Error::Corrupt("log checkpoint digest mismatch"));
             }
+            let command = record::decode(bytes[24], &bytes[RECORD_HEADER_LENGTH..bytes.len() - 8])
+                .map_err(replay_error)?;
             if sequence > manifest.checkpoint_sequence {
                 if sequence != resolved + 1
                     || (resolved == manifest.checkpoint_sequence
@@ -219,13 +221,20 @@ pub(super) fn recover(store: &mut storage::Store) -> storage::Result<()> {
                 {
                     return Err(storage::Error::Corrupt("noncontiguous recovery suffix"));
                 }
-                let command =
-                    record::decode(bytes[24], &bytes[RECORD_HEADER_LENGTH..bytes.len() - 8])
-                        .map_err(replay_error)?;
                 record::validate(&storage::view(store), sequence, &command)
                     .map_err(replay_error)?;
                 record::execute(store, sequence, digest, &command).map_err(replay_error)?;
                 resolved = sequence;
+            } else {
+                validate_checkpoint_record(
+                    &checkpoint,
+                    &history,
+                    sequence,
+                    digest,
+                    bytes[24],
+                    &command,
+                )
+                .map_err(replay_error)?;
             }
             predecessor = digest;
         }
@@ -238,7 +247,50 @@ pub(super) fn recover(store: &mut storage::Store) -> storage::Result<()> {
     if resolved != manifest.durable_sequence {
         return Err(storage::Error::Corrupt("incomplete recovery suffix"));
     }
-    publish_checkpoint(store)
+    if manifest.checkpoint_sequence != manifest.durable_sequence {
+        publish_checkpoint(store)?;
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_record(
+    view: &storage::View,
+    history: &vm::History,
+    sequence: u64,
+    digest: [u8; 32],
+    kind: u8,
+    command: &record::Command,
+) -> vm::Result<()> {
+    record::validate(view, sequence, command)?;
+    let outcome = vm::read_outcome(view, sequence)?;
+    if outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome.record_kind != kind || outcome.record_digest != digest)
+        || history
+            .version_kind(sequence)
+            .is_some_and(|version_kind| version_kind != kind)
+    {
+        return Err(vm::Error::Invalid(
+            "retained history disagrees with source record kind or digest",
+        ));
+    }
+    match command {
+        record::Command::Transaction {
+            transaction,
+            claims,
+        } => {
+            if let Some(outcome) = &outcome {
+                vm::validate_transaction_outcome(view, sequence, transaction, claims, outcome)?;
+            }
+            Ok(())
+        }
+        record::Command::Catalogue(operation) => {
+            vm::validate_catalogue_record(view, history, sequence, operation, outcome.as_ref())
+        }
+        record::Command::Limits(policy) => {
+            vm::validate_limits_record(view, history, sequence, policy, outcome.as_ref())
+        }
+    }
 }
 
 fn authoritative_io(error: io::Error) -> storage::Error {
@@ -256,6 +308,7 @@ fn replay_error(error: vm::Error) -> storage::Error {
         vm::Error::Unsupported { format, version } => {
             storage::Error::Unsupported { format, version }
         }
+        vm::Error::Storage(storage::Error::InvalidInput(reason)) => storage::Error::Corrupt(reason),
         vm::Error::Storage(error) => error,
     }
 }
@@ -359,6 +412,46 @@ mod tests {
             transaction,
             claims: policy(),
         }
+    }
+
+    #[test]
+    fn appendix_h3_program_body_record_and_minimal_claims() {
+        let bytes = "42 4c 4f 50 56 4d 30 31 01 00 00 00 4f 00 00 00
+            01 00 00 00 00 00 01 00 02 00 00 00 00 00 00 00
+            03 00 00 00 01 00 03
+            03 00 00 00 01 00 03
+            03 00 00 00 01 00 03 08 00 00 00 2a 00 00 00 00 00 00 00
+            01 00 04 00 00 00 00 00
+            64 00 02 00 00 00"
+            .split_ascii_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(bytes.len(), 79);
+        let command = record::Command::Transaction {
+            transaction: Transaction::from_parts(bytes, vec![0; 4]),
+            claims: LimitPolicy::new([79, 2, 1, 0, 4, 0, 0, 0, 0, 0, 8, 8, 0, 0, 0, 0, 8]).unwrap(),
+        };
+        let (_directory, mut store) = create();
+        let (kind, body) = record::encode(&command).unwrap();
+        assert_eq!(body.len(), 239);
+        let record = envelope(1, store.manifest().durable_digest, kind, &body).unwrap();
+        assert_eq!(record.len(), 311);
+        assert_eq!(&record[8..12], &[0x37, 1, 0, 0]);
+        assert_eq!(&record[307..], &[0x37, 1, 0, 0]);
+        let receipt = commit(&mut store, &command).unwrap();
+        assert_eq!(receipt.sequence, 1);
+        assert_eq!(
+            receipt.outcome,
+            Outcome::Success {
+                result_type: Type::U64,
+                value: Value::U64(42),
+                effects: vec![],
+            }
+        );
+        assert_eq!(store.manifest().checkpoint_sequence, 1);
+        let path = store.directory().to_owned();
+        drop(store);
+        recover(&mut storage::open(path).unwrap()).unwrap();
     }
 
     fn entries(
@@ -718,5 +811,531 @@ mod tests {
             read_record(&mut header.as_slice(), u64::MAX, 1, [7; 32]),
             Err(storage::Error::Corrupt(_))
         ));
+    }
+
+    fn retained_history() -> (tempfile::TempDir, storage::Store) {
+        let (directory, mut store) = create();
+        for command in [
+            record::Command::Catalogue(CatalogueOperation::Create {
+                name: "flags".into(), key: Type::Boolean, value: Type::Boolean,
+            }),
+            transaction(tx! { tables { flags: bool => bool = 1 } flags[false] = true; flags[true] = false; return true; }.unwrap()),
+            transaction(tx! { tables { flags: bool => bool = 1 } flags[false] = false; }.unwrap()),
+            record::Command::Catalogue(CatalogueOperation::Rename { table: 1, name: "renamed".into() }),
+            record::Command::Limits(policy()),
+            transaction(tx! { abort(19); }.unwrap()),
+        ] {
+            commit(&mut store, &command).unwrap();
+        }
+        assert_eq!(store.manifest().checkpoint_sequence, 6);
+        assert_eq!(store.manifest().durable_sequence, 6);
+        (directory, store)
+    }
+
+    fn checkpoint_changes(
+        store: &mut storage::Store,
+        changes: &[storage::Mutation],
+    ) {
+        storage::apply(store, changes).unwrap();
+        // This deliberately uses only the physical publisher: checksums and
+        // framing are valid, while the logical database contents may not be.
+        publish_checkpoint(store).unwrap();
+    }
+
+    fn change(
+        tree: TreeId,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> storage::Mutation {
+        storage::Mutation { tree, key, value }
+    }
+
+    fn state_key(
+        key: u8,
+        sequence: u64,
+    ) -> Vec<u8> {
+        storage::mvcc::StateKey::new(1, vec![key], sequence)
+            .unwrap()
+            .encode()
+    }
+
+    fn stored(
+        store: &storage::Store,
+        tree: TreeId,
+        key: &[u8],
+    ) -> Vec<u8> {
+        storage::get(&storage::view(store), tree, key)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn reopen_recovery(store: storage::Store) -> storage::Result<()> {
+        let path = store.directory().to_owned();
+        drop(store);
+        let mut store = storage::open(path)?;
+        let before = store.manifest().clone();
+        let result = recover(&mut store);
+        assert_eq!(store.manifest(), &before);
+        result
+    }
+
+    #[tokio::test]
+    async fn public_open_rejects_missing_retained_outcomes_even_when_c_equals_d() {
+        for sequence in [1_u64, 3, 6] {
+            let (_directory, mut store) = retained_history();
+            checkpoint_changes(
+                &mut store,
+                &[change(
+                    TreeId::Outcomes,
+                    sequence.to_be_bytes().to_vec(),
+                    None,
+                )],
+            );
+            let path = store.directory().to_owned();
+            drop(store);
+            assert!(matches!(
+                crate::database::open(path).await,
+                Err(Error::Storage(storage::Error::Corrupt(_)))
+            ));
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_checksum_valid_malformed_outcomes_and_old_catalogue_values() {
+        for case in 0..8 {
+            let (_directory, mut store) = retained_history();
+            let mutation = match case {
+                0 => change(
+                    TreeId::Outcomes,
+                    2_u64.to_be_bytes().to_vec(),
+                    Some(vec![1]),
+                ),
+                1 | 2 => {
+                    let mut bytes = stored(&store, TreeId::Outcomes, &2_u64.to_be_bytes());
+                    bytes[if case == 1 { 4 } else { 46 }] ^= 1;
+                    change(TreeId::Outcomes, 2_u64.to_be_bytes().to_vec(), Some(bytes))
+                }
+                3 | 4 => {
+                    let key = vm::catalogue_key(1, 1);
+                    let mut bytes = stored(&store, TreeId::Catalogue, &key);
+                    if case == 3 {
+                        bytes[3] = 1;
+                    } else {
+                        bytes[8] = 0;
+                    }
+                    change(TreeId::Catalogue, key, Some(bytes))
+                }
+                5 => {
+                    let key = vm::catalogue_key(1, 4);
+                    let mut catalogue =
+                        vm::decode_catalogue(1, &stored(&store, TreeId::Catalogue, &key)).unwrap();
+                    catalogue.table.value = Type::Unit;
+                    change(
+                        TreeId::Catalogue,
+                        key,
+                        Some(vm::encode_catalogue(&catalogue).unwrap()),
+                    )
+                }
+                6 => change(
+                    TreeId::State,
+                    state_key(0, 2),
+                    Some(storage::mvcc::StateValue::Put(vec![2]).encode().unwrap()),
+                ),
+                7 => change(
+                    TreeId::State,
+                    state_key(2, 2),
+                    Some(storage::mvcc::StateValue::Delete.encode().unwrap()),
+                ),
+                _ => unreachable!(),
+            };
+            checkpoint_changes(&mut store, &[mutation]);
+            assert!(
+                matches!(reopen_recovery(store), Err(storage::Error::Corrupt(_))),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_checks_exact_effects_not_latest_values_and_rejects_extra_versions() {
+        for case in 0..6 {
+            let (_directory, mut store) = retained_history();
+            let mutation = match case {
+                0 => change(TreeId::State, state_key(0, 2), None),
+                1 => change(
+                    TreeId::State,
+                    state_key(0, 2),
+                    Some(storage::mvcc::StateValue::Put(vec![0]).encode().unwrap()),
+                ),
+                2 => change(
+                    TreeId::State,
+                    state_key(0, 2),
+                    Some(storage::mvcc::StateValue::Delete.encode().unwrap()),
+                ),
+                3 => change(
+                    TreeId::State,
+                    state_key(1, 3),
+                    Some(storage::mvcc::StateValue::Delete.encode().unwrap()),
+                ),
+                4 => change(
+                    TreeId::State,
+                    state_key(1, 6),
+                    Some(storage::mvcc::StateValue::Delete.encode().unwrap()),
+                ),
+                5 => {
+                    let mut outcome = vm::read_outcome(&storage::view(&store), 2)
+                        .unwrap()
+                        .unwrap();
+                    let Outcome::Success { effects, .. } = &mut outcome.outcome else {
+                        unreachable!()
+                    };
+                    let vm::Effect::Put { value, .. } = &mut effects[0] else {
+                        unreachable!()
+                    };
+                    value[0] ^= 1;
+                    change(
+                        TreeId::Outcomes,
+                        2_u64.to_be_bytes().to_vec(),
+                        Some(
+                            vm::encode_outcome(2, outcome.record_digest, 1, &outcome.outcome)
+                                .unwrap(),
+                        ),
+                    )
+                }
+                _ => unreachable!(),
+            };
+            checkpoint_changes(&mut store, &[mutation]);
+            assert!(
+                matches!(reopen_recovery(store), Err(storage::Error::Corrupt(_))),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_log_checks_digest_result_descriptor_and_abort_instruction_fields() {
+        for case in 0..4 {
+            let (_directory, mut store) = retained_history();
+            let sequence = if case < 2 { 2 } else { 6 };
+            let mut outcome = vm::read_outcome(&storage::view(&store), sequence)
+                .unwrap()
+                .unwrap();
+            match case {
+                0 => outcome.record_digest[0] ^= 1,
+                1 => {
+                    let Outcome::Success {
+                        result_type, value, ..
+                    } = &mut outcome.outcome
+                    else {
+                        unreachable!()
+                    };
+                    *result_type = Type::Unit;
+                    *value = Value::Unit;
+                }
+                2 | 3 => {
+                    let Outcome::Aborted(abort) = &mut outcome.outcome else {
+                        unreachable!()
+                    };
+                    if case == 2 {
+                        abort.instruction = 1;
+                    } else {
+                        abort.user_code = 20;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let bytes =
+                vm::encode_outcome(sequence, outcome.record_digest, 1, &outcome.outcome).unwrap();
+            checkpoint_changes(
+                &mut store,
+                &[change(
+                    TreeId::Outcomes,
+                    sequence.to_be_bytes().to_vec(),
+                    Some(bytes),
+                )],
+            );
+            // The standalone logical checkpoint is well-formed; source records
+            // expose the discrepancy without executing their old writes again.
+            vm::validate_history(
+                &storage::checkpoint_view(&store),
+                store.manifest(),
+                store.genesis(),
+            )
+            .unwrap();
+            assert!(
+                matches!(reopen_recovery(store), Err(storage::Error::Corrupt(_))),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpointed_log_bodies_are_validated_even_without_a_replay_suffix() {
+        for body in [vec![0], vec![1, 0, 1, 0], vec![2, 0]] {
+            let (_directory, mut store) = create();
+            let bytes = envelope(1, store.manifest().durable_digest, 1, &body).unwrap();
+            let digest = append(&mut store, 1, &bytes).unwrap();
+            let outcome = Outcome::Success {
+                result_type: Type::Unit,
+                value: Value::Unit,
+                effects: vec![],
+            };
+            checkpoint_changes(
+                &mut store,
+                &[change(
+                    TreeId::Outcomes,
+                    1_u64.to_be_bytes().to_vec(),
+                    Some(vm::encode_outcome(1, digest, 1, &outcome).unwrap()),
+                )],
+            );
+            let result = reopen_recovery(store);
+            if body == [2, 0] {
+                assert!(matches!(
+                    result,
+                    Err(storage::Error::Unsupported {
+                        format: "transaction",
+                        version: 2
+                    })
+                ));
+            } else {
+                assert!(matches!(result, Err(storage::Error::Corrupt(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_unsupported_outcomes_catalogue_and_historical_schemas() {
+        for case in 0..3 {
+            let (_directory, mut store) = retained_history();
+            let (tree, key, offset) = if case == 0 {
+                (TreeId::Outcomes, 2_u64.to_be_bytes().to_vec(), 0)
+            } else {
+                // The old name is five bytes; its first schema starts at 17.
+                (
+                    TreeId::Catalogue,
+                    vm::catalogue_key(1, 1),
+                    if case == 1 { 0 } else { 17 },
+                )
+            };
+            let mut bytes = stored(&store, tree, &key);
+            bytes[offset] = 2;
+            checkpoint_changes(&mut store, &[change(tree, key, Some(bytes))]);
+            assert!(
+                matches!(
+                    reopen_recovery(store),
+                    Err(storage::Error::Unsupported { version: 2, .. })
+                ),
+                "case {case}"
+            );
+        }
+    }
+
+    fn reclaim_history(
+        store: &mut storage::Store,
+        floor: u64,
+        remove_log: bool,
+    ) {
+        let mut changes: Vec<_> = (1..=floor)
+            .map(|sequence| change(TreeId::Outcomes, sequence.to_be_bytes().to_vec(), None))
+            .collect();
+        if floor >= 3 {
+            // false@3 is the baseline, but true@2 must survive without outcome
+            // 2.
+            changes.push(change(TreeId::State, state_key(0, 2), None));
+        }
+        storage::apply(store, &changes).unwrap();
+        let mut manifest = store.manifest().clone();
+        manifest.history_floor = floor;
+        if remove_log {
+            manifest.log_floor = manifest.checkpoint_sequence + 1;
+            manifest.segments.clear();
+        }
+        let view = storage::view(store);
+        storage::publish(store, &view, manifest).unwrap();
+    }
+
+    #[test]
+    fn valid_dropped_tables_and_history_floors_recover_with_or_without_source_log() {
+        for remove_log in [false, true] {
+            for floor in [0, 3, 11] {
+                let (_directory, mut store) = retained_history();
+                commit(
+                    &mut store,
+                    &record::Command::Catalogue(CatalogueOperation::Drop { table: 1 }),
+                )
+                .unwrap();
+                let receipt = commit(
+                    &mut store,
+                    &record::Command::Catalogue(CatalogueOperation::Create {
+                        name: "renamed".into(),
+                        key: Type::U64,
+                        value: Type::I64,
+                    }),
+                )
+                .unwrap();
+                assert_eq!(receipt.sequence, 8);
+                for operation in [
+                    CatalogueOperation::Create {
+                        name: "renamed".into(),
+                        key: Type::U64,
+                        value: Type::I64,
+                    },
+                    CatalogueOperation::Drop { table: 1 },
+                ] {
+                    assert!(matches!(
+                        commit(&mut store, &record::Command::Catalogue(operation))
+                            .unwrap()
+                            .outcome,
+                        Outcome::Aborted(_)
+                    ));
+                }
+                commit(
+                    &mut store,
+                    &record::Command::Limits(LimitPolicy::new([0; 17]).unwrap()),
+                )
+                .unwrap();
+                reclaim_history(&mut store, floor, remove_log);
+                reopen_recovery(store).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn retained_sources_require_all_catalogue_and_policy_versions_after_outcome_gc() {
+        for tree in [TreeId::Catalogue, TreeId::Policy] {
+            let (_directory, mut store) = retained_history();
+            reclaim_history(&mut store, 6, false);
+            let key = if tree == TreeId::Catalogue {
+                vm::catalogue_key(1, 4)
+            } else {
+                5_u64.to_be_bytes().to_vec()
+            };
+            checkpoint_changes(&mut store, &[change(tree, key, None)]);
+            vm::validate_history(
+                &storage::checkpoint_view(&store),
+                store.manifest(),
+                store.genesis(),
+            )
+            .unwrap();
+            assert!(matches!(
+                reopen_recovery(store),
+                Err(storage::Error::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn optional_old_outcomes_allow_reclaimed_versions_but_not_contradictions() {
+        for case in 0..3 {
+            let (_directory, mut store) = retained_history();
+            let mut changes = vec![
+                change(TreeId::State, state_key(0, 2), None),
+                change(TreeId::Outcomes, 1_u64.to_be_bytes().to_vec(), None),
+            ];
+            if case != 0 {
+                changes.push(change(
+                    TreeId::State,
+                    state_key(1, if case == 1 { 2 } else { 3 }),
+                    Some(storage::mvcc::StateValue::Put(vec![1]).encode().unwrap()),
+                ));
+            }
+            storage::apply(&mut store, &changes).unwrap();
+            let mut manifest = store.manifest().clone();
+            manifest.history_floor = 3;
+            let checkpoint = storage::view(&store);
+            storage::publish(&mut store, &checkpoint, manifest).unwrap();
+            drop(checkpoint);
+            let result = reopen_recovery(store);
+            if case == 0 {
+                result.unwrap();
+            } else {
+                assert!(matches!(result, Err(storage::Error::Corrupt(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn baseline_versions_still_require_historical_liveness_without_outcomes_or_log() {
+        let (_directory, mut store) = retained_history();
+        commit(
+            &mut store,
+            &record::Command::Catalogue(CatalogueOperation::Drop { table: 1 }),
+        )
+        .unwrap();
+        commit(&mut store, &transaction(tx! { return 1; }.unwrap())).unwrap();
+        reclaim_history(&mut store, 8, true);
+        checkpoint_changes(
+            &mut store,
+            &[change(
+                TreeId::State,
+                state_key(1, 8),
+                Some(storage::mvcc::StateValue::Put(vec![1]).encode().unwrap()),
+            )],
+        );
+        assert!(matches!(
+            reopen_recovery(store),
+            Err(storage::Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn entire_catalogue_history_is_validated_without_outcomes_or_source_log() {
+        for case in 0..4 {
+            let (_directory, mut store) = retained_history();
+            let operations = if case == 3 {
+                vec![
+                    CatalogueOperation::Create {
+                        name: "flags".into(),
+                        key: Type::Boolean,
+                        value: Type::Boolean,
+                    },
+                    CatalogueOperation::Rename {
+                        table: 7,
+                        name: "other".into(),
+                    },
+                ]
+            } else {
+                vec![
+                    CatalogueOperation::Drop { table: 1 },
+                    CatalogueOperation::Drop { table: 1 },
+                ]
+            };
+            for operation in operations {
+                commit(&mut store, &record::Command::Catalogue(operation)).unwrap();
+            }
+            reclaim_history(&mut store, 8, true);
+            let mutation = if case == 0 {
+                change(TreeId::Catalogue, vm::catalogue_key(1, 1), None)
+            } else {
+                let (id, sequence) = if case == 3 { (7, 7) } else { (1, 7) };
+                let mut catalogue = vm::decode_catalogue(
+                    id,
+                    &stored(&store, TreeId::Catalogue, &vm::catalogue_key(id, sequence)),
+                )
+                .unwrap();
+                let effective = if case == 2 {
+                    catalogue.live = true;
+                    8
+                } else {
+                    catalogue.name = if case == 3 {
+                        "renamed"
+                    } else {
+                        "changed-drop-name"
+                    }
+                    .into();
+                    sequence
+                };
+                change(
+                    TreeId::Catalogue,
+                    vm::catalogue_key(id, effective),
+                    Some(vm::encode_catalogue(&catalogue).unwrap()),
+                )
+            };
+            checkpoint_changes(&mut store, &[mutation]);
+            assert!(
+                matches!(reopen_recovery(store), Err(storage::Error::Corrupt(_))),
+                "case {case}"
+            );
+        }
     }
 }

@@ -47,13 +47,15 @@ pub enum CatalogueOperation {
     },
 }
 
-struct CatalogueVersion {
-    live: bool,
-    name: String,
-    table: Table,
+/// Complete immutable-schema catalogue metadata at one effective sequence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogueVersion {
+    pub live: bool,
+    pub name: String,
+    pub table: Table,
 }
 
-fn input_error(error: storage::Error) -> Error {
+pub(super) fn input_error(error: storage::Error) -> Error {
     match error {
         storage::Error::InvalidInput(reason) => Error::Invalid(reason),
         storage::Error::Unsupported { format, version } => Error::Unsupported { format, version },
@@ -61,7 +63,7 @@ fn input_error(error: storage::Error) -> Error {
     }
 }
 
-fn persisted(error: Error) -> Error {
+pub(super) fn persisted(error: Error) -> Error {
     match error {
         Error::Invalid(reason) | Error::Storage(storage::Error::InvalidInput(reason)) => {
             Error::Storage(storage::Error::Corrupt(reason))
@@ -70,7 +72,7 @@ fn persisted(error: Error) -> Error {
     }
 }
 
-fn valid_id(id: u64) -> Result<()> {
+pub(super) fn valid_id(id: u64) -> Result<()> {
     if id == 0 || id == u64::MAX {
         return Err(Error::Invalid("reserved table ID or record sequence"));
     }
@@ -158,14 +160,17 @@ fn schema_descriptor(
     Ok(descriptor)
 }
 
-fn catalogue_key(
+/// Construct a descending-version seek key. Sequence zero is useful for seeking
+/// the empty pre-creation view, but is not a valid stored catalogue version.
+pub fn catalogue_key(
     id: u64,
     sequence: u64,
 ) -> Vec<u8> {
     [id.to_be_bytes(), (!sequence).to_be_bytes()].concat()
 }
 
-fn decode_catalogue_key(bytes: &[u8]) -> Result<(u64, u64)> {
+/// Decode a stored catalogue key as (table ID, effective sequence).
+pub fn decode_catalogue_key(bytes: &[u8]) -> Result<(u64, u64)> {
     if bytes.len() != 16 {
         return Err(Error::Storage(storage::Error::Corrupt(
             "invalid catalogue key length",
@@ -183,10 +188,13 @@ fn decode_catalogue_key(bytes: &[u8]) -> Result<(u64, u64)> {
     Ok((id, sequence))
 }
 
-fn decode_catalogue(
+/// Decode complete D.1 metadata, including immutable schema bounds. The caller
+/// supplies the table ID from its enclosing tree key or outcome effect.
+pub fn decode_catalogue(
     id: u64,
     bytes: &[u8],
 ) -> Result<CatalogueVersion> {
+    valid_id(id)?;
     let mut input = bytes;
     let version = u16::from_le_bytes(take(&mut input, 2)?.try_into().unwrap());
     if version != 1 {
@@ -222,15 +230,23 @@ fn decode_catalogue(
     })
 }
 
-fn encode_catalogue(version: &CatalogueVersion) -> Result<Vec<u8>> {
+/// Encode complete D.1 metadata after validating public names and type enums.
+pub fn encode_catalogue(version: &CatalogueVersion) -> Result<Vec<u8>> {
+    valid_id(version.table.id)?;
+    valid_name(&version.name)?;
+    let key = schema_descriptor(&version.table.key, true)?;
+    let value = schema_descriptor(&version.table.value, false)?;
     let mut bytes = vec![1, 0, if version.live { 1 } else { 2 }, 0];
     blob(&mut bytes, version.name.as_bytes())?;
-    blob(&mut bytes, &version.table.key.descriptor())?;
-    blob(&mut bytes, &version.table.value.descriptor())?;
+    blob(&mut bytes, &key)?;
+    blob(&mut bytes, &value)?;
     Ok(bytes)
 }
 
-fn catalogue_version(
+/// Read the last catalogue version at or before a protected snapshot sequence.
+/// A dropped version is returned as metadata, not skipped in favour of a live
+/// one.
+pub fn catalogue_version(
     view: &View,
     id: u64,
     sequence: u64,
@@ -523,14 +539,6 @@ pub(super) fn limits(policy: &LimitPolicy) -> Outcome {
     }
 }
 
-fn effect_address(effect: &Effect) -> (u64, &[u8]) {
-    match effect {
-        Effect::Put { table, key, .. } | Effect::Delete { table, key } => (*table, key),
-        Effect::Catalogue { table, .. } => (*table, &[]),
-        Effect::Limits { .. } => (0, &[]),
-    }
-}
-
 /// Install validated interpreter output once, with its complete D.3 outcome.
 /// The caller owns sequencing and must exclude speculative materialization when
 /// replaying from a checkpoint. This is not an idempotent replay API.
@@ -557,126 +565,36 @@ pub(super) fn install(
     {
         return Err(Error::Invalid("sequence is already resolved"));
     }
-    let mut bytes = vec![1, 0, kind, u8::from(matches!(outcome, Outcome::Aborted(_)))];
-    bytes.extend_from_slice(&sequence.to_le_bytes());
-    bytes.extend_from_slice(&digest);
+    let bytes = super::encode_outcome(sequence, digest, kind, outcome)?;
     let mut changes = Vec::new();
-    match outcome {
-        Outcome::Aborted(abort) => {
-            let reason: u16 = match abort.reason {
-                AbortReason::MissingKey => 1,
-                AbortReason::KeyExists => 2,
-                AbortReason::RequireFailed => 3,
-                AbortReason::ExplicitAbort => 4,
-                AbortReason::IntegerOverflow => 5,
-                AbortReason::BoundExceeded => 6,
-                AbortReason::ResourceLimit => 7,
-                AbortReason::DivisionByZero => 8,
-                AbortReason::InvalidShift => 9,
-                AbortReason::IndexOutOfBounds => 10,
-                AbortReason::InvalidUtf8 => 11,
-                AbortReason::NameInUse => 16,
-                AbortReason::TableNotLive => 17,
+    if let Outcome::Success { effects, .. } = outcome {
+        for effect in effects {
+            let (tree, key, value) = match effect {
+                Effect::Put { table, key, value } => (
+                    TreeId::State,
+                    mvcc::StateKey::new(*table, key.clone(), sequence)?.encode(),
+                    mvcc::StateValue::Put(value.clone()).encode()?,
+                ),
+                Effect::Delete { table, key } => (
+                    TreeId::State,
+                    mvcc::StateKey::new(*table, key.clone(), sequence)?.encode(),
+                    mvcc::StateValue::Delete.encode()?,
+                ),
+                Effect::Catalogue { table, value } => (
+                    TreeId::Catalogue,
+                    catalogue_key(*table, sequence),
+                    value.clone(),
+                ),
+                Effect::Limits { policy } => {
+                    let value = policy.encode();
+                    (TreeId::Policy, sequence.to_be_bytes().to_vec(), value)
+                }
             };
-            let legal = match kind {
-                1 => (1..=11).contains(&reason) && abort.instruction != u32::MAX,
-                2 => (16..=17).contains(&reason) && abort.instruction == u32::MAX,
-                _ => false,
-            };
-            if !legal
-                || (!matches!(reason, 3 | 4) && abort.user_code != 0)
-                || (reason == 7 && !(1..=17).contains(&abort.detail))
-                || (reason != 7 && abort.detail != 0)
-            {
-                return Err(Error::Invalid("invalid abort fields for record kind"));
-            }
-            bytes.extend_from_slice(&reason.to_le_bytes());
-            bytes.extend_from_slice(&[0; 2]);
-            bytes.extend_from_slice(&abort.instruction.to_le_bytes());
-            bytes.extend_from_slice(&abort.user_code.to_le_bytes());
-            bytes.extend_from_slice(&[0; 4]);
-            bytes.extend_from_slice(&abort.detail.to_le_bytes());
-            bytes.extend_from_slice(&[0; 8]);
-        }
-        Outcome::Success {
-            result_type,
-            value,
-            effects,
-        } => {
-            bytes.extend_from_slice(&[0; 4]);
-            bytes.extend_from_slice(&u32::MAX.to_le_bytes());
-            bytes.extend_from_slice(&[0; 16]);
-            let mut returned = Vec::new();
-            blob(&mut returned, &result_type.descriptor())?;
-            blob(&mut returned, &value.encode())?;
-            blob(&mut bytes, &returned)?;
-            let count =
-                u32::try_from(effects.len()).map_err(|_| Error::Invalid("too many effects"))?;
-            if kind != 1 && count != 1 {
-                return Err(Error::Invalid(
-                    "administrative success requires exactly one effect",
-                ));
-            }
-            bytes.extend_from_slice(&count.to_le_bytes());
-            let mut effects: Vec<_> = effects.iter().collect();
-            effects.sort_unstable_by(|a, b| effect_address(a).cmp(&effect_address(b)));
-            if effects
-                .windows(2)
-                .any(|pair| effect_address(pair[0]) == effect_address(pair[1]))
-            {
-                return Err(Error::Invalid("duplicate final effect address"));
-            }
-            for effect in effects {
-                let (tree, key, value) = match effect {
-                    Effect::Put { table, key, value } if kind == 1 => {
-                        bytes.push(1);
-                        bytes.extend_from_slice(&table.to_le_bytes());
-                        blob(&mut bytes, key)?;
-                        blob(&mut bytes, value)?;
-                        (
-                            TreeId::State,
-                            mvcc::StateKey::new(*table, key.clone(), sequence)?.encode(),
-                            mvcc::StateValue::Put(value.clone()).encode()?,
-                        )
-                    }
-                    Effect::Delete { table, key } if kind == 1 => {
-                        bytes.push(2);
-                        bytes.extend_from_slice(&table.to_le_bytes());
-                        blob(&mut bytes, key)?;
-                        (
-                            TreeId::State,
-                            mvcc::StateKey::new(*table, key.clone(), sequence)?.encode(),
-                            mvcc::StateValue::Delete.encode()?,
-                        )
-                    }
-                    Effect::Catalogue { table, value } if kind == 2 => {
-                        valid_id(*table)?;
-                        if *table > sequence {
-                            return Err(Error::Invalid("catalogue version predates creation"));
-                        }
-                        bytes.push(3);
-                        bytes.extend_from_slice(&table.to_le_bytes());
-                        blob(&mut bytes, value)?;
-                        (
-                            TreeId::Catalogue,
-                            catalogue_key(*table, sequence),
-                            value.clone(),
-                        )
-                    }
-                    Effect::Limits { policy } if kind == 3 => {
-                        let value = policy.encode();
-                        bytes.push(4);
-                        blob(&mut bytes, &value)?;
-                        (TreeId::Policy, sequence.to_be_bytes().to_vec(), value)
-                    }
-                    _ => return Err(Error::Invalid("effect does not match record kind")),
-                };
-                changes.push(Mutation {
-                    tree,
-                    key,
-                    value: Some(value),
-                });
-            }
+            changes.push(Mutation {
+                tree,
+                key,
+                value: Some(value),
+            });
         }
     }
     changes.push(Mutation {

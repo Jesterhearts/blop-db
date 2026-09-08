@@ -462,6 +462,13 @@ itself provides no scheduler, logical log writer or recovery coordinator. Cursor
 changefeeds, replication, GC and whole-file compaction remain unimplemented. Old manifests and
 unreferenced pages are retained rather than reclaimed unsafely.
 
+Database recovery also validates retained logical checkpoint history before accepting work, even
+when there is no replay suffix. It checks catalogue lifecycles and immutable schemas, historical row
+liveness and encodings, complete outcome framing, required outcome coverage, and agreement with
+exact retained versions and available canonical records. Optional outcomes below the history floor
+may outlive superseded state versions, but cannot contradict versions that remain. Missing required
+history is corruption, not an empty feed or permission to initialize replacement metadata.
+
 ### Platforms
 
 The storage module builds on Unix and Windows. A small internal platform module handles positional

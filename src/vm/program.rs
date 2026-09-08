@@ -244,6 +244,10 @@ fn read_tables(
     reader: &mut Reader<'_>,
     count: usize,
 ) -> Result<Vec<u64>> {
+    let length = count
+        .checked_mul(8)
+        .ok_or(Error::Invalid("table array length overflow"))?;
+    let mut reader = Reader(reader.take(length)?);
     let mut ids = Vec::with_capacity(count);
     for _ in 0..count {
         let id = reader.u64()?;
@@ -299,7 +303,7 @@ pub(super) fn decode(
             "resolved tables do not match program table IDs",
         ));
     }
-    let mut argument_types = Vec::with_capacity(header.arguments);
+    let mut argument_types = Vec::new();
     for _ in 0..header.arguments {
         let ty = Type::decode(reader.blob()?)?;
         if matches!(ty, Type::Rows { .. }) {
@@ -307,12 +311,12 @@ pub(super) fn decode(
         }
         argument_types.push(ty);
     }
-    let mut register_types = Vec::with_capacity(header.registers);
+    let mut register_types = Vec::new();
     for _ in 0..header.registers {
         register_types.push(Type::decode(reader.blob()?)?);
     }
-    let mut constant_types = Vec::with_capacity(header.constants);
-    let mut constants = Vec::with_capacity(header.constants);
+    let mut constant_types = Vec::new();
+    let mut constants = Vec::new();
     for _ in 0..header.constants {
         let ty = Type::decode(reader.blob()?)?;
         if matches!(ty, Type::Rows { .. }) {
@@ -334,7 +338,7 @@ pub(super) fn decode(
             "supplied argument count does not match program",
         ));
     }
-    let mut arguments = Vec::with_capacity(header.arguments);
+    let mut arguments = Vec::new();
     for ty in &argument_types {
         let bytes = reader.blob()?;
         if bytes.len() as u64 > limits[10] {
@@ -359,7 +363,7 @@ fn read_instructions(
     reader: &mut Reader<'_>,
     count: usize,
 ) -> Result<Vec<Instruction>> {
-    let mut instructions = Vec::with_capacity(count);
+    let mut instructions = Vec::new();
     for _ in 0..count {
         let opcode = reader.u8()?;
         if reader.u8()? != 0 {
@@ -906,6 +910,21 @@ fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_arrays_do_not_reserve_untrusted_counts() {
+        for count in [65_535, usize::MAX] {
+            assert!(read_tables(&mut Reader(&[]), count).is_err());
+            assert!(read_instructions(&mut Reader(&[]), count).is_err());
+        }
+        let original = encode(&Type::Unit, &[], &[], &[], &[], &[op(0x63, &[0, 0])]);
+        for offset in [16, 18, 20, 22] {
+            let mut bytes = original[..39].to_vec();
+            bytes[offset..offset + 2].copy_from_slice(&65_535_u16.to_le_bytes());
+            fix_length(&mut bytes);
+            assert!(decode(&bytes, &[0; 4], &[], &claims()).is_err());
+        }
+    }
 
     #[derive(Clone, Debug)]
     struct WireInstruction {
