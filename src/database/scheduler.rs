@@ -14,6 +14,8 @@ use std::task::Wake;
 use std::task::Waker;
 use std::thread;
 
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -128,10 +130,8 @@ struct Schedule {
     reserved_bytes: u64,
 }
 
-fn next_sequence(store: &storage::Store) -> Result<u64> {
-    store
-        .manifest()
-        .durable_sequence
+fn next_sequence(durable: u64) -> Result<u64> {
+    durable
         .checked_add(1)
         .filter(|&n| n != u64::MAX)
         .ok_or(Error::Storage(storage::Error::Exhausted))
@@ -141,6 +141,8 @@ fn prepare(
     store: &storage::Store,
     command: &mut record::Command,
     options: &EngineOptions,
+    previous_sequence: u64,
+    predecessor: [u8; 32],
 ) -> Result<Option<Prepared>> {
     let record::Command::Transaction {
         transaction,
@@ -159,7 +161,7 @@ fn prepare(
         }
         return Ok(None);
     };
-    let sequence = next_sequence(store)?;
+    let sequence = next_sequence(previous_sequence)?;
     let prepared = match vm::prepare_transaction_bounded(
         &storage::view(store),
         sequence,
@@ -197,8 +199,7 @@ fn prepare(
         }
     }
     let (kind, body) = record::encode(command).map_err(engine::rejection)?;
-    let bytes = engine::envelope(sequence, store.manifest().durable_digest, kind, &body)
-        .map_err(engine::rejection)?;
+    let bytes = engine::envelope(sequence, predecessor, kind, &body).map_err(engine::rejection)?;
     if bytes.len() as u64 > options.assigned_backlog_bytes {
         return Err(Error::OperationalLimit {
             resource: "assigned_backlog_bytes",
@@ -225,55 +226,132 @@ fn overlaps(
 fn register(
     store: &mut storage::Store,
     schedule: &mut Schedule,
-    head: Head,
+    head: &mut Option<Head>,
+    receiver: &mut mpsc::Receiver<Request>,
+    control: &mpsc::Receiver<Control>,
+    pool: &workers::Pool,
+    options: &EngineOptions,
+    status: &watch::Sender<EngineStatus>,
+    barrier: &mut Option<Request>,
 ) -> Result<()> {
-    let Head {
-        prepared, reply, ..
-    } = head;
-    let Prepared {
-        transaction,
-        bytes,
-        reservation,
-    } = prepared.expect("prepared transaction");
-    let sequence = transaction.sequence();
-    assert_eq!(sequence, next_sequence(store)?);
-    let digest = match engine::append(store, sequence, &bytes) {
-        Ok(digest) => digest,
-        Err(error) => {
-            let message = error.to_string();
-            let _ = reply.send(Err(Error::Uncertain {
-                sequence: Some(sequence),
-                source: Some(error.into()),
-            }));
-            return Err(Error::Uncertain {
-                sequence: Some(sequence),
-                source: Some(workers::failure(message)),
-            });
+    let mut records = Vec::new();
+    // Bound both accepted and rejected work, and never wait to fill a group.
+    for _ in 0..=receiver.len().min(63) {
+        if head.is_none() {
+            if !control.is_empty()
+                || !pool.completed.is_empty()
+                || pool.poisoned.load(Ordering::Acquire)
+            {
+                break;
+            }
+            let Ok(request) = receiver.try_recv() else {
+                break;
+            };
+            let Request::Execute {
+                mut command,
+                reply,
+                permit,
+            } = request
+            else {
+                *barrier = Some(request);
+                break;
+            };
+            if !matches!(command.as_ref(), record::Command::Transaction { .. }) {
+                *barrier = Some(Request::Execute {
+                    command,
+                    reply,
+                    permit,
+                });
+                break;
+            }
+            let previous = schedule.entries.back().unwrap();
+            status.send_modify(|s| s.prepared_head_bytes = options.preparation_bytes);
+            match prepare(
+                store,
+                &mut command,
+                options,
+                previous.sequence,
+                previous.digest,
+            ) {
+                Ok(prepared) => {
+                    *head = Some(Head {
+                        command,
+                        prepared,
+                        reply,
+                        _permit: permit,
+                    })
+                }
+                Err(error) => {
+                    let fatal =
+                        !matches!(error, Error::Rejected(_) | Error::OperationalLimit { .. });
+                    let message = error.to_string();
+                    let _ = reply.send(Err(error));
+                    if fatal {
+                        return Err(Error::Uncertain {
+                            sequence: None,
+                            source: Some(workers::failure(message)),
+                        });
+                    }
+                    continue;
+                }
+            }
         }
-    };
-    // Examine ALL unresolved possible writers, including blind writers. A newer
-    // declaration may abort or omit its write and cannot stand in for an older
-    // one.
-    let dependencies = schedule
-        .entries
-        .iter()
-        .filter(|entry| entry.outcome.is_none() && overlaps(&entry.writes, transaction.manifest()))
-        .map(|entry| entry.sequence)
-        .collect();
-    let writes = transaction.manifest().writes().cloned().collect();
-    schedule.assigned_bytes += bytes.len() as u64;
-    schedule.reserved_bytes += reservation;
-    schedule.entries.push_back(Entry {
-        sequence,
-        digest,
-        writes,
-        dependencies,
-        prepared: Some(transaction),
-        outcome: None,
-        reply,
-        bytes: bytes.len() as u64,
-        reservation,
-    });
+        let prepared = head.as_ref().unwrap().prepared.as_ref().unwrap();
+        if schedule.entries.len() == options.assigned_backlog_count
+            || prepared.bytes.len() as u64
+                > options.assigned_backlog_bytes - schedule.assigned_bytes
+            || prepared.reservation > options.execution_bytes - schedule.reserved_bytes
+        {
+            break;
+        }
+        let Head {
+            prepared,
+            reply,
+            _permit,
+            ..
+        } = head.take().unwrap();
+        let Prepared {
+            transaction,
+            bytes,
+            reservation,
+        } = prepared.unwrap();
+        let sequence = transaction.sequence();
+        let digest = Sha256::digest(&bytes).into();
+        // Every unresolved possible writer matters: a newer writer can abort.
+        let dependencies = schedule
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.outcome.is_none() && overlaps(&entry.writes, transaction.manifest())
+            })
+            .map(|entry| entry.sequence)
+            .collect();
+        let writes = transaction.manifest().writes().cloned().collect();
+        schedule.assigned_bytes += bytes.len() as u64;
+        schedule.reserved_bytes += reservation;
+        schedule.entries.push_back(Entry {
+            sequence,
+            digest,
+            writes,
+            dependencies,
+            prepared: Some(transaction),
+            outcome: None,
+            reply,
+            bytes: bytes.len() as u64,
+            reservation,
+        });
+        // Selected preparations use assigned reservations; queue permits remain
+        // held until the entire group is durable. Only `head` uses scratch.
+        records.push((sequence, bytes, _permit));
+    }
+    engine::append_batch(
+        store,
+        records.iter().map(|(n, bytes, _)| (*n, bytes.as_slice())),
+    )
+    .map_err(|error| Error::Uncertain {
+        sequence: records.first().map(|(n, _, _)| *n),
+        source: Some(error.into()),
+    })?;
     Ok(())
 }
 
@@ -325,25 +403,35 @@ fn complete(
     store: &mut storage::Store,
     schedule: &mut Schedule,
     pool: &mut workers::Pool,
-    completion: workers::Completion,
+    mut completion: workers::Completion,
 ) -> vm::Result<()> {
-    pool.busy[completion.worker] = false;
-    let outcome = completion.outcome?;
-    if pool.poisoned.load(Ordering::Acquire) {
-        return Err(workers::failure("worker pool requires recovery"));
-    }
-    let entry = schedule
-        .entries
-        .iter_mut()
-        .find(|entry| entry.sequence == completion.sequence)
-        .expect("completion belongs to assigned record");
-    vm::install(store, entry.sequence, entry.digest, 1, &outcome)?;
-    entry.outcome = Some(outcome);
-    entry.writes.clear();
-    for entry in &mut schedule.entries {
-        entry
-            .dependencies
-            .retain(|&sequence| sequence != completion.sequence);
+    let queued = pool.completed.len();
+    for index in 0..=queued {
+        pool.busy[completion.worker] = false;
+        let outcome = completion.outcome?;
+        if pool.poisoned.load(Ordering::Acquire) {
+            return Err(workers::failure("worker pool requires recovery"));
+        }
+        let entry = schedule
+            .entries
+            .iter_mut()
+            .find(|entry| entry.sequence == completion.sequence)
+            .expect("completion belongs to assigned record");
+        vm::install(store, entry.sequence, entry.digest, 1, &outcome)?;
+        entry.outcome = Some(outcome);
+        entry.writes.clear();
+        for entry in &mut schedule.entries {
+            entry
+                .dependencies
+                .retain(|&sequence| sequence != completion.sequence);
+        }
+        if index == queued {
+            break;
+        }
+        let Ok(next) = pool.completed.try_recv() else {
+            break;
+        };
+        completion = next;
     }
     let mut digest = None;
     let previous_frontier = schedule.frontier;
@@ -426,7 +514,7 @@ fn sample(
             .count();
         status.administrative_barrier = head
             .filter(|h| h.prepared.is_none())
-            .and_then(|_| next_sequence(store).ok());
+            .and_then(|_| next_sequence(store.manifest().durable_sequence).ok());
         status.retention = RetentionFloors { history, log };
     });
     Ok(())
@@ -494,6 +582,7 @@ pub(super) fn run(
     status: watch::Sender<EngineStatus>,
     mut pool: workers::Pool,
 ) {
+    storage::enable_runtime_cache(&mut store);
     let mut registry = snapshot::Registry::default();
     let mut schedule = Schedule {
         frontier: store.manifest().checkpoint_sequence,
@@ -502,6 +591,7 @@ pub(super) fn run(
         reserved_bytes: 0,
     };
     let mut head: Option<Head> = None;
+    let mut pending_request = None;
     let mut requests = true;
     let mut controls = true;
     let mut prefer_requests = false;
@@ -572,7 +662,17 @@ pub(super) fn run(
                         <= options.assigned_backlog_bytes - schedule.assigned_bytes
                     && prepared.reservation <= options.execution_bytes - schedule.reserved_bytes
                 {
-                    if let Err(error) = register(&mut store, &mut schedule, head.take().unwrap()) {
+                    if let Err(error) = register(
+                        &mut store,
+                        &mut schedule,
+                        &mut head,
+                        &mut receiver,
+                        &control,
+                        &pool,
+                        &options,
+                        &status,
+                        &mut pending_request,
+                    ) {
                         last_error = Some(error.to_string());
                         failed = true;
                         break;
@@ -609,14 +709,19 @@ pub(super) fn run(
         if progress {
             continue;
         }
-        match wait(
-            &mut pool,
-            &mut receiver,
-            &mut control,
-            requests && head.is_none() && pending_maintenance.is_none(),
-            controls && pending_maintenance.is_none(),
-            prefer_requests,
-        ) {
+        let event = if let Some(request) = pending_request.take() {
+            Event::Request(Some(request))
+        } else {
+            wait(
+                &mut pool,
+                &mut receiver,
+                &mut control,
+                requests && head.is_none() && pending_maintenance.is_none(),
+                controls && pending_maintenance.is_none(),
+                prefer_requests,
+            )
+        };
+        match event {
             Event::Complete(Some(completion)) => {
                 if let Err(error) = complete(&mut store, &mut schedule, &mut pool, completion) {
                     last_error = Some(error.to_string());
@@ -739,7 +844,13 @@ pub(super) fn run(
                     continue;
                 }
                 status.send_modify(|s| s.prepared_head_bytes = options.preparation_bytes);
-                match prepare(&store, &mut command, &options) {
+                match prepare(
+                    &store,
+                    &mut command,
+                    &options,
+                    store.manifest().durable_sequence,
+                    store.manifest().durable_digest,
+                ) {
                     Ok(prepared) => {
                         head = Some(Head {
                             command,
@@ -805,7 +916,7 @@ pub(super) fn run(
             )),
         }));
     }
-    while let Some(request) = receiver.blocking_recv() {
+    while let Some(request) = pending_request.take().or_else(|| receiver.blocking_recv()) {
         match request {
             Request::Execute { reply, .. } => {
                 let _ = reply.send(Err(Error::Closed));
@@ -960,6 +1071,464 @@ mod tests {
         };
         *manifest = Some(AccessManifest::new([(Scope::Table(1), AccessMode::Write)]).unwrap());
         command
+    }
+
+    async fn queued(
+        options: &EngineOptions,
+        commands: Vec<record::Command>,
+    ) -> (
+        budget::Queue,
+        mpsc::Receiver<Request>,
+        Vec<oneshot::Receiver<Result<Receipt>>>,
+    ) {
+        let queue = budget::Queue::new(options);
+        let (sender, receiver) = mpsc::channel(options.submission_queue_count);
+        let mut receipts = Vec::new();
+        for command in commands {
+            let permit = budget::reserve(&queue, &command).await.unwrap();
+            let (reply, receipt) = oneshot::channel();
+            sender
+                .try_send(Request::Execute {
+                    command: Box::new(command),
+                    reply,
+                    permit,
+                })
+                .unwrap();
+            receipts.push(receipt);
+        }
+        (queue, receiver, receipts)
+    }
+
+    fn queued_head(
+        store: &Store,
+        receiver: &mut mpsc::Receiver<Request>,
+        options: &EngineOptions,
+    ) -> Option<Head> {
+        let Request::Execute {
+            mut command,
+            reply,
+            permit,
+        } = receiver.try_recv().unwrap()
+        else {
+            unreachable!()
+        };
+        let prepared = prepare(
+            store,
+            &mut command,
+            options,
+            store.manifest().durable_sequence,
+            store.manifest().durable_digest,
+        )
+        .unwrap();
+        Some(Head {
+            command,
+            prepared,
+            reply,
+            _permit: permit,
+        })
+    }
+
+    #[tokio::test]
+    async fn queued_log_group_is_durable_before_dispatch_and_completions_share_a_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = reference(&directory, "group");
+        let options = EngineOptions {
+            workers: 3,
+            ..Default::default()
+        };
+        let (queue, mut receiver, mut receipts) = queued(
+            &options,
+            vec![
+                transaction(tx! { return 1; }.unwrap()),
+                transaction(tx! { return 2; }.unwrap()),
+                transaction(tx! { return 3; }.unwrap()),
+            ],
+        )
+        .await;
+        let mut head = queued_head(&store, &mut receiver, &options);
+        let (_, control) = mpsc::channel(1);
+        let (status, _) = watch::channel(initial_status(options.clone()));
+        let hooks = Arc::new(workers::test_support::Hooks::default());
+        let mut pool = workers::start(options.workers, hooks.clone()).unwrap();
+        let mut schedule = Schedule {
+            frontier: 0,
+            entries: VecDeque::new(),
+            assigned_bytes: 0,
+            reserved_bytes: 0,
+        };
+        let generation = store.manifest().generation;
+        let mut barrier = None;
+        register(
+            &mut store,
+            &mut schedule,
+            &mut head,
+            &mut receiver,
+            &control,
+            &pool,
+            &options,
+            &status,
+            &mut barrier,
+        )
+        .unwrap();
+        assert!(barrier.is_none());
+        assert!(head.is_none());
+        assert_eq!(store.manifest().generation, generation + 1);
+        assert_eq!(store.manifest().durable_sequence, 3);
+        assert_eq!(store.manifest().checkpoint_sequence, 0);
+        assert_eq!(schedule.entries.len(), 3);
+        assert!(schedule.reserved_bytes <= options.execution_bytes);
+        assert_eq!(queue.count.available_permits(), queue.max_count);
+        assert_eq!(queue.bytes.available_permits(), queue.max_bytes);
+        assert!(hooks.started.lock().unwrap().is_empty());
+        assert!(entries(&store, TreeId::Outcomes).is_empty());
+        assert!(dispatch(&store, &mut schedule, &mut pool, options.execution_window).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while pool.completed.len() != 3 {
+            assert!(Instant::now() < deadline, "workers did not complete");
+            tokio::task::yield_now().await;
+        }
+        for receipt in &mut receipts {
+            assert!(matches!(
+                receipt.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        let first = pool.completed.try_recv().unwrap();
+        complete(&mut store, &mut schedule, &mut pool, first).unwrap();
+        assert_eq!(store.manifest().generation, generation + 2);
+        assert_eq!(store.manifest().checkpoint_sequence, 3);
+        assert_eq!(schedule.frontier, 3);
+        assert!(schedule.entries.is_empty());
+        assert_eq!((schedule.assigned_bytes, schedule.reserved_bytes), (0, 0));
+        for (index, receipt) in receipts.into_iter().enumerate() {
+            let receipt = receipt.await.unwrap().unwrap();
+            assert_eq!(receipt.sequence, index as u64 + 1);
+            assert_eq!(value(receipt), Value::I64(index as i64 + 1));
+        }
+        drop(pool);
+        drop(store);
+        let mut reopened = storage::open(directory.path().join("group")).unwrap();
+        engine::recover(&mut reopened).unwrap();
+        assert_eq!(reopened.manifest().generation, generation + 2);
+    }
+
+    #[tokio::test]
+    async fn queued_groups_keep_rejections_backpressure_and_administrative_barriers_ordered() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = reference(&directory, "group");
+        let options = EngineOptions {
+            workers: 2,
+            assigned_backlog_count: 2,
+            ..Default::default()
+        };
+        let (queue, mut receiver, mut receipts) = queued(
+            &options,
+            vec![
+                transaction(tx! { return 1; }.unwrap()),
+                transaction(tx! { tables { data: u64 => u64 = 1 } data[1] = 1; }.unwrap()),
+                transaction(tx! { return 2; }.unwrap()),
+                transaction(tx! { return 3; }.unwrap()),
+                table(),
+                transaction(tx! { tables { data: u64 => u64 = 4 } data[1] = 42; }.unwrap()),
+            ],
+        )
+        .await;
+        let mut head = queued_head(&store, &mut receiver, &options);
+        let (_, control) = mpsc::channel(1);
+        let (status, _) = watch::channel(initial_status(options.clone()));
+        let mut pool = workers::start(options.workers, Arc::default()).unwrap();
+        let mut schedule = Schedule {
+            frontier: 0,
+            entries: VecDeque::new(),
+            assigned_bytes: 0,
+            reserved_bytes: 0,
+        };
+        let mut barrier = None;
+        register(
+            &mut store,
+            &mut schedule,
+            &mut head,
+            &mut receiver,
+            &control,
+            &pool,
+            &options,
+            &status,
+            &mut barrier,
+        )
+        .unwrap();
+        assert!(barrier.is_none());
+        assert_eq!(store.manifest().durable_sequence, 2);
+        assert_eq!(schedule.entries.len(), 2);
+        assert_eq!(
+            head.as_ref()
+                .unwrap()
+                .prepared
+                .as_ref()
+                .unwrap()
+                .transaction
+                .sequence(),
+            3
+        );
+        assert_eq!(queue.max_count - queue.count.available_permits(), 3);
+        assert!(matches!(
+            receipts.remove(1).await.unwrap(),
+            Err(Error::Rejected(_))
+        ));
+        // A cancelled receiver must not cancel canonical work or free its
+        // sequence.
+        drop(receipts.remove(1));
+        dispatch(&store, &mut schedule, &mut pool, options.execution_window).unwrap();
+        while !schedule.entries.is_empty() {
+            let completion = pool.completed.recv().await.unwrap();
+            complete(&mut store, &mut schedule, &mut pool, completion).unwrap();
+        }
+        register(
+            &mut store,
+            &mut schedule,
+            &mut head,
+            &mut receiver,
+            &control,
+            &pool,
+            &options,
+            &status,
+            &mut barrier,
+        )
+        .unwrap();
+        assert!(matches!(&barrier, Some(Request::Execute { command, .. })
+            if matches!(command.as_ref(), record::Command::Catalogue(_))));
+        assert!(head.is_none());
+        assert_eq!(receiver.len(), 1);
+        assert_eq!(store.manifest().durable_sequence, 3);
+        dispatch(&store, &mut schedule, &mut pool, options.execution_window).unwrap();
+        let completion = pool.completed.recv().await.unwrap();
+        complete(&mut store, &mut schedule, &mut pool, completion).unwrap();
+        let Request::Execute {
+            command,
+            reply,
+            permit,
+        } = barrier.take().unwrap()
+        else {
+            unreachable!()
+        };
+        let receipt = engine::commit(&mut store, &command).unwrap();
+        schedule.frontier = receipt.sequence;
+        assert_eq!(receipt.sequence, 4);
+        reply.send(Ok(receipt)).unwrap();
+        drop(permit);
+        head = queued_head(&store, &mut receiver, &options);
+        register(
+            &mut store,
+            &mut schedule,
+            &mut head,
+            &mut receiver,
+            &control,
+            &pool,
+            &options,
+            &status,
+            &mut barrier,
+        )
+        .unwrap();
+        dispatch(&store, &mut schedule, &mut pool, options.execution_window).unwrap();
+        let completion = pool.completed.recv().await.unwrap();
+        complete(&mut store, &mut schedule, &mut pool, completion).unwrap();
+        for (receipt, sequence) in receipts.into_iter().zip([1, 3, 4, 5]) {
+            assert_eq!(receipt.await.unwrap().unwrap().sequence, sequence);
+        }
+        assert_eq!(
+            rows(&store, 4, 5),
+            vec![(1_u64.to_be_bytes().to_vec(), 42_u64.to_le_bytes().to_vec())]
+        );
+        assert_eq!(queue.count.available_permits(), queue.max_count);
+    }
+
+    #[tokio::test]
+    async fn queued_control_and_close_stop_log_group_selection() {
+        for close in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = reference(&directory, "group");
+            let options = EngineOptions::default();
+            let (queue, mut receiver, _receipts) = queued(
+                &options,
+                vec![
+                    transaction(tx! { return 1; }.unwrap()),
+                    transaction(tx! { return 2; }.unwrap()),
+                ],
+            )
+            .await;
+            let mut head = queued_head(&store, &mut receiver, &options);
+            let (sender, control) = mpsc::channel(1);
+            let (reply, _snapshot) = oneshot::channel();
+            sender.try_send(Control::Snapshot { reply }).unwrap();
+            if close {
+                let (sender, replacement) = mpsc::channel(1);
+                sender.try_send(Request::Close).unwrap();
+                receiver = replacement;
+            }
+            let (status, _) = watch::channel(initial_status(options.clone()));
+            let pool = workers::start(options.workers, Arc::default()).unwrap();
+            let mut schedule = Schedule {
+                frontier: 0,
+                entries: VecDeque::new(),
+                assigned_bytes: 0,
+                reserved_bytes: 0,
+            };
+            let mut control = control;
+            if close {
+                control.try_recv().unwrap();
+            }
+            let mut barrier = None;
+            register(
+                &mut store,
+                &mut schedule,
+                &mut head,
+                &mut receiver,
+                &control,
+                &pool,
+                &options,
+                &status,
+                &mut barrier,
+            )
+            .unwrap();
+            assert_eq!(store.manifest().durable_sequence, 1);
+            assert_eq!(schedule.entries.len(), 1);
+            if close {
+                assert!(matches!(barrier, Some(Request::Close)));
+            } else {
+                assert!(barrier.is_none());
+                assert_eq!(receiver.len(), 1);
+                assert_eq!(control.len(), 1);
+                assert_eq!(queue.max_count - queue.count.available_permits(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn log_groups_bound_work_even_with_larger_admission_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = reference(&directory, "group");
+        let options = EngineOptions {
+            submission_queue_count: 128,
+            assigned_backlog_count: 128,
+            execution_bytes: u64::MAX,
+            ..Default::default()
+        };
+        let (queue, mut receiver, _receipts) =
+            queued(&options, vec![transaction(tx! { return 1; }.unwrap()); 70]).await;
+        let mut head = queued_head(&store, &mut receiver, &options);
+        let (_, control) = mpsc::channel(1);
+        let (status, _) = watch::channel(initial_status(options.clone()));
+        let pool = workers::start(options.workers, Arc::default()).unwrap();
+        let mut schedule = Schedule {
+            frontier: 0,
+            entries: VecDeque::new(),
+            assigned_bytes: 0,
+            reserved_bytes: 0,
+        };
+        register(
+            &mut store,
+            &mut schedule,
+            &mut head,
+            &mut receiver,
+            &control,
+            &pool,
+            &options,
+            &status,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(store.manifest().durable_sequence, 64);
+        assert_eq!(store.manifest().generation, 2);
+        assert_eq!(schedule.entries.len(), 64);
+        assert!(head.is_none());
+        assert_eq!(receiver.len(), 6);
+        assert_eq!(queue.max_count - queue.count.available_permits(), 6);
+    }
+
+    #[tokio::test]
+    async fn grouped_publication_failure_never_dispatches_and_worker_failure_replays_whole_group() {
+        for publication_failure in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = reference(&directory, "group");
+            let options = EngineOptions {
+                workers: 1,
+                ..Default::default()
+            };
+            let (queue, receiver, mut receipts) = queued(
+                &options,
+                vec![
+                    transaction(tx! { return 1; }.unwrap()),
+                    transaction(tx! { return 2; }.unwrap()),
+                    transaction(tx! { return 3; }.unwrap()),
+                    table(),
+                ],
+            )
+            .await;
+            let path = store.directory().to_owned();
+            if publication_failure {
+                std::fs::create_dir(path.join("manifest.pending")).unwrap();
+            }
+            let (_, control) = mpsc::channel(1);
+            let (status, observed) = watch::channel(initial_status(options.clone()));
+            let hooks = Arc::new(workers::test_support::Hooks::default());
+            hooks.actions.lock().unwrap().insert(1, Action::Error);
+            let pool = workers::start(options.workers, hooks.clone()).unwrap();
+            let writer_queue = queue.clone();
+            thread::spawn(move || {
+                run(
+                    store,
+                    receiver,
+                    control,
+                    writer_queue,
+                    options,
+                    status,
+                    pool,
+                )
+            })
+            .join()
+            .unwrap();
+            assert!(observed.borrow().poisoned);
+            assert_eq!(observed.borrow().checkpoint, 0);
+            assert_eq!(
+                observed.borrow().durable_frontier,
+                if publication_failure { 0 } else { 3 }
+            );
+            assert_eq!(
+                *hooks.started.lock().unwrap(),
+                if publication_failure { vec![] } else { vec![1] }
+            );
+            assert!(matches!(
+                receipts.pop().unwrap().await.unwrap(),
+                Err(Error::Closed)
+            ));
+            for (index, receipt) in receipts.into_iter().enumerate() {
+                assert!(
+                    matches!(receipt.await.unwrap(), Err(Error::Uncertain { sequence: Some(n), .. }) if n == index as u64 + 1)
+                );
+            }
+            assert_eq!(queue.count.available_permits(), queue.max_count);
+            if publication_failure {
+                std::fs::remove_dir(path.join("manifest.pending")).unwrap();
+            }
+            let mut reopened = storage::open(path).unwrap();
+            assert_eq!(reopened.manifest().checkpoint_sequence, 0);
+            assert_eq!(
+                reopened.manifest().generation,
+                if publication_failure { 1 } else { 2 }
+            );
+            engine::recover(&mut reopened).unwrap();
+            let expected = if publication_failure { 0 } else { 3 };
+            assert_eq!(reopened.manifest().checkpoint_sequence, expected);
+            assert_eq!(
+                entries(&reopened, TreeId::Outcomes).len(),
+                expected as usize
+            );
+            assert_eq!(
+                engine::commit(&mut reopened, &transaction(tx! { return 4; }.unwrap()))
+                    .unwrap()
+                    .sequence,
+                expected + 1
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1137,10 +1706,16 @@ mod tests {
             ..Default::default()
         };
         let command = transaction(tx! { return 42_u64; }.unwrap());
-        let required = prepare(&store, &mut command.clone(), &options)
-            .unwrap()
-            .unwrap()
-            .reservation;
+        let required = prepare(
+            &store,
+            &mut command.clone(),
+            &options,
+            store.manifest().durable_sequence,
+            store.manifest().durable_digest,
+        )
+        .unwrap()
+        .unwrap()
+        .reservation;
         options.execution_bytes = required * 2;
         options.submission_queue_bytes = budget::input_bytes(&command).unwrap() as usize * 2;
         let (_directory, database) = fixture(options).await;
@@ -1996,9 +2571,15 @@ mod tests {
             transaction(tx! { tables { data: u64 => u64 = 1 } data[2] = 20; }.unwrap()),
         ];
         for (index, command) in commands.into_iter().enumerate() {
-            let prepared = prepare(&store, &mut command.clone(), &EngineOptions::default())
-                .unwrap()
-                .unwrap();
+            let prepared = prepare(
+                &store,
+                &mut command.clone(),
+                &EngineOptions::default(),
+                store.manifest().durable_sequence,
+                store.manifest().durable_digest,
+            )
+            .unwrap()
+            .unwrap();
             let sequence = index as u64 + 2;
             let digest = engine::append(&mut store, sequence, &prepared.bytes).unwrap();
             if sequence != 3 {
@@ -2114,11 +2695,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = reference(&directory, "sizes");
         let command = transaction(tx! { return 42_u64; }.unwrap());
-        let length = prepare(&store, &mut command.clone(), &EngineOptions::default())
-            .unwrap()
-            .unwrap()
-            .bytes
-            .len() as u64;
+        let length = prepare(
+            &store,
+            &mut command.clone(),
+            &EngineOptions::default(),
+            store.manifest().durable_sequence,
+            store.manifest().durable_digest,
+        )
+        .unwrap()
+        .unwrap()
+        .bytes
+        .len() as u64;
         for options in [
             EngineOptions {
                 assigned_backlog_count: 1,

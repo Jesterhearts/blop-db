@@ -27,6 +27,8 @@ use crate::vm::{
 pub(crate) struct Claim {
     sequence: u64,
     view: RwLock<Option<View>>,
+    // One validated historical table only; schema sizes are format-bounded.
+    table: RwLock<Option<Arc<Table>>>,
 }
 
 /// Clones share one revocable claim at the original sequence. Reads perform
@@ -91,6 +93,7 @@ pub(crate) fn capture(
     let claim = Arc::new(Claim {
         sequence,
         view: RwLock::new(Some(storage::view(store))),
+        table: RwLock::new(None),
     });
     registry.claims.push(Arc::downgrade(&claim));
     Snapshot {
@@ -120,11 +123,7 @@ pub(crate) fn snapshot_floor(
 
 pub(crate) fn revoke_all(registry: &mut Registry) {
     for claim in registry.claims.drain(..).filter_map(|weak| weak.upgrade()) {
-        claim
-            .view
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        revoke_claim(&claim);
     }
 }
 
@@ -143,27 +142,46 @@ pub async fn snapshot(database: &Database) -> Result<Snapshot> {
 /// not for idle handles. Returns true only when this call released the view.
 /// Durable tail cursors are independent and remain registered.
 pub fn revoke(snapshot: &Snapshot) -> bool {
-    snapshot
-        .claim
+    revoke_claim(&snapshot.claim)
+}
+
+fn revoke_claim(claim: &Claim) -> bool {
+    let mut view = claim
         .view
         .write()
+        .unwrap_or_else(|error| error.into_inner());
+    let revoked = view.take().is_some();
+    claim
+        .table
+        .write()
         .unwrap_or_else(|error| error.into_inner())
-        .take()
-        .is_some()
+        .take();
+    revoked
 }
 
 fn live_table(
     view: &View,
     id: u64,
     sequence: u64,
-) -> Result<Table> {
-    vm::catalogue_version(view, id, sequence)
+    cached: &RwLock<Option<Arc<Table>>>,
+) -> Result<Arc<Table>> {
+    if let Some(table) = cached
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        && table.id == id
+    {
+        return Ok(table.clone());
+    }
+    let table = vm::catalogue_version(view, id, sequence)
         .map_err(Error::Read)?
         .filter(|version| version.live)
-        .map(|version| version.table)
+        .map(|version| Arc::new(version.table))
         .ok_or(Error::InvalidInput(
             "table is unknown or dropped at snapshot sequence",
-        ))
+        ))?;
+    *cached.write().unwrap_or_else(|error| error.into_inner()) = Some(table.clone());
+    Ok(table)
 }
 
 fn key_bytes(
@@ -194,7 +212,7 @@ pub fn get(
         .read()
         .unwrap_or_else(|error| error.into_inner());
     let view = guard.as_ref().ok_or(Error::SnapshotRevoked)?;
-    let table = live_table(view, table, snapshot.sequence())?;
+    let table = live_table(view, table, snapshot.sequence(), &snapshot.claim.table)?;
     let key = key_bytes(&table, key)?;
     mvcc::get(view, table.id, &key, snapshot.sequence())
         .map_err(Error::Storage)?
@@ -232,7 +250,7 @@ pub fn catalogue(snapshot: &Snapshot) -> Result<Vec<CatalogueVersion>> {
 /// `Some(Err(SnapshotRevoked))` if revoked. It is deliberately not fused.
 pub struct SnapshotScan {
     snapshot: Snapshot,
-    table: Table,
+    table: Arc<Table>,
     lower: Bound<Vec<u8>>,
     upper: Bound<Vec<u8>>,
     done: bool,
@@ -253,7 +271,7 @@ pub fn scan(
         .read()
         .unwrap_or_else(|error| error.into_inner());
     let view = guard.as_ref().ok_or(Error::SnapshotRevoked)?;
-    let table = live_table(view, table, snapshot.sequence())?;
+    let table = live_table(view, table, snapshot.sequence(), &snapshot.claim.table)?;
     let bound = |bound| match bound {
         Bound::Unbounded => Ok(Bound::Unbounded),
         Bound::Included(key) => key_bytes(&table, key).map(Bound::Included),
@@ -347,6 +365,120 @@ mod tests {
     use crate::vm::Type;
 
     #[tokio::test]
+    async fn cached_tables_are_snapshot_local_bounded_and_cleared_on_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        let database = db::create(&path, db::CreateOptions::default())
+            .await
+            .unwrap();
+        let empty = snapshot(&database).await.unwrap();
+        db::execute_catalogue(
+            &database,
+            CatalogueOperation::Create {
+                name: "items".into(),
+                key: Type::U64,
+                value: Type::I64,
+            },
+        )
+        .await
+        .unwrap();
+        db::execute(
+            &database,
+            tx! { tables { items: u64 => i64 = 1 } items[7] = 10; }.unwrap(),
+            db::Limits::default(),
+        )
+        .await
+        .unwrap();
+        db::execute_catalogue(
+            &database,
+            CatalogueOperation::Create {
+                name: "other".into(),
+                key: Type::U64,
+                value: Type::I64,
+            },
+        )
+        .await
+        .unwrap();
+        let captured = snapshot(&database).await.unwrap();
+        let other = catalogue(&captured)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "other")
+            .unwrap()
+            .table
+            .id;
+        assert!(matches!(
+            get(&empty, 1, &Value::U64(7)),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(empty.claim.table.read().unwrap().is_none());
+        assert_eq!(
+            get(&captured, 1, &Value::U64(7)).unwrap(),
+            Some(Value::I64(10))
+        );
+        let warm = captured.claim.table.read().unwrap().clone().unwrap();
+        assert_eq!(
+            get(&captured.clone(), 1, &Value::U64(7)).unwrap(),
+            Some(Value::I64(10))
+        );
+        assert!(Arc::ptr_eq(
+            &warm,
+            captured.claim.table.read().unwrap().as_ref().unwrap()
+        ));
+        assert!(get(&captured, 0, &Value::U64(7)).is_err());
+        assert!(matches!(
+            get(&captured, 1, &Value::I64(7)),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(Arc::ptr_eq(
+            &warm,
+            captured.claim.table.read().unwrap().as_ref().unwrap()
+        ));
+
+        let mut rows = scan(&captured, 1, Bound::Unbounded, Bound::Unbounded).unwrap();
+        assert!(Arc::ptr_eq(&warm, &rows.table));
+        assert_eq!(
+            rows.next().unwrap().unwrap(),
+            (Value::U64(7), Value::I64(10))
+        );
+        assert_eq!(get(&captured, other, &Value::U64(7)).unwrap(), None);
+        assert_eq!(
+            captured.claim.table.read().unwrap().as_ref().unwrap().id,
+            other
+        );
+        db::execute_catalogue(&database, CatalogueOperation::Drop { table: 1 })
+            .await
+            .unwrap();
+        let dropped = snapshot(&database).await.unwrap();
+        assert!(matches!(
+            get(&dropped, 1, &Value::U64(7)),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(dropped.claim.table.read().unwrap().is_none());
+        assert_eq!(
+            get(&captured, 1, &Value::U64(7)).unwrap(),
+            Some(Value::I64(10))
+        );
+        db::close(&database).await.unwrap();
+        for snapshot in [&empty, &captured, &dropped] {
+            assert!(snapshot.claim.table.read().unwrap().is_none());
+            assert!(matches!(
+                get(snapshot, 1, &Value::U64(7)),
+                Err(Error::SnapshotRevoked)
+            ));
+        }
+        assert!(matches!(rows.next(), Some(Err(Error::SnapshotRevoked))));
+        let reopened = db::open(&path).await.unwrap();
+        let current = snapshot(&reopened).await.unwrap();
+        assert!(matches!(
+            get(&current, 1, &Value::U64(7)),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(get(&current, other, &Value::U64(7)).unwrap(), None);
+        db::close(&reopened).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn revocation_waits_for_in_flight_original_view_but_not_idle_clones() {
         let directory = tempfile::tempdir().unwrap();
         let database = db::create(directory.path().join("db"), db::CreateOptions::default())
@@ -370,6 +502,10 @@ mod tests {
         .await
         .unwrap();
         let snapshot = snapshot(&database).await.unwrap();
+        assert_eq!(
+            get(&snapshot, 1, &Value::U64(7)).unwrap(),
+            Some(Value::I64(10))
+        );
         db::execute(
             &database,
             tx! { tables { items: u64 => i64 = 1 } items[7] = 20; }.unwrap(),
@@ -409,6 +545,7 @@ mod tests {
             get(&snapshot, 1, &Value::U64(7)),
             Err(Error::SnapshotRevoked)
         ));
+        assert!(snapshot.claim.table.read().unwrap().is_none());
         db::close(&database).await.unwrap();
         let reopened = db::open(directory.path().join("db")).await.unwrap();
         db::close(&reopened).await.unwrap();

@@ -6,6 +6,7 @@
 //! store and engine.
 
 use std::fs::File;
+use std::io::BufReader;
 use std::io::Read;
 use std::io::{
     self,
@@ -23,7 +24,7 @@ const GENESIS_LENGTH: usize = 180;
 const MANIFEST_BASE_LENGTH: usize = 272;
 const MAX_MANIFEST_LENGTH: usize = 16 * 1024 * 1024;
 const DESCRIPTOR_LENGTH: usize = 96;
-const SEGMENT_HEADER_LENGTH: u64 = 96;
+pub(super) const SEGMENT_HEADER_LENGTH: u64 = 96;
 const MAX_RECORD_LENGTH: u64 = 64 * 1024 * 1024;
 const LIMIT_CEILINGS: [u64; 17] = [
     16 * 1024 * 1024,
@@ -314,7 +315,7 @@ impl Manifest {
     }
 }
 
-fn validate_manifest(manifest: &Manifest) -> std::result::Result<(), &'static str> {
+pub(super) fn validate_manifest(manifest: &Manifest) -> std::result::Result<(), &'static str> {
     if manifest.segments.len() > (MAX_MANIFEST_LENGTH - MANIFEST_BASE_LENGTH) / DESCRIPTOR_LENGTH {
         return Err("manifest exceeds the hard size ceiling");
     }
@@ -559,7 +560,7 @@ pub fn validate_logs(
         })?;
         // A bounded reader must not even prefetch bytes from an uncommitted
         // tail.
-        let mut reader = file.take(segment.committed_bytes);
+        let mut reader = BufReader::new(file.take(segment.committed_bytes));
         let mut header = [0; SEGMENT_HEADER_LENGTH as usize];
         read_committed(&mut reader, &mut header)?;
         validate_segment_header(&header, &manifest.database_id, segment)?;
@@ -583,7 +584,7 @@ pub fn validate_logs(
     Ok(())
 }
 
-fn read_committed(
+pub(super) fn read_committed(
     reader: &mut impl Read,
     bytes: &mut [u8],
 ) -> Result<()> {
@@ -596,7 +597,7 @@ fn read_committed(
     })
 }
 
-fn validate_segment_header(
+pub(super) fn validate_segment_header(
     header: &[u8; 96],
     database_id: &[u8; 16],
     segment: &SegmentDescriptor,
@@ -622,7 +623,7 @@ fn validate_segment_header(
     Ok(())
 }
 
-fn validate_record(
+pub(super) fn validate_record(
     reader: &mut impl Read,
     remaining: u64,
     sequence: u64,

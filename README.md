@@ -151,12 +151,37 @@ Workers never publish stale roots or consume another transaction's tentative ove
 `F` is live visibility, `D` is the CURRENT-selected manifest's durable frontier, and `C` is the
 checkpoint. They are tracked separately. Each contiguous frontier advance publishes a checkpoint
 filtered at F before releasing receipts; one publication can cover several previously completed
-records. When F equals D, the live roots already satisfy that boundary, so checkpointing skips the
-pruning scan. Appends still publish individually. There is no log group commit or asynchronous
-checkpoint writer. See [BENCHMARKS.md](BENCHMARKS.md) for measured independent-client workloads. A
+records. When F equals D, the live roots already satisfy that boundary. Otherwise, a bounded index
+of above-checkpoint edits avoids rescanning retained history when possible. The coordinator groups
+up to 64 already queued local transactions within existing count and byte budgets, without waiting
+to fill a group. All group records are published durably before any dispatch. Administrative
+requests, queued controls and reported worker completions stop group collection. Already queued
+worker completions can share one prefix checkpoint. There is no asynchronous checkpoint writer or
+semantic merging of transactions. See [BENCHMARKS.md](BENCHMARKS.md) for measured workloads. A
 failed checkpoint publication can leave F above C: the prefix through F is durable and resolved, but
 receipts remain uncertain and the writer requires reopening. Diagnostics retain that F rather than
 lowering it.
+
+After full startup recovery, the live owner enables a 64 MiB decoded-node cache per page-file
+descriptor. Cached nodes are immutable and shared across worker and snapshot views; hits still check
+the requesting view's pinned prefix. Cache retention is bounded, but active readers and older file
+descriptors pinned across compaction can retain additional memory. Overflow values are not cached.
+Each snapshot claim also caches its last successfully resolved historical table, releasing it on
+revocation. Low-level reference stores remain uncached.
+
+Live publications reuse proofs for already validated immutable roots and log prefixes. New physical
+edits validate system key/value framing before inheriting root proofs; invalid edits force full
+publication validation. Log suffixes still undergo complete envelope, CRC, hash-chain and anchor
+checks. Pending log digests are capped at 4096 records, and the above-checkpoint edit index at 1 MiB
+of accounted entries; unsupported transitions or exhausted caches fall back to full validation or
+filtering. These caches are separate from transaction admission reservations. They do not persist
+across reopen or replace recovery checks. Full checkpoint validation bypasses the page cache, and
+file handover resets the runtime proofs. Modifying an owner's immutable files externally is not a
+supported live operation; caching does not continuously scrub for later external corruption.
+
+Publication flushes changed page/log files and directories for new filenames. Already published,
+unchanged prefixes need no repeated flush. New manifests and CURRENT still follow the complete G.3
+file-flush, rename and directory-flush ordering before durability is reported.
 
 Catalogue and policy requests stop later sequencing, drain the preceding prefix, then execute their
 durable barrier. Submissions queued behind a barrier are prepared against the resulting metadata.

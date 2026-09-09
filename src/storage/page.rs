@@ -1,9 +1,13 @@
 //! Version 1 page encoding and positional, append-only file access.
 
+mod cache;
+
 use std::collections::HashSet;
 use std::fs::File;
 use std::io;
 use std::sync::Arc;
+
+use cache::PageCache;
 
 use super::Error;
 use super::Result;
@@ -34,6 +38,7 @@ pub(super) struct PageFile {
 pub(super) struct PageReader {
     file: Arc<File>,
     page_count: u64,
+    cache: Option<Arc<PageCache>>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,7 +53,7 @@ pub(super) struct LeafCell {
     pub value: Value,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum Node {
     Leaf(Vec<LeafCell>),
     Internal {
@@ -88,6 +93,7 @@ impl PageFile {
             reader: PageReader {
                 file: Arc::new(file),
                 page_count: 1,
+                cache: None,
             },
             next_page: 1,
             poisoned: false,
@@ -112,6 +118,7 @@ impl PageFile {
         let reader = PageReader {
             file: Arc::new(file),
             page_count,
+            cache: None,
         };
         let bytes = reader.read(0, None)?;
         if bytes[72..88] != database_id || u64_at(bytes.as_slice(), 88) != file_id {
@@ -126,6 +133,15 @@ impl PageFile {
 
     pub(super) fn reader(&self) -> PageReader {
         self.reader.clone()
+    }
+
+    /// Enables bounded decoded-node reuse for subsequently captured readers.
+    /// Call only after recovery; explicit disk verification must use
+    /// `uncached`.
+    pub(super) fn enable_cache(&mut self) {
+        self.reader
+            .cache
+            .get_or_insert_with(|| Arc::new(PageCache::new()));
     }
 
     pub(super) fn page_count(&self) -> u64 {
@@ -219,6 +235,15 @@ impl PageFile {
 }
 
 impl PageReader {
+    /// Keeps the descriptor and pinned prefix, but bypasses cached contents.
+    pub(super) fn uncached(&self) -> Self {
+        Self {
+            file: self.file.clone(),
+            page_count: self.page_count,
+            cache: None,
+        }
+    }
+
     pub(super) fn same_file(
         &self,
         other: &Self,
@@ -231,8 +256,32 @@ impl PageReader {
         tree: TreeId,
         id: u64,
     ) -> Result<Node> {
+        if self.cache.is_some() {
+            return self.shared_node(tree, id).map(|node| (*node).clone());
+        }
         let bytes = self.read(id, Some(tree))?;
         decode_node(&bytes, self.page_count)
+    }
+
+    pub(super) fn shared_node(
+        &self,
+        tree: TreeId,
+        id: u64,
+    ) -> Result<Arc<Node>> {
+        if !valid_ref(id, self.page_count) {
+            return Err(Error::Corrupt("page reference outside tree prefix"));
+        }
+        if let Some(cache) = &self.cache
+            && let Some(node) = cache.get(tree, id, self.page_count)?
+        {
+            return Ok(node);
+        }
+        let bytes = self.read(id, Some(tree))?;
+        let node = Arc::new(decode_node(&bytes, self.page_count)?);
+        if let Some(cache) = &self.cache {
+            cache.insert(tree, id, node.clone());
+        }
+        Ok(node)
     }
 
     pub(super) fn value(
@@ -668,6 +717,183 @@ mod tests {
     ) {
         checksum(bytes);
         write_all_at(&file.reader.file, bytes, id * PAGE_SIZE as u64).unwrap();
+    }
+
+    #[test]
+    fn cache_is_opt_in_shared_and_bypassed_by_explicit_disk_reads() {
+        let mut file = create();
+        let id = file.append_node(TreeId::State, &leaf()).unwrap();
+        let original = raw(&file, id);
+        let before = file.reader();
+        assert!(before.cache.is_none());
+        file.enable_cache();
+        let reader = file.reader();
+        file.enable_cache();
+        assert!(Arc::ptr_eq(
+            reader.cache.as_ref().unwrap(),
+            file.reader.cache.as_ref().unwrap()
+        ));
+        let node = reader.shared_node(TreeId::State, id).unwrap();
+        let clone = reader.clone();
+        assert!(Arc::ptr_eq(
+            &node,
+            &clone.shared_node(TreeId::State, id).unwrap()
+        ));
+        let Node::Leaf(mut owned) = reader.node(TreeId::State, id).unwrap() else {
+            panic!()
+        };
+        owned[0].key.clear();
+        assert!(matches!(node.as_ref(), Node::Leaf(cells) if cells[0].key == b"a"));
+        let uncached = reader.uncached();
+        assert!(reader.same_file(&uncached));
+        assert_eq!(reader.page_count, uncached.page_count);
+        assert!(uncached.cache.is_none());
+
+        write_all_at(&file.reader.file, &[0], id * PAGE_SIZE as u64).unwrap();
+        assert!(Arc::ptr_eq(
+            &node,
+            &reader.shared_node(TreeId::State, id).unwrap()
+        ));
+        assert!(matches!(
+            uncached.node(TreeId::State, id),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            before.node(TreeId::State, id),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            reader.shared_node(TreeId::Policy, id),
+            Err(Error::Corrupt(_))
+        ));
+        write_all_at(
+            &file.reader.file,
+            original.as_slice(),
+            id * PAGE_SIZE as u64,
+        )
+        .unwrap();
+        uncached.node(TreeId::State, id).unwrap();
+    }
+
+    #[test]
+    fn cached_nodes_recheck_pinned_prefix_and_every_child_reference() {
+        for future_child in 0..2 {
+            let mut file = create();
+            file.enable_cache();
+            let first = file.append_node(TreeId::State, &leaf()).unwrap();
+            let future = file.page_count() + 1;
+            let mut children = vec![first, first];
+            children[future_child] = future;
+            let root = file
+                .append_node(
+                    TreeId::State,
+                    &Node::Internal {
+                        level: 1,
+                        keys: vec![b"c".to_vec()],
+                        children,
+                    },
+                )
+                .unwrap();
+            let pinned = file.reader();
+            assert_eq!(file.append_node(TreeId::State, &leaf()).unwrap(), future);
+            let newer = file.reader();
+            newer.shared_node(TreeId::State, root).unwrap();
+            newer.shared_node(TreeId::State, future).unwrap();
+            assert!(matches!(
+                pinned.shared_node(TreeId::State, root),
+                Err(Error::Corrupt(_))
+            ));
+            assert!(matches!(
+                pinned.shared_node(TreeId::State, future),
+                Err(Error::Corrupt(_))
+            ));
+            pinned.shared_node(TreeId::State, first).unwrap();
+        }
+
+        let mut file = create();
+        file.enable_cache();
+        let root = file
+            .append_node(
+                TreeId::State,
+                &Node::Leaf(vec![LeafCell {
+                    key: b"a".to_vec(),
+                    value: Value::Overflow {
+                        len: INLINE_LIMIT + 1,
+                        head: 2,
+                    },
+                }]),
+            )
+            .unwrap();
+        let pinned = file.reader();
+        let value = file
+            .store_value(TreeId::State, &vec![5; INLINE_LIMIT + 1])
+            .unwrap();
+        let newer = file.reader();
+        newer.shared_node(TreeId::State, root).unwrap();
+        assert_eq!(
+            newer.value(TreeId::State, &value).unwrap(),
+            vec![5; INLINE_LIMIT + 1]
+        );
+        assert!(matches!(
+            pinned.shared_node(TreeId::State, root),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            pinned.value(TreeId::State, &value),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn failed_decodes_are_not_cached_and_reopen_has_an_independent_cache() {
+        let mut file = create();
+        file.enable_cache();
+        let id = file.append_node(TreeId::State, &leaf()).unwrap();
+        let mut bytes = raw(&file, id);
+        let original = bytes.clone();
+        bytes[66..68].fill(0);
+        overwrite(&file, id, &mut bytes);
+        let reader = file.reader();
+        assert!(matches!(
+            reader.shared_node(TreeId::State, id),
+            Err(Error::Corrupt(_))
+        ));
+        write_all_at(
+            &file.reader.file,
+            original.as_slice(),
+            id * PAGE_SIZE as u64,
+        )
+        .unwrap();
+        let node = reader.shared_node(TreeId::State, id).unwrap();
+        let mut reopened = PageFile::open(
+            file.reader.file.try_clone().unwrap(),
+            [7; 16],
+            19,
+            file.page_count(),
+        )
+        .unwrap();
+        assert!(reopened.reader.cache.is_none());
+        reopened.enable_cache();
+        let second = reopened.reader().shared_node(TreeId::State, id).unwrap();
+        assert!(!Arc::ptr_eq(&node, &second));
+        assert!(!reader.same_file(&reopened.reader()));
+
+        let mut other = create();
+        other.enable_cache();
+        let other_id = other
+            .append_node(
+                TreeId::State,
+                &Node::Leaf(vec![LeafCell {
+                    key: b"other".to_vec(),
+                    value: Value::Inline(vec![]),
+                }]),
+            )
+            .unwrap();
+        assert_eq!(id, other_id);
+        assert!(
+            matches!(other.reader().shared_node(TreeId::State, id).unwrap().as_ref(), Node::Leaf(cells) if cells[0].key == b"other")
+        );
+        assert!(matches!(node.as_ref(), Node::Leaf(cells) if cells[0].key == b"a"));
     }
 
     #[test]

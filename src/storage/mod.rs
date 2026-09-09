@@ -14,7 +14,9 @@
 //! dropped. No VM, sequencer, logical log writer or changefeed is included.
 
 pub(crate) mod backup;
+mod checkpoint;
 pub mod encoding;
+mod log_validation;
 pub(crate) mod maintenance;
 mod metadata;
 pub mod mvcc;
@@ -38,6 +40,7 @@ pub use store::View;
 pub use store::apply;
 pub use store::checkpoint_view;
 pub use store::create;
+pub(crate) use store::enable_runtime_cache;
 pub use store::get;
 pub use store::open;
 pub use store::prepare_checkpoint;

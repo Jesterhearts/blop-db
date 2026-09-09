@@ -108,16 +108,23 @@ pub(super) fn append(
     sequence: u64,
     bytes: &[u8],
 ) -> storage::Result<[u8; 32]> {
+    append_batch(store, [(sequence, bytes)])
+}
+
+/// Publish a caller-bounded group without selecting intermediate frontiers.
+pub(super) fn append_batch<'a>(
+    store: &mut storage::Store,
+    records: impl IntoIterator<Item = (u64, &'a [u8])>,
+) -> storage::Result<[u8; 32]> {
+    let mut records = records.into_iter().peekable();
+    let &(first, _) = records
+        .peek()
+        .ok_or(storage::Error::InvalidInput("empty log group"))?;
     let mut manifest = store.manifest().clone();
-    let digest = Sha256::digest(bytes).into();
-    if !store.rotate_next
-        && let Some(segment) = manifest.segments.last_mut()
+    let mut file = if !store.rotate_next
+        && let Some(segment) = manifest.segments.last()
     {
-        let committed_bytes = segment
-            .committed_bytes
-            .checked_add(bytes.len() as u64)
-            .ok_or(storage::Error::Exhausted)?;
-        let mut file = OpenOptions::new().append(true).open(
+        let file = OpenOptions::new().append(true).open(
             store
                 .directory()
                 .join(format!("log-{:020}.bin", segment.segment_id)),
@@ -129,28 +136,40 @@ pub(super) fn append(
             std::cmp::Ordering::Greater => return Err(storage::Error::NeedsRecovery),
             std::cmp::Ordering::Equal => {}
         }
-        file.write_all(bytes)?;
-        segment.last_sequence = sequence;
-        segment.last_digest = digest;
-        segment.committed_bytes = committed_bytes;
+        file
     } else {
         let (mut file, segment_id) =
             storage::maintenance::allocate(store, "log", manifest.next_segment_id)?;
         manifest.next_segment_id = segment_id + 1;
         let segment = storage::SegmentDescriptor {
             segment_id,
-            first_sequence: sequence,
-            last_sequence: sequence,
-            committed_bytes: (SEGMENT_HEADER_LENGTH + bytes.len()) as u64,
+            first_sequence: first,
+            last_sequence: first,
+            committed_bytes: SEGMENT_HEADER_LENGTH as u64,
             predecessor_digest: manifest.durable_digest,
-            last_digest: digest,
+            last_digest: manifest.durable_digest,
         };
         file.write_all(&segment_header(manifest.database_id, &segment))?;
-        file.write_all(bytes)?;
         manifest.segments.push(segment);
+        file
+    };
+    for (sequence, bytes) in records {
+        if sequence == u64::MAX || manifest.durable_sequence.checked_add(1) != Some(sequence) {
+            return Err(storage::Error::InvalidInput("noncontiguous log group"));
+        }
+        let digest = Sha256::digest(bytes).into();
+        let segment = manifest.segments.last_mut().unwrap();
+        segment.committed_bytes = segment
+            .committed_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or(storage::Error::Exhausted)?;
+        file.write_all(bytes)?;
+        segment.last_sequence = sequence;
+        segment.last_digest = digest;
+        manifest.durable_sequence = sequence;
+        manifest.durable_digest = digest;
     }
-    manifest.durable_sequence = sequence;
-    manifest.durable_digest = digest;
+    let digest = manifest.durable_digest;
     let checkpoint = storage::checkpoint_view(store);
     // Publication flushes log files and directory entries before selecting D.
     storage::publish(store, &checkpoint, manifest)?;
@@ -477,6 +496,106 @@ mod tests {
         let (kind, body) = record::encode(command).unwrap();
         let bytes = envelope(sequence, store.manifest().durable_digest, kind, &body).unwrap();
         append(store, sequence, &bytes).unwrap()
+    }
+
+    #[test]
+    fn log_groups_extend_or_rotate_once_and_replay_the_same_canonical_chain() {
+        for rotate in [false, true] {
+            let (_directory, mut store) = create();
+            commit(&mut store, &transaction(tx! { return 1; }.unwrap())).unwrap();
+            let before = store.manifest().clone();
+            let first = store.directory().join("log-00000000000000000001.bin");
+            let prefix = fs::read(&first).unwrap();
+            store.rotate_next = rotate;
+            let mut predecessor = before.durable_digest;
+            let mut records = Vec::new();
+            for (sequence, command) in [
+                (2, transaction(tx! { return 2; }.unwrap())),
+                (3, transaction(tx! { abort(3); }.unwrap())),
+            ] {
+                let (kind, body) = record::encode(&command).unwrap();
+                let bytes = envelope(sequence, predecessor, kind, &body).unwrap();
+                predecessor = Sha256::digest(&bytes).into();
+                records.push((sequence, bytes));
+            }
+            let digest = append_batch(
+                &mut store,
+                records.iter().map(|(n, bytes)| (*n, bytes.as_slice())),
+            )
+            .unwrap();
+            assert_eq!(digest, predecessor);
+            assert_eq!(store.manifest().generation, before.generation + 1);
+            assert_eq!(store.manifest().checkpoint_sequence, 1);
+            assert_eq!(store.manifest().durable_sequence, 3);
+            assert_eq!(store.manifest().segments.len(), if rotate { 2 } else { 1 });
+            assert!(!store.rotate_next);
+            assert_eq!(entries(&store, TreeId::Outcomes).len(), 1);
+            let log = fs::read(store.directory().join(format!(
+                "log-{:020}.bin",
+                store.manifest().segments.last().unwrap().segment_id
+            )))
+            .unwrap();
+            let offset = if rotate {
+                SEGMENT_HEADER_LENGTH
+            } else {
+                prefix.len()
+            };
+            assert_eq!(
+                &log[offset..],
+                records
+                    .into_iter()
+                    .flat_map(|(_, bytes)| bytes)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(&fs::read(&first).unwrap()[..prefix.len()], prefix);
+            let path = store.directory().to_owned();
+            drop(store);
+            let mut reopened = storage::open(path).unwrap();
+            recover(&mut reopened).unwrap();
+            assert_eq!(reopened.manifest().checkpoint_sequence, 3);
+            assert_eq!(reopened.manifest().checkpoint_digest, digest);
+            assert_eq!(entries(&reopened, TreeId::Outcomes).len(), 3);
+            assert!(matches!(
+                vm::read_outcome(&storage::view(&reopened), 3)
+                    .unwrap()
+                    .unwrap()
+                    .outcome,
+                Outcome::Aborted(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn failed_group_publication_preserves_selected_prefix_and_reuses_only_unpublished_sequences() {
+        for rotate in [false, true] {
+            let (_directory, mut store) = create();
+            commit(&mut store, &transaction(tx! { return 1; }.unwrap())).unwrap();
+            let before = store.manifest().clone();
+            store.rotate_next = rotate;
+            let (kind, body) = record::encode(&transaction(tx! { return 99; }.unwrap())).unwrap();
+            let second = envelope(2, before.durable_digest, kind, &body).unwrap();
+            let third = envelope(3, Sha256::digest(&second).into(), kind, &body).unwrap();
+            let path = store.directory().to_owned();
+            let blocked = path.join("manifest.pending");
+            fs::create_dir(&blocked).unwrap();
+            assert!(
+                append_batch(&mut store, [(2, second.as_slice()), (3, third.as_slice())]).is_err()
+            );
+            assert_eq!(store.manifest(), &before);
+            assert_eq!(entries(&store, TreeId::Outcomes).len(), 1);
+            drop(store);
+            fs::remove_dir(blocked).unwrap();
+            let mut reopened = storage::open(path).unwrap();
+            recover(&mut reopened).unwrap();
+            assert_eq!(reopened.manifest().durable_sequence, 1);
+            assert_eq!(entries(&reopened, TreeId::Outcomes).len(), 1);
+            assert_eq!(
+                commit(&mut reopened, &transaction(tx! { return 2; }.unwrap()))
+                    .unwrap()
+                    .sequence,
+                2
+            );
+        }
     }
 
     #[test]

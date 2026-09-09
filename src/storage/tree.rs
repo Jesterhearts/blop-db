@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::ops::Bound;
-use std::vec;
+use std::sync::Arc;
 
 use super::Entry;
 use super::Error;
@@ -32,7 +32,7 @@ pub(super) fn get(
     let mut id = root;
     let mut expected = None;
     loop {
-        match load(reader, tree, id, expected)? {
+        match load_shared(reader, tree, id, expected)?.as_ref() {
             Node::Leaf(cells) => {
                 return cells
                     .binary_search_by(|cell| cell.key.as_slice().cmp(key))
@@ -45,7 +45,7 @@ pub(super) fn get(
                 keys,
                 children,
             } => {
-                id = children[route(&keys, key)];
+                id = children[route(keys, key)];
                 expected = Some(level - 1);
             }
         }
@@ -53,8 +53,7 @@ pub(super) fn get(
 }
 
 struct Frame {
-    level: u8,
-    children: Vec<u64>,
+    node: Arc<Node>,
     next: usize,
 }
 
@@ -64,7 +63,8 @@ pub struct Scan {
     reader: PageReader,
     tree: TreeId,
     stack: Vec<Frame>,
-    leaf: vec::IntoIter<LeafCell>,
+    leaf: Option<Arc<Node>>,
+    next: usize,
     upper: Bound<Vec<u8>>,
     last: Option<Vec<u8>>,
     done: bool,
@@ -93,7 +93,8 @@ pub(super) fn scan(
         reader: reader.clone(),
         tree,
         stack: Vec::new(),
-        leaf: Vec::new().into_iter(),
+        leaf: None,
+        next: 0,
         upper: upper.map(<[u8]>::to_vec),
         last: None,
         done: root == 0 || empty,
@@ -111,17 +112,16 @@ fn descend(
     lower: Bound<&[u8]>,
 ) -> Result<()> {
     loop {
-        match load(&scan.reader, scan.tree, id, expected)? {
+        let node = load_shared(&scan.reader, scan.tree, id, expected)?;
+        match node.as_ref() {
             Node::Leaf(cells) => {
                 let start = cells.partition_point(|cell| match lower {
                     Bound::Unbounded => false,
                     Bound::Included(key) => cell.key.as_slice() < key,
                     Bound::Excluded(key) => cell.key.as_slice() <= key,
                 });
-                scan.leaf = cells.into_iter();
-                if start != 0 {
-                    scan.leaf.nth(start - 1);
-                }
+                scan.leaf = Some(node);
+                scan.next = start;
                 return Ok(());
             }
             Node::Internal {
@@ -131,13 +131,12 @@ fn descend(
             } => {
                 let index = match lower {
                     Bound::Unbounded => 0,
-                    Bound::Included(key) | Bound::Excluded(key) => route(&keys, key),
+                    Bound::Included(key) | Bound::Excluded(key) => route(keys, key),
                 };
                 id = children[index];
                 expected = Some(level - 1);
                 scan.stack.push(Frame {
-                    level,
-                    children,
+                    node,
                     next: index + 1,
                 });
             }
@@ -147,7 +146,12 @@ fn descend(
 
 fn advance(scan: &mut Scan) -> Result<Option<Entry>> {
     loop {
-        if let Some(cell) = scan.leaf.next() {
+        let cell = match scan.leaf.as_deref() {
+            Some(Node::Leaf(cells)) => cells.get(scan.next),
+            _ => None,
+        };
+        if let Some(cell) = cell {
+            scan.next += 1;
             let beyond = match &scan.upper {
                 Bound::Unbounded => false,
                 Bound::Included(key) => cell.key > *key,
@@ -161,17 +165,23 @@ fn advance(scan: &mut Scan) -> Result<Option<Entry>> {
             }
             let value = scan.reader.value(scan.tree, &cell.value)?;
             scan.last = Some(cell.key.clone());
-            return Ok(Some((cell.key, value)));
+            return Ok(Some((cell.key.clone(), value)));
         }
         let Some(frame) = scan.stack.last_mut() else {
             return Ok(None);
         };
-        if frame.next == frame.children.len() {
+        let Node::Internal {
+            level, children, ..
+        } = frame.node.as_ref()
+        else {
+            unreachable!("scan ancestors are internal nodes");
+        };
+        if frame.next == children.len() {
             scan.stack.pop();
             continue;
         }
-        let id = frame.children[frame.next];
-        let expected = frame.level - 1;
+        let id = children[frame.next];
+        let expected = level - 1;
         frame.next += 1;
         descend(scan, id, Some(expected), Bound::Unbounded)?;
     }
@@ -381,7 +391,7 @@ fn minimum(
     mut expected: u8,
 ) -> Result<Vec<u8>> {
     loop {
-        match load(reader, tree, id, Some(expected))? {
+        match load_shared(reader, tree, id, Some(expected))?.as_ref() {
             Node::Leaf(cells) => return Ok(cells[0].key.clone()),
             Node::Internal {
                 level, children, ..
@@ -552,6 +562,19 @@ fn load(
     expected: Option<u8>,
 ) -> Result<Node> {
     let node = reader.node(tree, id)?;
+    if expected.is_some_and(|expected| node.level() != expected) {
+        return Err(Error::Corrupt("child level does not decrease by one"));
+    }
+    Ok(node)
+}
+
+fn load_shared(
+    reader: &PageReader,
+    tree: TreeId,
+    id: u64,
+    expected: Option<u8>,
+) -> Result<Arc<Node>> {
+    let node = reader.shared_node(tree, id)?;
     if expected.is_some_and(|expected| node.level() != expected) {
         return Err(Error::Corrupt("child level does not decrease by one"));
     }
@@ -835,6 +858,7 @@ mod tests {
     #[test]
     fn mixed_incremental_updates_match_ordered_map() {
         let mut file = create();
+        file.enable_cache();
         let mut root = 0;
         let mut model = BTreeMap::new();
         let mut seed = 291;
@@ -960,6 +984,50 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn cached_point_reads_and_scans_reuse_nodes_across_pinned_roots() {
+        let mut file = create();
+        file.enable_cache();
+        let a = leaf(&mut file, &[b"a", b"b"]);
+        let c = leaf(&mut file, &[b"c", b"d"]);
+        let root = branch(&mut file, 1, &[b"c"], vec![a, c]);
+        let reader = file.reader();
+        let root_node = reader.shared_node(TreeId::State, root).unwrap();
+        let leaf_node = reader.shared_node(TreeId::State, a).unwrap();
+        let expected = entries(&reader.uncached(), root);
+        for _ in 0..3 {
+            assert_eq!(
+                get(&reader, TreeId::State, root, b"b").unwrap(),
+                Some(b"b".to_vec())
+            );
+            let mut rows = scan(
+                &reader,
+                TreeId::State,
+                root,
+                Bound::Excluded(b"a"),
+                Bound::Included(b"c"),
+            )
+            .unwrap();
+            assert!(Arc::ptr_eq(&rows.stack[0].node, &root_node));
+            assert!(Arc::ptr_eq(rows.leaf.as_ref().unwrap(), &leaf_node));
+            assert_eq!(rows.next().unwrap().unwrap(), expected[1]);
+            assert_eq!(rows.collect::<Result<Vec<_>>>().unwrap(), expected[2..3]);
+        }
+        let changed = put(&mut file, TreeId::State, root, b"b", b"new").unwrap();
+        let newer = file.reader();
+        assert_eq!(
+            get(&newer, TreeId::State, changed, b"b").unwrap(),
+            Some(b"new".to_vec())
+        );
+        assert_eq!(entries(&reader, root), expected);
+        assert_eq!(entries(&newer, root), expected);
+        assert!(matches!(
+            get(&reader, TreeId::State, changed, b"b"),
+            Err(Error::Corrupt(_))
+        ));
+        validate(&newer.uncached(), TreeId::State, changed).unwrap();
     }
 
     #[test]
@@ -1215,6 +1283,7 @@ mod tests {
     #[test]
     fn pinned_snapshot_reads_are_independent_of_concurrent_appends_and_writer_drop() {
         let mut file = create();
+        file.enable_cache();
         let mut root = 0;
         for id in 0..200 {
             root = put(&mut file, TreeId::State, root, &long_key(id), &[id as u8]).unwrap();

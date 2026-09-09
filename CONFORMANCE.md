@@ -48,9 +48,19 @@ views, scans, worker jobs and backups still retain the shared lease until safe r
 
 ## Operating Choices
 
-- Appends publish individually. Checkpoints publish each newly resolved prefix before receipts.
-  Group commit, asynchronous checkpoint writing and semantic operation coalescing are optional and
-  are not implemented.
+- Local transaction admission opportunistically groups up to 64 already queued requests within
+  existing budgets. The complete group is durable before dispatch; queued completions can share a
+  prefix checkpoint before receipts. Logical import retains individual append publication.
+  Asynchronous checkpoint writing and semantic operation coalescing are not implemented.
+- Live owners use bounded decoded-page and snapshot-table caches, plus incremental root and log
+  validation proofs. Full recovery and low-level storage validation remain uncached. Unsupported
+  transitions and bounded-index exhaustion fall back to full checks. Proofs are updated only after
+  successful publication, and file handover resets them. External mutation of immutable files while
+  an owner is live is unsupported; cached reads are not continuous disk scrubbing.
+- G.3 synchronization skips only unchanged files already made durable by a previous publication and
+  the initial directory flush when no new referenced filenames exist. Manifest and CURRENT file
+  flushes, renames and directory flushes remain ordered. Runtime fault tests exercise every actual
+  I/O boundary with old-or-new recovery checks; group tests cover publication failure and replay.
 - Maintenance is explicit. There is no automatic disk-pressure policy or automatic cursor release.
   Abandoned cursors must be observed and explicitly released; protected history is never silently
   discarded.

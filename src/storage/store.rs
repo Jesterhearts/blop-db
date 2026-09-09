@@ -18,13 +18,14 @@ use super::Current;
 use super::Entry;
 use super::Error;
 use super::Genesis;
-use super::LimitPolicy;
 use super::Manifest;
 use super::Result;
 use super::TreeId;
+use super::checkpoint;
+use super::checkpoint::RuntimeValidation;
+use super::log_validation;
 use super::metadata;
 use super::mvcc::StateKey;
-use super::mvcc::StateValue;
 use super::page::MAX_KEY;
 use super::page::MAX_VALUE;
 use super::page::PageFile;
@@ -65,6 +66,7 @@ pub struct Store {
     poisoned: bool,
     pub(crate) rotate_next: bool,
     read_only: bool,
+    runtime: Option<RuntimeValidation>,
     #[cfg(test)]
     fail_after: Option<usize>,
 }
@@ -94,14 +96,16 @@ pub struct View {
     pub(super) reader: PageReader,
     pub(super) lease: Arc<DirectoryLease>,
     pub(super) roots: [u64; 5],
+    pub(super) validation: checkpoint::Proofs,
 }
 
 /// One physical edit. `None` removes an entry, rather than installing an MVCC
 /// tombstone.
 ///
 /// The engine must validate system values, schemas and complete outcomes before
-/// installation. For an MVCC deletion, put an encoded [`StateValue::Delete`] at
-/// its versioned key.
+/// installation. For an MVCC deletion, put an encoded
+/// [`StateValue::Delete`](super::mvcc::StateValue::Delete) at its versioned
+/// key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mutation {
     pub tree: TreeId,
@@ -194,6 +198,7 @@ pub fn create(
         poisoned: false,
         rotate_next: false,
         read_only: false,
+        runtime: None,
         #[cfg(test)]
         fail_after: None,
     };
@@ -275,6 +280,7 @@ pub(super) fn open_directory(
         // to be persisted to make a requested rotation survive restart.
         rotate_next: true,
         read_only,
+        runtime: None,
         #[cfg(test)]
         fail_after: None,
     })
@@ -287,6 +293,10 @@ pub fn view(store: &Store) -> View {
         reader: store.pages.reader(),
         lease: Arc::clone(&store.lease),
         roots: store.roots,
+        validation: store
+            .runtime
+            .as_ref()
+            .map_or([None; 4], |runtime| runtime.live),
     }
 }
 
@@ -294,7 +304,20 @@ pub fn view(store: &Store) -> View {
 pub fn checkpoint_view(store: &Store) -> View {
     View {
         roots: store.manifest.roots,
+        validation: store
+            .runtime
+            .as_ref()
+            .map_or([None; 4], |runtime| runtime.published),
         ..view(store)
+    }
+}
+
+/// Enable bounded caches only after public database recovery. The first
+/// publication still fully validates roots and logs before seeding proofs.
+pub(crate) fn enable_runtime_cache(store: &mut Store) {
+    store.pages.enable_cache();
+    if store.runtime.is_none() {
+        store.runtime = Some(RuntimeValidation::new(store.roots == store.manifest.roots));
     }
 }
 
@@ -352,6 +375,16 @@ pub fn apply(
             }
         }
     }
+    if let Some(runtime) = &mut store.runtime {
+        checkpoint::observe(
+            runtime,
+            store.roots,
+            roots,
+            changes,
+            &store.manifest,
+            &store.genesis,
+        );
+    }
     store.roots = roots;
     Ok(())
 }
@@ -372,6 +405,39 @@ pub fn prepare_checkpoint(
     }
     let source = view(store);
     let mut roots = source.roots;
+    if let Some(pending) = store
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.pending.as_ref())
+        && source
+            .validation
+            .iter()
+            .enumerate()
+            .all(|(index, proof)| proof.is_some_and(|proof| proof.root == roots[index]))
+    {
+        for ((index, key), version) in &pending.keys {
+            if *version > sequence {
+                match tree::delete(&mut store.pages, TREES[*index], roots[*index], key) {
+                    Ok(root) => roots[*index] = root,
+                    Err(error) => {
+                        store.poisoned = true;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        let validation = std::array::from_fn(|index| {
+            source.validation[index].map(|proof| checkpoint::ValidatedTree {
+                root: roots[index],
+                sequence: proof.sequence.min(sequence),
+            })
+        });
+        return Ok(View {
+            roots,
+            validation,
+            ..view(store)
+        });
+    }
     for tree in TREES[..4].iter().copied() {
         for entry in scan(&source, tree, Bound::Unbounded, Bound::Unbounded)? {
             let (key, _) = entry?;
@@ -404,6 +470,8 @@ pub fn prepare_checkpoint(
 /// protected every active retention claim. Log bodies, schemas, outcomes and
 /// catalogue semantics remain engine inputs. No logical log is written here:
 /// supplied segment prefixes must already exist in the directory.
+/// The live database owner can reuse bounded proofs of immutable prefixes;
+/// ordinary low-level owners and full recovery validate from files instead.
 /// Any publication I/O failure requires dropping handles and reopening, not
 /// retrying blindly.
 pub fn publish(
@@ -429,12 +497,38 @@ pub fn publish(
     // page IDs.
     manifest.page_count = store.pages.page_count();
     manifest.encode()?;
-    validate_checkpoint(&checkpoint.reader, &manifest, &store.genesis)?;
-    metadata::validate_logs(&store.directory, &manifest)?;
-    validate_anchors(store, &manifest)?;
+    let proofs = checkpoint::validate(
+        &checkpoint.reader,
+        &manifest,
+        &store.genesis,
+        if store.runtime.is_some() {
+            checkpoint.validation
+        } else {
+            [None; 4]
+        },
+    )?;
+    let mut logs = match store
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.logs.as_ref())
+    {
+        Some(proof) => {
+            log_validation::validate_extension(&store.directory, &store.manifest, &manifest, proof)?
+        }
+        None => None,
+    };
+    if logs.is_none() {
+        metadata::validate_logs(&store.directory, &manifest)?;
+        validate_anchors(store, &manifest)?;
+        logs = log_validation::LogValidation::at_checkpoint(&manifest);
+    }
     if let Err(error) = publish_files(store, &manifest) {
         store.poisoned = true;
         return Err(error);
+    }
+    if let Some(runtime) = &mut store.runtime {
+        checkpoint::published(runtime, store.roots, &manifest, proofs);
+        runtime.logs = logs;
     }
     store.manifest = manifest;
     Ok(())
@@ -565,70 +659,7 @@ fn validate_checkpoint(
     manifest: &Manifest,
     genesis: &Genesis,
 ) -> Result<()> {
-    for tree in TREES {
-        let root = manifest.roots[tree.index()];
-        tree::validate(reader, tree, root)?;
-        for entry in tree::scan(reader, tree, root, Bound::Unbounded, Bound::Unbounded)? {
-            let (key, value) = entry?;
-            let sequence = entry_sequence(tree, &key)?;
-            if tree != TreeId::Cursors && sequence > manifest.checkpoint_sequence {
-                return Err(Error::Corrupt(
-                    "checkpoint contains a post-checkpoint version",
-                ));
-            }
-            match tree {
-                TreeId::State => {
-                    StateValue::decode(&value).map_err(persisted)?;
-                }
-                TreeId::Policy => {
-                    LimitPolicy::decode(&value)?;
-                }
-                TreeId::Cursors => validate_cursor(sequence, &value, manifest)?,
-                _ => {}
-            }
-        }
-    }
-    if tree::get(
-        reader,
-        TreeId::Policy,
-        manifest.roots[2],
-        &0_u64.to_be_bytes(),
-    )? != Some(genesis.initial_policy.encode())
-    {
-        return Err(Error::Corrupt("initial policy differs from genesis"));
-    }
-    Ok(())
-}
-
-fn validate_cursor(
-    id: u64,
-    value: &[u8],
-    manifest: &Manifest,
-) -> Result<()> {
-    if id >= manifest.next_cursor_id || value.len() < 16 || value.len() > 271 {
-        return Err(Error::Corrupt("invalid cursor identity or value length"));
-    }
-    let version = u16::from_le_bytes(value[..2].try_into().unwrap());
-    if version != 1 {
-        return Err(Error::Unsupported {
-            format: "cursor",
-            version,
-        });
-    }
-    let baseline = u64::from_le_bytes(value[4..12].try_into().unwrap());
-    let length = u32::from_le_bytes(value[12..16].try_into().unwrap()) as usize;
-    if !(1..=3).contains(&value[2])
-        || value[3] != 0
-        || baseline > manifest.durable_sequence
-        || baseline < manifest.history_floor
-        || (value[2] != 1 && manifest.log_floor > baseline + 1)
-        || length != value.len() - 16
-        || value[16..].contains(&0)
-        || std::str::from_utf8(&value[16..]).is_err()
-    {
-        return Err(Error::Corrupt("invalid cursor value or retention floor"));
-    }
-    Ok(())
+    checkpoint::validate(reader, manifest, genesis, [None; 4]).map(|_| ())
 }
 
 fn persisted(error: Error) -> Error {
@@ -713,18 +744,37 @@ fn publish_files(
         digest: Sha256::digest(&bytes).into(),
     }
     .encode()?;
-    store.pages.sync()?;
+    // Immutable prefixes already selected by CURRENT are already durable.
+    // The low-level path keeps its unconditional flush protocol.
+    let reuse = store.runtime.is_some();
+    let new_pages = manifest.page_file_id != store.manifest.page_file_id
+        || manifest.page_count != store.manifest.page_count;
+    if !reuse || new_pages {
+        store.pages.sync()?;
+    }
     publication_step(store)?;
+    let mut new_files = manifest.page_file_id != store.manifest.page_file_id;
     for segment in &manifest.segments {
-        platform::sync_file_path(
-            &store
-                .directory
-                .join(format!("log-{:020}.bin", segment.segment_id)),
-        )?;
+        let previous = store
+            .manifest
+            .segments
+            .binary_search_by_key(&segment.segment_id, |s| s.segment_id)
+            .ok()
+            .map(|index| &store.manifest.segments[index]);
+        new_files |= previous.is_none();
+        if !reuse || previous != Some(segment) {
+            platform::sync_file_path(
+                &store
+                    .directory
+                    .join(format!("log-{:020}.bin", segment.segment_id)),
+            )?;
+        }
         publication_step(store)?;
     }
     let directory = platform::open_directory(&store.directory)?;
-    platform::sync_directory(&directory)?;
+    if !reuse || new_files {
+        platform::sync_directory(&directory)?;
+    }
     publication_step(store)?;
     let temporary = store.directory.join("manifest.pending");
     remove_temporary(&temporary)?;
@@ -824,6 +874,10 @@ pub(super) fn adopt(
     }
     store.roots = manifest.roots;
     store.manifest = manifest;
+    if store.runtime.is_some() {
+        store.runtime = Some(RuntimeValidation::new(true));
+        store.pages.enable_cache();
+    }
     Ok(())
 }
 
@@ -858,8 +912,10 @@ pub(super) fn set_read_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::LimitPolicy;
     use crate::storage::SegmentDescriptor;
     use crate::storage::mvcc;
+    use crate::storage::mvcc::StateValue;
 
     fn new_store() -> (tempfile::TempDir, Store) {
         let directory = tempfile::tempdir().unwrap();
@@ -961,6 +1017,237 @@ mod tests {
             last_digest: *digests.last().unwrap(),
         });
         (manifest, digests)
+    }
+
+    #[test]
+    fn runtime_proofs_and_pending_edits_match_full_prefix_validation() {
+        let (_directory, mut store) = new_store();
+        enable_runtime_cache(&mut store);
+        let (manifest, digests) = write_log(&store, 65);
+        let checkpoint = checkpoint_view(&store);
+        publish(&mut store, &checkpoint, manifest).unwrap();
+        drop(checkpoint);
+        for sequence in (2_u64..=65).rev() {
+            apply(
+                &mut store,
+                &[row(
+                    &sequence.to_be_bytes(),
+                    sequence,
+                    StateValue::Put(vec![sequence as u8]),
+                )],
+            )
+            .unwrap();
+        }
+        let live = view(&store);
+        let mut wrong = store.manifest.clone();
+        wrong.checkpoint_sequence = 2;
+        wrong.checkpoint_digest = digests[2];
+        assert!(matches!(
+            publish(&mut store, &live, wrong),
+            Err(Error::Corrupt(_))
+        ));
+        for sequence in [2, 17, 34, 65] {
+            let prefix = prepare_checkpoint(&mut store, sequence).unwrap();
+            let pending = store.runtime.as_mut().unwrap().pending.take();
+            let reference = prepare_checkpoint(&mut store, sequence).unwrap();
+            store.runtime.as_mut().unwrap().pending = pending;
+            for tree in TREES {
+                let entries = |view: &View| {
+                    scan(view, tree, Bound::Unbounded, Bound::Unbounded)
+                        .unwrap()
+                        .collect::<Result<Vec<_>>>()
+                        .unwrap()
+                };
+                assert_eq!(entries(&prefix), entries(&reference));
+            }
+            let mut manifest = store.manifest.clone();
+            manifest.checkpoint_sequence = sequence;
+            manifest.checkpoint_digest = digests[sequence as usize];
+            manifest.roots = prefix.roots;
+            manifest.page_count = store.pages.page_count();
+            validate_checkpoint(&prefix.reader, &manifest, &store.genesis).unwrap();
+            assert_eq!(
+                scan(&prefix, TreeId::State, Bound::Unbounded, Bound::Unbounded)
+                    .unwrap()
+                    .count(),
+                (sequence - 1) as usize
+            );
+            publish(&mut store, &prefix, manifest).unwrap();
+            let runtime = store.runtime.as_ref().unwrap();
+            assert_eq!(
+                runtime.pending.as_ref().unwrap().keys.len(),
+                (65 - sequence) as usize
+            );
+            assert!(
+                runtime
+                    .published
+                    .iter()
+                    .flatten()
+                    .all(|proof| proof.sequence <= sequence)
+            );
+        }
+        assert!(store.runtime.as_ref().unwrap().logs.is_some());
+        assert_eq!(
+            scan(&live, TreeId::State, Bound::Unbounded, Bound::Unbounded)
+                .unwrap()
+                .count(),
+            64
+        );
+        let path = store.directory.clone();
+        drop(live);
+        drop(store);
+        let reopened = open(path).unwrap();
+        assert!(reopened.runtime.is_none());
+        assert_eq!(reopened.manifest.checkpoint_sequence, 65);
+    }
+
+    #[test]
+    fn invalid_runtime_edits_invalidate_proofs_and_still_fail_publication() {
+        for change in [
+            Mutation {
+                tree: TreeId::State,
+                key: vec![1],
+                value: Some(vec![1]),
+            },
+            Mutation {
+                tree: TreeId::Policy,
+                key: 0_u64.to_be_bytes().to_vec(),
+                value: None,
+            },
+            Mutation {
+                tree: TreeId::Policy,
+                key: 0_u64.to_be_bytes().to_vec(),
+                value: Some(LimitPolicy::new([1; 17]).unwrap().encode()),
+            },
+            Mutation {
+                tree: TreeId::Policy,
+                key: 0_u64.to_be_bytes().to_vec(),
+                value: Some(vec![1]),
+            },
+            row(b"key", 2, StateValue::Put(vec![1])),
+        ] {
+            let (_directory, mut store) = new_store();
+            enable_runtime_cache(&mut store);
+            let checkpoint = view(&store);
+            let manifest = store.manifest.clone();
+            publish(&mut store, &checkpoint, manifest).unwrap();
+            let previous = store.manifest.clone();
+            apply(&mut store, &[change]).unwrap();
+            let checkpoint = view(&store);
+            assert!(publish(&mut store, &checkpoint, previous.clone()).is_err());
+            assert_eq!(store.manifest, previous);
+        }
+    }
+
+    #[test]
+    fn full_validation_and_reopen_bypass_a_warm_runtime_cache() {
+        let (_directory, mut store) = new_store();
+        enable_runtime_cache(&mut store);
+        let checkpoint = view(&store);
+        get(&checkpoint, TreeId::Policy, &0_u64.to_be_bytes()).unwrap();
+        let path = store.directory.clone();
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path.join("pages-00000000000000000001.bin"))
+            .unwrap();
+        platform::write_all_at(
+            &file,
+            &[0xff],
+            checkpoint.roots[2] * super::super::page::PAGE_SIZE as u64,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_checkpoint(&checkpoint.reader, &store.manifest, &store.genesis),
+            Err(Error::Corrupt(_))
+        ));
+        drop(checkpoint);
+        drop(store);
+        assert!(matches!(open(path), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn runtime_publication_flushes_new_data_and_survives_every_io_boundary() {
+        use platform::faults::Event;
+        use platform::faults::Failure;
+        use platform::faults::Guard;
+        use platform::faults::Operation;
+        use platform::faults::Phase;
+
+        for checkpointing in [false, true] {
+            let mut failures = None;
+            for fault in std::iter::once(None).chain((0..64).map(Some)) {
+                if fault.is_some_and(|index| index >= failures.unwrap()) {
+                    break;
+                }
+                let (_directory, mut store) = new_store();
+                enable_runtime_cache(&mut store);
+                let (mut manifest, _) = write_log(&store, 3);
+                if checkpointing {
+                    let previous = checkpoint_view(&store);
+                    publish(&mut store, &previous, manifest).unwrap();
+                    apply(
+                        &mut store,
+                        &[
+                            row(b"a", 2, StateValue::Put(vec![2])),
+                            row(b"b", 3, StateValue::Put(vec![3])),
+                        ],
+                    )
+                    .unwrap();
+                    manifest = store.manifest.clone();
+                    manifest.checkpoint_sequence = 3;
+                    manifest.checkpoint_digest = manifest.durable_digest;
+                }
+                let checkpoint = view(&store);
+                let guard = Guard::new(fault.map(|index| (index, Failure::Error)));
+                let result = publish(&mut store, &checkpoint, manifest);
+                let trace = guard.trace();
+                drop(guard);
+                if fault.is_none() {
+                    result.unwrap();
+                    failures = Some(trace.len());
+                    assert_eq!(
+                        trace
+                            .iter()
+                            .filter(|e| matches!(e, Event(Operation::SyncFile, Phase::Before)))
+                            .count(),
+                        3
+                    );
+                    assert_eq!(
+                        trace
+                            .iter()
+                            .filter(|e| matches!(e, Event(Operation::SyncDirectory, Phase::Before)))
+                            .count(),
+                        if checkpointing { 2 } else { 3 }
+                    );
+                } else {
+                    assert!(result.is_err());
+                    assert!(matches!(writable(&store), Err(Error::NeedsRecovery)));
+                }
+                let path = store.directory.clone();
+                drop(checkpoint);
+                drop(store);
+                let reopened = open(path).unwrap();
+                assert!(matches!(reopened.manifest.durable_sequence, 0 | 3));
+                assert!(matches!(reopened.manifest.checkpoint_sequence, 0 | 3));
+                let rows = scan(
+                    &view(&reopened),
+                    TreeId::State,
+                    Bound::Unbounded,
+                    Bound::Unbounded,
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+                assert_eq!(
+                    rows.len(),
+                    if reopened.manifest.checkpoint_sequence == 3 {
+                        2
+                    } else {
+                        0
+                    }
+                );
+            }
+        }
     }
 
     #[test]

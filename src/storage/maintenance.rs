@@ -138,6 +138,7 @@ pub(crate) fn prepare(
             reader: pages.reader(),
             lease: Arc::clone(&store.lease),
             roots,
+            validation: [None; 4],
         };
         manifest.page_file_id = id;
         manifest.next_page_file_id = id + 1;
