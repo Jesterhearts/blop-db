@@ -476,7 +476,7 @@ async fn snapshot_tail_and_retention_floors_are_independent() {
     assert!(db::revoke(&snapshot));
     assert_eq!(
         db::retention_status(&database).await.unwrap(),
-        db::RetentionFloors { history: 2, log: 4 }
+        db::RetentionFloors { history: 2, log: 2 }
     );
     let batch = db::read_feed(&database, &cursor, at, BatchLimits::default())
         .await

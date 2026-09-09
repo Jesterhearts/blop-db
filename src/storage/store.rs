@@ -493,9 +493,15 @@ pub fn publish(
     }
     manifest.generation = next_generation(store)?;
     manifest.roots = checkpoint.roots;
-    // Even a previously pinned root must not roll back allocation of published
-    // page IDs.
-    manifest.page_count = store.pages.page_count();
+    // Reusing the selected roots needs only their already durable page prefix.
+    // Leave post-checkpoint materialization outside it until roots change; log
+    // publications need not flush those reconstructible pages. Never roll back
+    // allocation of previously published page IDs.
+    manifest.page_count = if store.runtime.is_some() && checkpoint.roots == store.manifest.roots {
+        store.manifest.page_count
+    } else {
+        store.pages.page_count()
+    };
     manifest.encode()?;
     let proofs = checkpoint::validate(
         &checkpoint.reader,
@@ -1182,28 +1188,43 @@ mod tests {
                 let (_directory, mut store) = new_store();
                 enable_runtime_cache(&mut store);
                 let (mut manifest, _) = write_log(&store, 3);
+                let previous = checkpoint_view(&store);
+                publish(&mut store, &previous, manifest).unwrap();
+                apply(
+                    &mut store,
+                    &[
+                        row(b"a", 2, StateValue::Put(vec![2])),
+                        row(b"b", 3, StateValue::Put(vec![3])),
+                    ],
+                )
+                .unwrap();
                 if checkpointing {
-                    let previous = checkpoint_view(&store);
-                    publish(&mut store, &previous, manifest).unwrap();
-                    apply(
-                        &mut store,
-                        &[
-                            row(b"a", 2, StateValue::Put(vec![2])),
-                            row(b"b", 3, StateValue::Put(vec![3])),
-                        ],
-                    )
-                    .unwrap();
                     manifest = store.manifest.clone();
                     manifest.checkpoint_sequence = 3;
                     manifest.checkpoint_digest = manifest.durable_digest;
+                } else {
+                    (manifest, _) = write_log(&store, 1);
                 }
-                let checkpoint = view(&store);
+                let checkpoint = if checkpointing {
+                    view(&store)
+                } else {
+                    checkpoint_view(&store)
+                };
                 let guard = Guard::new(fault.map(|index| (index, Failure::Error)));
                 let result = publish(&mut store, &checkpoint, manifest);
                 let trace = guard.trace();
                 drop(guard);
                 if fault.is_none() {
                     result.unwrap();
+                    assert_eq!(
+                        store.manifest.page_count,
+                        if checkpointing {
+                            store.pages.page_count()
+                        } else {
+                            2
+                        }
+                    );
+                    assert!(store.pages.page_count() > 2);
                     failures = Some(trace.len());
                     assert_eq!(
                         trace
@@ -1224,10 +1245,11 @@ mod tests {
                     assert!(matches!(writable(&store), Err(Error::NeedsRecovery)));
                 }
                 let path = store.directory.clone();
+                drop(previous);
                 drop(checkpoint);
                 drop(store);
                 let reopened = open(path).unwrap();
-                assert!(matches!(reopened.manifest.durable_sequence, 0 | 3));
+                assert!(matches!(reopened.manifest.durable_sequence, 3 | 4));
                 assert!(matches!(reopened.manifest.checkpoint_sequence, 0 | 3));
                 let rows = scan(
                     &view(&reopened),
@@ -1464,6 +1486,7 @@ mod tests {
         let manifest = store.manifest.clone();
         publish(&mut store, &checkpoint, manifest).unwrap();
         let count = store.manifest.page_count;
+        enable_runtime_cache(&mut store);
         let manifest = store.manifest.clone();
         publish(&mut store, &old, manifest).unwrap();
         assert_eq!(store.manifest.page_count, count);

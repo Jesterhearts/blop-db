@@ -5,7 +5,8 @@ storage layer and an async database API with revocable snapshots, durable retent
 resolved and logical feeds, verified replica import, manual maintenance and pinned physical backups.
 A coordinator sequences transactions, publishes their log records before dispatch, and installs
 complete worker outcomes against the latest storage roots. A persistent worker pool interprets
-independent transactions in parallel. Receipts follow prefix checkpoint publication.
+independent transactions in parallel. Receipts follow durable logging and contiguous visibility;
+materialized checkpoints are published periodically.
 
 `tx!` compiles a small deterministic transaction program to the ISA 1 bytecode specified in
 [`DESIGN.md`](DESIGN.md), appendices A, B and C. Parsing, type checking, register allocation and
@@ -29,15 +30,17 @@ functions accept a cloneable `Database` handle:
   `open_with_options(path, engine_options).await` select nonpersistent worker and capacity settings.
   Existing `CreateOptions` initializers are unchanged.
 - `execute(&db, transaction, claims).await` returns a `Receipt { sequence, outcome }` after the
-  transaction is durable, resolved and checkpointed.
+  transaction is durable, resolved and included in the contiguous visible prefix. Its materialized
+  checkpoint may lag behind; recovery replays the durable log suffix.
 - `execute_with_manifest(&db, transaction, claims, manifest).await` independently validates supplied
   C.4 declarations before sequencing. Broader declarations are allowed and retained exactly.
 - `execute_catalogue(&db, operation).await` creates, renames or drops tables. A successful create
   returns its table ID as `Value::U64` in the outcome.
 - `execute_limits(&db, limits).await` changes the policy for subsequent records, even when the old
   policy prevents transaction submission.
-- `close(&db).await` stops submissions from every clone, drains accepted requests and waits for the
-  directory lock to be released. Dropping every handle also drains accepted work, but does not wait.
+- `close(&db).await` stops submissions from every clone, drains accepted requests, checkpoints the
+  visible prefix and waits for the directory lock to be released. Dropping every handle also drains
+  and checkpoints accepted work, but does not wait or report shutdown failures.
 - `status(&db)` returns the latest `EngineStatus` sample without waiting for workers or storage I/O.
 
 Both transaction claims and creation limits use `Limits`, a struct with semantic names for all 17
@@ -89,16 +92,17 @@ not the live scheduler's operational limits.
 
 `EngineOptions` controls live admission and scheduling independently of `Limits`:
 
-| Field                    | Default                               | Purpose                                                                      |
-| ------------------------ | ------------------------------------- | ---------------------------------------------------------------------------- |
-| `workers`                | Available CPUs clamped to 2 through 4 | Persistent interpreters; configurable from 1 through 256.                    |
-| `execution_window`       | 64                                    | Dispatch only `F < N <= min(D, F + W)`, using overflow-safe arithmetic.      |
-| `submission_queue_count` | 64                                    | Count permits for unassigned submissions, including the prepared queue head. |
-| `submission_queue_bytes` | 64 MiB                                | Input byte reservations for those submissions.                               |
-| `assigned_backlog_count` | 64                                    | Maximum assigned records waiting for visible checkpointed receipts.          |
-| `assigned_backlog_bytes` | 64 MiB                                | Maximum canonical log bytes in that assigned backlog.                        |
-| `execution_bytes`        | 512 MiB                               | Aggregate lifetime reservations for assigned transactions.                   |
-| `preparation_bytes`      | 512 MiB                               | Separate capacity for one active validation or prepared queue head.          |
+| Field                    | Default                               | Purpose                                                                                |
+| ------------------------ | ------------------------------------- | -------------------------------------------------------------------------------------- |
+| `workers`                | Available CPUs clamped to 2 through 4 | Persistent interpreters; configurable from 1 through 256.                              |
+| `execution_window`       | 64                                    | Dispatch only `F < N <= min(D, F + W)`, using overflow-safe arithmetic.                |
+| `checkpoint_interval`    | 64                                    | Newly visible records before checkpoint publication; configurable from 1 through 4096. |
+| `submission_queue_count` | 64                                    | Count permits for unassigned submissions, including the prepared queue head.           |
+| `submission_queue_bytes` | 64 MiB                                | Input byte reservations for those submissions.                                         |
+| `assigned_backlog_count` | 64                                    | Maximum assigned records waiting for visible receipts.                                 |
+| `assigned_backlog_bytes` | 64 MiB                                | Maximum canonical log bytes in that assigned backlog.                                  |
+| `execution_bytes`        | 512 MiB                               | Aggregate lifetime reservations for assigned transactions.                             |
+| `preparation_bytes`      | 512 MiB                               | Separate capacity for one active validation or prepared queue head.                    |
 
 Count and byte permits are acquired before enqueueing. Waiting producers retain their own inputs;
 those inputs have not been accepted by the engine. Count permits can also be held while waiting for
@@ -120,11 +124,10 @@ Before assigning a transaction, the coordinator reserves its decoded program, sc
 list, registers, distinct-address set, overlay, pending outcome and above-frontier logical versions.
 The reservation includes representation and temporary-buffer allowances, including zero-width tuple
 values and scan results built before destination checks. It remains charged until the record is
-installed, visible and checkpointed. Reserving the full lifetime in sequence order, then dispatching
-the oldest ready work first, prevents later work from taking capacity needed by the oldest record.
-Preparation separately bounds decoding and conservative access-analysis scratch before those stages
-run. These estimates deliberately favour safety over accepting every program that might fit in
-practice.
+installed and visible. Reserving the full lifetime in sequence order, then dispatching the oldest
+ready work first, prevents later work from taking capacity needed by the oldest record. Preparation
+separately bounds decoding and conservative access-analysis scratch before those stages run. These
+estimates deliberately favour safety over accepting every program that might fit in practice.
 
 Resource pressure delays admission. If a single record cannot fit the configured capacity,
 submission returns `Error::OperationalLimit { resource, required, limit }` before sequencing. It
@@ -149,18 +152,34 @@ crate-private VM installation hook, against the latest store, before satisfying 
 Workers never publish stale roots or consume another transaction's tentative overlay.
 
 `F` is live visibility, `D` is the CURRENT-selected manifest's durable frontier, and `C` is the
-checkpoint. They are tracked separately. Each contiguous frontier advance publishes a checkpoint
-filtered at F before releasing receipts; one publication can cover several previously completed
-records. When F equals D, the live roots already satisfy that boundary. Otherwise, a bounded index
-of above-checkpoint edits avoids rescanning retained history when possible. The coordinator groups
-up to 64 already queued local transactions within existing count and byte budgets, without waiting
-to fill a group. All group records are published durably before any dispatch. Administrative
-requests, queued controls and reported worker completions stop group collection. Already queued
-worker completions can share one prefix checkpoint. There is no asynchronous checkpoint writer or
-semantic merging of transactions. See [BENCHMARKS.md](BENCHMARKS.md) for measured workloads. A
-failed checkpoint publication can leave F above C: the prefix through F is durable and resolved, but
-receipts remain uncertain and the writer requires reopening. Diagnostics retain that F rather than
-lowering it.
+checkpoint. They are tracked separately. Receipts can follow a contiguous frontier advance without a
+new checkpoint: every record through F is already durable in the log and fully installed. Recovery
+discards post-checkpoint materialization and replays `(C, D]`, including acknowledged transactions,
+aborts and no-write outcomes. This preserves durability and visibility, but changes the former
+checkpoint-before-receipt default. Set `EngineOptions::checkpoint_interval` to 1 to retain that
+behaviour.
+
+The coordinator publishes a checkpoint when `F - C >= checkpoint_interval`, before releasing the
+receipts for that advance. It also checkpoints the drained prefix before catalogue/policy barriers,
+maintenance and normal shutdown. An idle database can keep a smaller suffix uncheckpointed; the
+interval bounds record count, not elapsed time, bytes or replay cost. A completion group can cross
+the threshold, and unresolved assigned records can extend D beyond F. Lower the interval for large
+transactions or tighter recovery-work requirements. Logs needed for replay remain protected by C,
+even when snapshots and cursor baselines have advanced beyond it.
+
+Checkpoints are filtered at F. When F equals D, the live roots already satisfy that boundary.
+Otherwise, a bounded index of above-checkpoint edits avoids rescanning retained history when
+possible. The coordinator groups up to 64 already queued local transactions within existing count
+and byte budgets, without waiting to fill a group. All group records are published durably before
+any dispatch. Administrative requests, queued controls and reported worker completions stop group
+collection. There is no asynchronous checkpoint writer or semantic merging of transactions. See
+[BENCHMARKS.md](BENCHMARKS.md) for measured workloads.
+
+A failed checkpoint stops the writer and requires reopening. Previously successful receipts remain
+durable through replay; receipts still waiting on the failed publication are uncertain. Diagnostics
+retain F rather than lowering it. If `close` was accepted and the writer stops in a failed state, it
+returns `Error::Storage(storage::Error::NeedsRecovery)` after releasing the storage handles. The
+error detail is available in `status(&db).last_error`.
 
 After full startup recovery, the live owner enables a 64 MiB decoded-node cache per page-file
 descriptor. Cached nodes are immutable and shared across worker and snapshot views; hits still check
@@ -180,8 +199,10 @@ file handover resets the runtime proofs. Modifying an owner's immutable files ex
 supported live operation; caching does not continuously scrub for later external corruption.
 
 Publication flushes changed page/log files and directories for new filenames. Already published,
-unchanged prefixes need no repeated flush. New manifests and CURRENT still follow the complete G.3
-file-flush, rename and directory-flush ordering before durability is reported.
+unchanged prefixes need no repeated flush. Runtime publications that reuse the selected roots also
+retain their published page count, leaving reconstructible post-checkpoint pages outside the durable
+prefix until roots change. New manifests and CURRENT still follow the complete G.3 file-flush,
+rename and directory-flush ordering before durability is reported.
 
 Catalogue and policy requests stop later sequencing, drain the preceding prefix, then execute their
 durable barrier. Submissions queued behind a barrier are prepared against the resulting metadata.
@@ -1057,7 +1078,10 @@ drains both assigned and queued work, snapshots are revoked before releasing the
 repeated close preserves its success/closed semantics. Shutdown tests also check definite rejection
 of unread controls. A checkpoint failure test obstructs only unpublished temporary output after
 durable append and installation, then verifies F/C/D diagnostics and replay without damaging
-committed history.
+committed history. Deferred-checkpoint tests cover interval thresholds, the interval-1 compatibility
+setting, old snapshots across checkpoints, final checkpoint failures and a real process exit after
+successful receipts. Reopening checks exact outcomes, non-duplicated increments and cursor baselines
+above C, including resolved and logical feed continuity.
 
 To check the Windows code without running it, install the target with
 `rustup target add x86_64-pc-windows-gnu`, then run

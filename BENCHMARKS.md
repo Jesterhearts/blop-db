@@ -4,7 +4,8 @@
 comparison exercises independent transactions through the public async API and cached reads through
 public snapshots. A separate, single-client buffered mode measures the reference VM. This is a
 small, reproducible workload comparison, not a general database ranking. The optimized results below
-include engine scaling changes; the comparison libraries remain development dependencies.
+include engine scaling changes; the comparison libraries remain development dependencies. The latest
+write optimisation results are in [Deferred Checkpoints](#deferred-checkpoints-2026-09-08).
 
 ## Run
 
@@ -65,8 +66,8 @@ Larger durable trials can take substantially longer and use substantial disk spa
 - Durable blop clients each run a current-thread Tokio executor on a native client thread and await
   every receipt, checking for semantic aborts. The database has a separate coordinator and the
   selected persistent worker count. Other `EngineOptions` and transaction `Limits` retain their
-  defaults: in particular, the execution window and assigned backlog remain 64. More clients can
-  encounter ordinary admission backpressure rather than increase active execution.
+  defaults: in particular, the execution window, assigned backlog and checkpoint interval are 64.
+  More clients can encounter ordinary admission backpressure rather than increase active execution.
 - Cached reads sample existing keys uniformly with replacement after updates and verification. All
   read paths produce owned values, including copying redb's borrowed value. Durable blop uses
   `database::get` on one shared pinned snapshot; redb uses a shared pinned read transaction/table.
@@ -100,18 +101,18 @@ Larger durable trials can take substantially longer and use substantial disk spa
 
 ### Durable Mode
 
-| Engine | Commit Setting                                                                                                                         | Cached Read Path                                         |
-| ------ | -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| blop   | `database::execute`, waiting for a successful durability receipt; queued log groups followed by visible-prefix checkpoint publication. | `database::get` (`get_snapshot`), after public reopen.   |
-| redb   | One write transaction per key, `Durability::Immediate`.                                                                                | One pinned read transaction.                             |
-| SQLite | WAL, `synchronous=FULL`, one autocommit UPSERT per key; automatic WAL checkpointing remains enabled.                                   | One read transaction and prepared SELECT per connection. |
+| Engine | Commit Setting                                                                                                                          | Cached Read Path                                         |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| blop   | `database::execute`, waiting for a successful durability receipt after log publication and contiguous visibility; periodic checkpoints. | `database::get` (`get_snapshot`), after public reopen.   |
+| redb   | One write transaction per key, `Durability::Immediate`.                                                                                 | One pinned read transaction.                             |
+| SQLite | WAL, `synchronous=FULL`, one autocommit UPSERT per key; automatic WAL checkpointing remains enabled.                                    | One read transaction and prepared SELECT per connection. |
 
 Durable commits have comparable intent but different work. blop also retains transaction programs,
 outcomes and historical versions. Local transaction log groups contain up to 64 already queued
-requests, within existing budgets, with no artificial wait to fill a group. One checkpoint can cover
-several completed records when the visible prefix advances. The baseline had no log group commit.
-The engines do not have identical storage or retention policies, and no maintenance is requested
-here.
+requests, within existing budgets, with no artificial wait to fill a group. Checkpoints now run
+after 64 newly visible records, rather than every visible-prefix advance. The original baseline had
+no log group commit. The engines do not have identical storage or retention policies, and no
+maintenance is requested here.
 
 ### Buffered Mode
 
@@ -126,6 +127,79 @@ in a complete engine. These figures isolate execution/storage cost and must not 
 durable or parallel-engine throughput. Unsynchronized writes can still perform file I/O and
 encounter OS writeback. The VM and MVCC read diagnostics are not measurements of the public snapshot
 API; the MVCC diagnostic returns encoded bytes, verified against the expected encoding.
+
+## Deferred Checkpoints: 2026-09-08
+
+This follow-up compares production revision `838a303` with the deferred-checkpoint changes. It uses
+the same, unchanged harness, release profile, CPU set 0 through 3 and filesystem as the earlier
+runs. Each configuration has 1,000 independent inserts, 1,000 independent updates and 100,000 cached
+reads per fresh database, with three measured trials and discarded warm-up. Configurations and
+builds/tests ran separately, not concurrently with measured workloads.
+
+The default checkpoint interval is now 64 visible records. Every receipt still follows durable
+canonical logging, complete installation and contiguous visibility, but no longer promises that
+materialized pages have been checkpointed. Set `EngineOptions::checkpoint_interval` to 1 for the
+former checkpoint-before-receipt behaviour. The on-disk format, durability-before-execution rule and
+manifest/CURRENT ordering are unchanged.
+
+The benchmark still verifies full values and the final checkpoint after close/reopen. Periodic
+checkpoints are inside the write timers. As before, close is outside timing; it now publishes the
+remaining partial interval. The measurements are durable receipt throughput, not throughput for
+checkpointing every transaction, and not request-latency percentiles.
+
+Run each command on `838a303`, then rebuild and run on the changed sources:
+
+```sh
+cargo build --release --example kv_bench
+taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 100000 --repeats 3 --mode durable --clients 1 --workers 1
+taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 100000 --repeats 3 --mode durable --clients 16 --workers 4
+taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 100000 --repeats 3 --mode durable --clients 4 --workers 1
+```
+
+Median transactions per second:
+
+| Clients | Workers | Operation | Before |  After | Speedup |
+| ------: | ------: | --------- | -----: | -----: | ------: |
+|       1 |       1 | Insert    |   93.0 |  181.2 |   1.95x |
+|       1 |       1 | Update    |   92.4 |  181.1 |   1.96x |
+|       4 |       1 | Insert    |   93.5 |  188.7 |   2.02x |
+|       4 |       1 | Update    |   94.0 |  183.8 |   1.96x |
+|      16 |       4 | Insert    |  329.7 | 1011.1 |   3.07x |
+|      16 |       4 | Update    |  333.1 |  952.3 |   2.86x |
+
+Per-trial rates, in trial order, preserve the variability behind those medians:
+
+| Clients / Workers | Before Inserts      | After Inserts          | Before Updates      | After Updates       |
+| ----------------- | ------------------- | ---------------------- | ------------------- | ------------------- |
+| 1 / 1             | 53.0, 93.4, 93.0    | 181.2, 180.5, 181.2    | 92.1, 92.6, 92.4    | 181.3, 181.1, 179.3 |
+| 4 / 1             | 93.5, 94.8, 93.0    | 189.0, 185.3, 188.7    | 94.6, 94.0, 93.3    | 186.0, 176.1, 183.8 |
+| 16 / 4            | 329.7, 305.5, 342.1 | 1026.0, 1011.1, 1005.2 | 333.1, 316.3, 337.0 | 925.4, 952.3, 972.0 |
+
+The first single-client baseline insert trial was substantially slower; it is retained rather than
+discarded. These are workstation measurements, not isolated per-optimisation attribution. At 16
+clients, the after-run comparison-engine medians were 1,231.2 inserts/s and 1,260.1 updates/s for
+redb, and 626.4 inserts/s and 626.2 updates/s for SQLite. The result narrows the gap to redb on this
+workload; it is not a general database ranking.
+
+An ordinary single-client transaction on an existing log now requests five file/directory sync calls
+for its log publication, instead of ten across log and checkpoint publications. A periodic
+checkpoint adds another five calls. Runtime log-only publication keeps the selected roots' existing
+page count, so reconstructible appended pages do not trigger a page flush. These are call counts,
+not necessarily device-flush counts. New files and administrative operations add work. Removing the
+completion publication also lets concurrent clients proceed without that coordinator I/O pause.
+
+The trade-off is more replay work after interruption and a more conservative log-retention floor
+until C advances. The interval bounds record count, not bytes, execution time or elapsed checkpoint
+age. Large transactions, cold data, mixed workloads and tail latency remain unmeasured here.
+
+A separate larger verification run also completed with full-value reopen checks: 10,000 inserts,
+10,000 updates and one million cached reads, using 16 clients and four workers. blop reached 911.2
+inserts/s and 801.3 updates/s. This was one measured trial, not a median or a matched before/after
+comparison:
+
+```sh
+taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 10000 --reads 1000000 --repeats 1 --mode durable --clients 16 --workers 4
+```
 
 ## Optimized Results: 2026-09-08
 

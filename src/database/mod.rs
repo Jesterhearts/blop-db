@@ -132,8 +132,10 @@ pub struct CreateOptions {
     pub cursor_namespace: Option<[u8; 16]>,
 }
 
-/// A durable, checkpointed result. An aborted outcome contains no data writes
-/// but still occupies this sequence and is durably recorded.
+/// A durable result in the contiguous visible prefix. The materialized
+/// checkpoint may lag behind; recovery replays its durable log suffix.
+/// An aborted outcome contains no data writes but still occupies this sequence
+/// and is durably recorded.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Receipt {
     pub sequence: u64,
@@ -583,7 +585,9 @@ async fn submit(
 }
 
 /// Stop accepting new submissions from all clones, drain already accepted
-/// requests, and wait until the directory lock has been released. Receipts for
+/// requests, checkpoint the visible prefix, and wait until the directory lock
+/// has been released. A shutdown failure reports `Storage(NeedsRecovery)`;
+/// earlier successful receipts remain durable through log replay. Receipts for
 /// individual transactions still report their own results. A repeated close
 /// after shutdown returns `Error::Closed`. Even that result waits for the
 /// writer to release its storage handles, so the directory can be reopened.
@@ -600,7 +604,11 @@ pub async fn close(database: &Database) -> Result<()> {
         .map_err(|_| Error::Closed);
     let mut stopped = database.stopped.clone();
     let _ = stopped.changed().await;
-    result
+    result?;
+    if database.status.borrow().poisoned {
+        return Err(Error::Storage(storage::Error::NeedsRecovery));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

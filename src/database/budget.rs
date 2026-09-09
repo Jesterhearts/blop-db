@@ -20,11 +20,15 @@ use crate::vm;
 pub struct EngineOptions {
     pub workers: usize,
     pub execution_window: u64,
+    /// Checkpoint after this many newly visible records. Receipts before then
+    /// are recovered from the durable log. Use 1 to checkpoint every visible
+    /// prefix before releasing its receipts. Must be between 1 and 4096.
+    pub checkpoint_interval: u64,
     pub submission_queue_count: usize,
     pub submission_queue_bytes: usize,
     pub assigned_backlog_count: usize,
     pub assigned_backlog_bytes: u64,
-    /// Full lifetime reservations, retained through checkpointed visibility.
+    /// Full lifetime reservations, retained through visible receipts.
     pub execution_bytes: u64,
     /// Bounds decoding, access analysis and the retained prepared queue head.
     pub preparation_bytes: u64,
@@ -35,6 +39,7 @@ impl Default for EngineOptions {
         Self {
             workers: std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4)),
             execution_window: 64,
+            checkpoint_interval: 64,
             submission_queue_count: 64,
             submission_queue_bytes: 64 * 1024 * 1024,
             assigned_backlog_count: 64,
@@ -48,6 +53,7 @@ impl Default for EngineOptions {
 pub(super) fn validate(options: &EngineOptions) -> Result<()> {
     if !(1..=256).contains(&options.workers)
         || options.execution_window == 0
+        || !(1..=4096).contains(&options.checkpoint_interval)
         || options.submission_queue_count == 0
         || options.submission_queue_count > Semaphore::MAX_PERMITS
         || options.submission_queue_bytes == 0
@@ -242,6 +248,14 @@ mod tests {
             },
             EngineOptions {
                 execution_window: 0,
+                ..Default::default()
+            },
+            EngineOptions {
+                checkpoint_interval: 0,
+                ..Default::default()
+            },
+            EngineOptions {
+                checkpoint_interval: 4097,
                 ..Default::default()
             },
             EngineOptions {

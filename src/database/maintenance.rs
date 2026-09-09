@@ -203,7 +203,7 @@ pub(super) fn run(
             "maintenance sequencer is not drained",
         )));
     }
-    // Do not assume normal per-frontier checkpointing made C equal to F.
+    // Deferred checkpoints can leave C below the drained frontier F.
     let checkpoint = storage::prepare_checkpoint(store, frontier).map_err(Error::Storage)?;
     let mut manifest = previous.clone();
     manifest.checkpoint_sequence = frontier;
@@ -1226,7 +1226,7 @@ mod tests {
         assert_eq!(copied, original);
         assert_eq!(
             (copied.checkpoint_sequence, copied.durable_sequence),
-            (2, 4)
+            (1, 4)
         );
         assert_eq!(
             fs::read(destination.join("CURRENT")).unwrap(),

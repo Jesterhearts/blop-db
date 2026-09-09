@@ -1,6 +1,6 @@
 //! Durable registration -> dependency-ready interpretation -> serial
-//! installation -> prefix checkpoint/receipts. No worker publishes roots or
-//! tentative state.
+//! installation -> visible receipts -> periodic checkpoints. No worker
+//! publishes roots or tentative state.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -404,6 +404,7 @@ fn complete(
     schedule: &mut Schedule,
     pool: &mut workers::Pool,
     mut completion: workers::Completion,
+    checkpoint_interval: u64,
 ) -> vm::Result<()> {
     let queued = pool.completed.len();
     for index in 0..=queued {
@@ -447,15 +448,19 @@ fn complete(
         digest = Some(entry.digest);
     }
     if let Some(digest) = digest {
-        let mut manifest = store.manifest().clone();
-        manifest.checkpoint_sequence = schedule.frontier;
-        manifest.checkpoint_digest = digest;
-        let checkpoint = if schedule.frontier == manifest.durable_sequence {
-            storage::view(store)
-        } else {
-            storage::prepare_checkpoint(store, schedule.frontier)?
-        };
-        storage::publish(store, &checkpoint, manifest)?;
+        if schedule.frontier - store.manifest().checkpoint_sequence >= checkpoint_interval {
+            let mut manifest = store.manifest().clone();
+            manifest.checkpoint_sequence = schedule.frontier;
+            manifest.checkpoint_digest = digest;
+            let checkpoint = if schedule.frontier == manifest.durable_sequence {
+                storage::view(store)
+            } else {
+                storage::prepare_checkpoint(store, schedule.frontier)?
+            };
+            storage::publish(store, &checkpoint, manifest)?;
+        }
+        // D was published before dispatch. Installed outcomes in the contiguous
+        // visible prefix can be recovered by replay even while C trails F.
         while schedule
             .entries
             .front()
@@ -609,7 +614,13 @@ pub(super) fn run(
         }
         // Observe reported faults before admitting or dispatching more work.
         if let Ok(completion) = pool.completed.try_recv() {
-            if let Err(error) = complete(&mut store, &mut schedule, &mut pool, completion) {
+            if let Err(error) = complete(
+                &mut store,
+                &mut schedule,
+                &mut pool,
+                completion,
+                options.checkpoint_interval,
+            ) {
                 last_error = Some(error.to_string());
                 failed = true;
                 break;
@@ -650,6 +661,12 @@ pub(super) fn run(
             continue;
         }
         if !requests && head.is_none() && schedule.entries.is_empty() {
+            if store.manifest().checkpoint_sequence != schedule.frontier
+                && let Err(error) = engine::publish_checkpoint(&mut store)
+            {
+                last_error = Some(error.to_string());
+                failed = true;
+            }
             break;
         }
         let mut progress = false;
@@ -680,6 +697,13 @@ pub(super) fn run(
                     progress = true;
                 }
             } else if schedule.entries.is_empty() {
+                if store.manifest().checkpoint_sequence != schedule.frontier
+                    && let Err(error) = engine::publish_checkpoint(&mut store)
+                {
+                    last_error = Some(error.to_string());
+                    failed = true;
+                    break;
+                }
                 let pending = head.take().unwrap();
                 let result = engine::commit(&mut store, &pending.command);
                 failed = result
@@ -723,7 +747,13 @@ pub(super) fn run(
         };
         match event {
             Event::Complete(Some(completion)) => {
-                if let Err(error) = complete(&mut store, &mut schedule, &mut pool, completion) {
+                if let Err(error) = complete(
+                    &mut store,
+                    &mut schedule,
+                    &mut pool,
+                    completion,
+                    options.checkpoint_interval,
+                ) {
                     last_error = Some(error.to_string());
                     failed = true;
                     break;
@@ -1065,6 +1095,398 @@ mod tests {
         value
     }
 
+    fn deferred_transactions() -> [crate::Transaction; 4] {
+        [
+            tx! { tables { data: u64 => u64 = 1 } data[1] += 1; return data[1]; }.unwrap(),
+            tx! { tables { data: u64 => u64 = 1 } data[1] += 100; require(false, 7); }.unwrap(),
+            tx! {
+                tables { data: u64 => u64 = 1 }
+                if false { data[1] += 100; }
+                return data[1];
+            }
+            .unwrap(),
+            tx! { tables { data: u64 => u64 = 1 } data[1] += 1; return data[1]; }.unwrap(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn deferred_checkpoint_crash_child() {
+        let Some(path) = std::env::var_os("BLOP_DEFERRED_CHECKPOINT_CRASH_DB") else {
+            return;
+        };
+        let database = db::open(path).await.unwrap();
+        let cursors = db::list_cursors(&database).await.unwrap();
+        assert_eq!(cursors.len(), 2);
+        let mut receipts = Vec::new();
+        for (index, transaction) in deferred_transactions().into_iter().enumerate() {
+            let receipt = db::execute(&database, transaction, Default::default())
+                .await
+                .unwrap();
+            assert_eq!(receipt.sequence, index as u64 + 3);
+            match index {
+                0 => assert_eq!(value(receipt.clone()), Value::U64(11)),
+                1 => assert!(matches!(receipt.outcome, Outcome::Aborted(_))),
+                2 => assert!(matches!(
+                    &receipt.outcome,
+                    Outcome::Success { value: Value::U64(11), effects, .. } if effects.is_empty()
+                )),
+                3 => assert_eq!(value(receipt.clone()), Value::U64(12)),
+                _ => unreachable!(),
+            }
+            let snapshot = db::snapshot(&database).await.unwrap();
+            assert_eq!(snapshot.sequence(), receipt.sequence);
+            assert_eq!(
+                db::get(&snapshot, 1, &Value::U64(1)).unwrap(),
+                Some(Value::U64(if index == 3 { 12 } else { 11 }))
+            );
+            let status =
+                wait_status(&database, |s| s.visibility_frontier == receipt.sequence).await;
+            assert_eq!(status.checkpoint, 2);
+            assert_eq!(status.durable_frontier, receipt.sequence);
+            receipts.push(receipt);
+        }
+        for info in cursors {
+            let after = db::Watermark::new(database.database_id(), 2).unwrap();
+            let batch = match info.token.kind() {
+                db::CursorKind::Resolved => {
+                    db::read_feed(&database, &info.token, after, db::BatchLimits::default()).await
+                }
+                db::CursorKind::Logical => {
+                    db::read_logical_feed(&database, &info.token, after, db::BatchLimits::default())
+                        .await
+                }
+                _ => unreachable!(),
+            }
+            .unwrap();
+            assert_eq!((batch.start_exclusive, batch.end_inclusive), (2, 6));
+            assert_eq!(
+                db::FeedBatch::decode(&batch.encode().unwrap()).unwrap(),
+                batch
+            );
+            let records = match batch.records {
+                db::FeedRecords::Resolved(records) => records,
+                db::FeedRecords::Logical(records) => {
+                    records.into_iter().map(|r| r.outcome).collect()
+                }
+            };
+            assert_eq!(
+                records
+                    .into_iter()
+                    .map(|r| Receipt {
+                        sequence: r.sequence,
+                        outcome: r.outcome,
+                    })
+                    .collect::<Vec<_>>(),
+                receipts
+            );
+            if info.token.kind() == db::CursorKind::Logical {
+                db::acknowledge_cursor(
+                    &database,
+                    &info.token,
+                    db::Watermark::new(database.database_id(), 3).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let (snapshot, cursor) =
+            db::snapshot_and_cursor(&database, db::CursorKind::Resolved, "post-checkpoint")
+                .await
+                .unwrap();
+        assert_eq!(snapshot.sequence(), 6);
+        assert_eq!(
+            db::reopen_cursor(&database, &cursor)
+                .await
+                .unwrap()
+                .baseline,
+            6
+        );
+        assert_eq!(db::status(&database).checkpoint, 2);
+        // Do not run handle destructors: recovery must rely on the acknowledged
+        // log suffix.
+        std::process::exit(77);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_suffix_and_cursor_baselines_survive_process_exit_without_close() {
+        let (directory, database) = fixture(EngineOptions::default()).await;
+        enqueue(&database, table()).await.await.unwrap().unwrap();
+        let initial = tx! { tables { data: u64 => u64 = 1 } data[1] = 10; }.unwrap();
+        db::execute(&database, initial.clone(), Default::default())
+            .await
+            .unwrap();
+        let (_, resolved) =
+            db::snapshot_and_cursor(&database, db::CursorKind::Resolved, "resolved")
+                .await
+                .unwrap();
+        let (_, logical) = db::snapshot_and_cursor(&database, db::CursorKind::Logical, "logical")
+            .await
+            .unwrap();
+        db::close(&database).await.unwrap();
+
+        let mut serial = reference(&directory, "serial");
+        engine::commit(&mut serial, &table()).unwrap();
+        engine::commit(&mut serial, &transaction(initial)).unwrap();
+        let expected = deferred_transactions()
+            .into_iter()
+            .map(|tx| {
+                let receipt = engine::commit(&mut serial, &transaction(tx)).unwrap();
+                vm::read_outcome(&storage::view(&serial), receipt.sequence)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let path = directory.path().join("db");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "database::scheduler::tests::deferred_checkpoint_crash_child",
+                "--nocapture",
+            ])
+            .env("BLOP_DEFERRED_CHECKPOINT_CRASH_DB", &path)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let exit = loop {
+            if let Some(exit) = child.try_wait().unwrap() {
+                break exit;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("deferred checkpoint child timed out");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            exit.code(),
+            Some(77),
+            "child did not reach the acknowledged crash point"
+        );
+
+        let store = storage::open(&path).unwrap();
+        assert_eq!(
+            (
+                store.manifest().checkpoint_sequence,
+                store.manifest().durable_sequence
+            ),
+            (2, 6)
+        );
+        for sequence in 3..=6 {
+            assert!(
+                vm::read_outcome(&storage::view(&store), sequence)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            rows(&store, 1, 6),
+            vec![(1_u64.to_be_bytes().to_vec(), 10_u64.to_le_bytes().to_vec())]
+        );
+        drop(store);
+        let database = db::open(&path).await.unwrap();
+        let snapshot = db::snapshot(&database).await.unwrap();
+        assert_eq!(snapshot.sequence(), 6);
+        assert_eq!(
+            db::get(&snapshot, 1, &Value::U64(1)).unwrap(),
+            Some(Value::U64(12))
+        );
+        let batch = db::read_feed(
+            &database,
+            &resolved,
+            db::Watermark::new(database.database_id(), 2).unwrap(),
+            db::BatchLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((batch.start_exclusive, batch.end_inclusive), (2, 6));
+        assert_eq!(batch.records, db::FeedRecords::Resolved(expected.clone()));
+        assert_eq!(
+            db::reopen_cursor(&database, &logical)
+                .await
+                .unwrap()
+                .baseline,
+            3
+        );
+        let batch = db::read_logical_feed(
+            &database,
+            &logical,
+            db::Watermark::new(database.database_id(), 3).unwrap(),
+            db::BatchLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((batch.start_exclusive, batch.end_inclusive), (3, 6));
+        let db::FeedRecords::Logical(records) = batch.records else {
+            unreachable!()
+        };
+        assert_eq!(
+            records.into_iter().map(|r| r.outcome).collect::<Vec<_>>(),
+            expected[1..]
+        );
+        let cursors = db::list_cursors(&database).await.unwrap();
+        assert_eq!(cursors.len(), 3);
+        let tail = cursors
+            .iter()
+            .find(|c| c.label == "post-checkpoint")
+            .unwrap();
+        assert_eq!(tail.baseline, 6);
+        let empty = db::read_feed(
+            &database,
+            &tail.token,
+            snapshot.watermark(),
+            db::BatchLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((empty.start_exclusive, empty.end_inclusive), (6, 6));
+        assert_eq!(empty.records, db::FeedRecords::Resolved(Vec::new()));
+        db::close(&database).await.unwrap();
+
+        let database = db::open(&path).await.unwrap();
+        let receipt = db::execute(
+            &database,
+            deferred_transactions()[0].clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.sequence, 7);
+        assert_eq!(value(receipt), Value::U64(13));
+        db::close(&database).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_interval_counts_visible_transactions_and_close_publishes_remainder() {
+        let increment = deferred_transactions()[0].clone();
+        for interval in [1, 4] {
+            let (directory, database) = fixture(EngineOptions {
+                checkpoint_interval: interval,
+                ..Default::default()
+            })
+            .await;
+            enqueue(&database, table()).await.await.unwrap().unwrap();
+            db::execute(
+                &database,
+                tx! { tables { data: u64 => u64 = 1 } data[1] = 10; }.unwrap(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            let old = db::snapshot(&database).await.unwrap();
+            assert_eq!(old.sequence(), 2);
+            for sequence in 2..=6 {
+                if sequence > 2 {
+                    let receipt = db::execute(&database, increment.clone(), Default::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(receipt.sequence, sequence);
+                    assert_eq!(value(receipt), Value::U64(sequence + 8));
+                }
+                let status = wait_status(&database, |s| s.visibility_frontier == sequence).await;
+                assert_eq!(status.durable_frontier, sequence);
+                assert_eq!(status.checkpoint, 1 + (sequence - 1) / interval * interval);
+                assert_eq!(
+                    db::get(&old, 1, &Value::U64(1)).unwrap(),
+                    Some(Value::U64(10))
+                );
+            }
+            db::close(&database).await.unwrap();
+            assert_eq!(db::status(&database).checkpoint, 6);
+            let store = storage::open(directory.path().join("db")).unwrap();
+            assert_eq!(store.manifest().checkpoint_sequence, 6);
+            assert_eq!(store.manifest().durable_sequence, 6);
+            assert_eq!(
+                rows(&store, 1, 6),
+                vec![(1_u64.to_be_bytes().to_vec(), 14_u64.to_le_bytes().to_vec())]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_close_checkpoint_preserves_successful_receipt_for_replay() {
+        let (directory, database) = fixture(EngineOptions::default()).await;
+        enqueue(&database, table()).await.await.unwrap().unwrap();
+        db::execute(
+            &database,
+            tx! { tables { data: u64 => u64 = 1 } data[1] = 10; }.unwrap(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let (_, cursor) = db::snapshot_and_cursor(&database, db::CursorKind::Resolved, "receipt")
+            .await
+            .unwrap();
+        let receipt = db::execute(
+            &database,
+            deferred_transactions()[0].clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.sequence, 3);
+        assert_eq!(value(receipt.clone()), Value::U64(11));
+        let snapshot = db::snapshot(&database).await.unwrap();
+        assert_eq!(snapshot.sequence(), 3);
+        let status = wait_status(&database, |s| s.visibility_frontier == 3).await;
+        assert_eq!(status.checkpoint, 1);
+        let path = directory.path().join("db");
+        let current = std::fs::read(path.join("CURRENT")).unwrap();
+        let unpublished = path.join("manifest.pending");
+        std::fs::create_dir(&unpublished).unwrap();
+        let closing = db::close(&database).await;
+        let status = db::status(&database);
+        assert!(status.closed && status.poisoned);
+        assert!(status.last_error.is_some());
+        assert_eq!(
+            (
+                status.visibility_frontier,
+                status.checkpoint,
+                status.durable_frontier
+            ),
+            (3, 1, 3)
+        );
+        assert_eq!(std::fs::read(path.join("CURRENT")).unwrap(), current);
+        assert!(snapshot.is_revoked());
+        std::fs::remove_dir(unpublished).unwrap();
+
+        let store = storage::open(&path).unwrap();
+        assert_eq!(store.manifest().checkpoint_sequence, 1);
+        assert_eq!(store.manifest().durable_sequence, 3);
+        assert!(
+            vm::read_outcome(&storage::view(&store), 3)
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        let database = db::open(&path).await.unwrap();
+        let snapshot = db::snapshot(&database).await.unwrap();
+        assert_eq!(snapshot.sequence(), 3);
+        assert_eq!(
+            db::get(&snapshot, 1, &Value::U64(1)).unwrap(),
+            Some(Value::U64(11))
+        );
+        let batch = db::read_feed(
+            &database,
+            &cursor,
+            db::Watermark::new(database.database_id(), 2).unwrap(),
+            db::BatchLimits::default(),
+        )
+        .await
+        .unwrap();
+        let db::FeedRecords::Resolved(records) = batch.records else {
+            unreachable!()
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sequence, receipt.sequence);
+        assert_eq!(records[0].outcome, receipt.outcome);
+        db::close(&database).await.unwrap();
+        assert!(
+            matches!(closing, Err(Error::Storage(storage::Error::NeedsRecovery))),
+            "failed close checkpoint must be reported to the caller"
+        );
+    }
+
     fn broad(mut command: record::Command) -> record::Command {
         let record::Command::Transaction { manifest, .. } = &mut command else {
             unreachable!()
@@ -1129,7 +1551,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_log_group_is_durable_before_dispatch_and_completions_share_a_checkpoint() {
+    async fn queued_log_group_is_durable_before_dispatch_and_receipts_replay_without_a_checkpoint()
+    {
         let directory = tempfile::tempdir().unwrap();
         let mut store = reference(&directory, "group");
         let options = EngineOptions {
@@ -1194,9 +1617,16 @@ mod tests {
             ));
         }
         let first = pool.completed.try_recv().unwrap();
-        complete(&mut store, &mut schedule, &mut pool, first).unwrap();
-        assert_eq!(store.manifest().generation, generation + 2);
-        assert_eq!(store.manifest().checkpoint_sequence, 3);
+        complete(
+            &mut store,
+            &mut schedule,
+            &mut pool,
+            first,
+            options.checkpoint_interval,
+        )
+        .unwrap();
+        assert_eq!(store.manifest().generation, generation + 1);
+        assert_eq!(store.manifest().checkpoint_sequence, 0);
         assert_eq!(schedule.frontier, 3);
         assert!(schedule.entries.is_empty());
         assert_eq!((schedule.assigned_bytes, schedule.reserved_bytes), (0, 0));
@@ -1280,7 +1710,14 @@ mod tests {
         dispatch(&store, &mut schedule, &mut pool, options.execution_window).unwrap();
         while !schedule.entries.is_empty() {
             let completion = pool.completed.recv().await.unwrap();
-            complete(&mut store, &mut schedule, &mut pool, completion).unwrap();
+            complete(
+                &mut store,
+                &mut schedule,
+                &mut pool,
+                completion,
+                options.checkpoint_interval,
+            )
+            .unwrap();
         }
         register(
             &mut store,
@@ -1301,7 +1738,14 @@ mod tests {
         assert_eq!(store.manifest().durable_sequence, 3);
         dispatch(&store, &mut schedule, &mut pool, options.execution_window).unwrap();
         let completion = pool.completed.recv().await.unwrap();
-        complete(&mut store, &mut schedule, &mut pool, completion).unwrap();
+        complete(
+            &mut store,
+            &mut schedule,
+            &mut pool,
+            completion,
+            options.checkpoint_interval,
+        )
+        .unwrap();
         let Request::Execute {
             command,
             reply,
@@ -1310,6 +1754,7 @@ mod tests {
         else {
             unreachable!()
         };
+        engine::publish_checkpoint(&mut store).unwrap();
         let receipt = engine::commit(&mut store, &command).unwrap();
         schedule.frontier = receipt.sequence;
         assert_eq!(receipt.sequence, 4);
@@ -1330,7 +1775,14 @@ mod tests {
         .unwrap();
         dispatch(&store, &mut schedule, &mut pool, options.execution_window).unwrap();
         let completion = pool.completed.recv().await.unwrap();
-        complete(&mut store, &mut schedule, &mut pool, completion).unwrap();
+        complete(
+            &mut store,
+            &mut schedule,
+            &mut pool,
+            completion,
+            options.checkpoint_interval,
+        )
+        .unwrap();
         for (receipt, sequence) in receipts.into_iter().zip([1, 3, 4, 5]) {
             assert_eq!(receipt.await.unwrap().unwrap().sequence, sequence);
         }
@@ -1537,6 +1989,7 @@ mod tests {
             workers: 3,
             execution_window: 8,
             assigned_backlog_count: 9,
+            checkpoint_interval: 3,
             ..Default::default()
         })
         .await;
@@ -1599,7 +2052,7 @@ mod tests {
             s.durable_frontier == 11 && s.resolved_above_frontier == 6
         })
         .await;
-        assert_eq!((status.visibility_frontier, status.checkpoint), (2, 2));
+        assert_eq!((status.visibility_frontier, status.checkpoint), (2, 1));
         assert_eq!(status.oldest_unresolved, Some(3));
         assert_eq!(status.dependency_waiting, 1);
         assert_eq!(status.assigned_count, 9);
@@ -2114,6 +2567,7 @@ mod tests {
         let (directory, database) = fixture(EngineOptions {
             workers: 2,
             assigned_backlog_count: 2,
+            checkpoint_interval: 1,
             ..Default::default()
         })
         .await;

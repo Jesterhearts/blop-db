@@ -49,18 +49,24 @@ views, scans, worker jobs and backups still retain the shared lease until safe r
 ## Operating Choices
 
 - Local transaction admission opportunistically groups up to 64 already queued requests within
-  existing budgets. The complete group is durable before dispatch; queued completions can share a
-  prefix checkpoint before receipts. Logical import retains individual append publication.
-  Asynchronous checkpoint writing and semantic operation coalescing are not implemented.
+  existing budgets. The complete group is durable before dispatch. Receipts require contiguous
+  visibility, not a fresh materialized checkpoint. `EngineOptions::checkpoint_interval` defaults to
+  64 newly visible records; 1 retains checkpoint-before-receipt behaviour. Checkpoints also precede
+  drained administrative barriers, maintenance and normal shutdown. Logical import retains
+  individual append publication and checkpoints before completion. Asynchronous checkpoint writing
+  and semantic operation coalescing are not implemented.
 - Live owners use bounded decoded-page and snapshot-table caches, plus incremental root and log
   validation proofs. Full recovery and low-level storage validation remain uncached. Unsupported
   transitions and bounded-index exhaustion fall back to full checks. Proofs are updated only after
   successful publication, and file handover resets them. External mutation of immutable files while
   an owner is live is unsupported; cached reads are not continuous disk scrubbing.
-- G.3 synchronization skips only unchanged files already made durable by a previous publication and
+- G.3 synchronization skips unchanged prefixes already made durable by a previous publication and
   the initial directory flush when no new referenced filenames exist. Manifest and CURRENT file
   flushes, renames and directory flushes remain ordered. Runtime fault tests exercise every actual
-  I/O boundary with old-or-new recovery checks; group tests cover publication failure and replay.
+  I/O boundary with old-or-new recovery checks. Reused runtime roots keep their published page
+  count, excluding reconstructible appended pages until roots change. Group tests cover publication
+  failure and replay; a subprocess exits after successful deferred-checkpoint receipts and above-C
+  cursor publication, then recovery verifies outcomes and both feed kinds.
 - Maintenance is explicit. There is no automatic disk-pressure policy or automatic cursor release.
   Abandoned cursors must be observed and explicitly released; protected history is never silently
   discarded.
