@@ -3,6 +3,7 @@
 use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::RwLockReadGuard;
 use std::sync::Weak;
 
 use super::Control;
@@ -28,7 +29,26 @@ pub(crate) struct Claim {
     sequence: u64,
     view: RwLock<Option<View>>,
     // One validated historical table only; schema sizes are format-bounded.
-    table: RwLock<Option<Arc<Table>>>,
+    table: RwLock<Option<Arc<ReadTable>>>,
+}
+
+struct ReadTable {
+    table: Table,
+    key_schema: encoding::Schema,
+}
+
+enum TableRead<'a> {
+    Cached(RwLockReadGuard<'a, Option<Arc<ReadTable>>>),
+    Loaded(Arc<ReadTable>),
+}
+
+impl TableRead<'_> {
+    fn table(&self) -> &Arc<ReadTable> {
+        match self {
+            Self::Cached(guard) => guard.as_ref().expect("a cached table is present"),
+            Self::Loaded(table) => table,
+        }
+    }
 }
 
 /// Clones share one revocable claim at the original sequence. Reads perform
@@ -159,43 +179,49 @@ fn revoke_claim(claim: &Claim) -> bool {
     revoked
 }
 
-fn live_table(
+fn live_table<'a>(
     view: &View,
     id: u64,
     sequence: u64,
-    cached: &RwLock<Option<Arc<Table>>>,
-) -> Result<Arc<Table>> {
-    if let Some(table) = cached
-        .read()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_ref()
-        && table.id == id
-    {
-        return Ok(table.clone());
+    cached: &'a RwLock<Option<Arc<ReadTable>>>,
+) -> Result<TableRead<'a>> {
+    let guard = cached.read().unwrap_or_else(|error| error.into_inner());
+    if guard.as_ref().is_some_and(|table| table.table.id == id) {
+        return Ok(TableRead::Cached(guard));
     }
+    drop(guard);
     let table = vm::catalogue_version(view, id, sequence)
         .map_err(Error::Read)?
         .filter(|version| version.live)
-        .map(|version| Arc::new(version.table))
+        .map(|version| version.table)
         .ok_or(Error::InvalidInput(
             "table is unknown or dropped at snapshot sequence",
         ))?;
+    let key_schema = encoding::Schema::decode(&table.key.descriptor()).map_err(Error::Storage)?;
+    let table = Arc::new(ReadTable { table, key_schema });
     *cached.write().unwrap_or_else(|error| error.into_inner()) = Some(table.clone());
-    Ok(table)
+    Ok(TableRead::Loaded(table))
 }
 
 fn key_bytes(
-    table: &Table,
+    table: &ReadTable,
     key: &Value,
 ) -> Result<Vec<u8>> {
     // Check against the stored, validated type before recursive value encoding.
-    if !table.key.accepts(key) {
+    if !table.table.key.accepts(key) {
         return Err(Error::InvalidInput(
             "key does not match captured table schema",
         ));
     }
-    let schema = encoding::Schema::decode(&table.key.descriptor()).map_err(Error::Storage)?;
-    encoding::encode_key(&schema, &key.encode()).map_err(Error::Storage)
+    let schema = &table.key_schema;
+    match key {
+        Value::Unit => encoding::encode_key(schema, &[]),
+        Value::Boolean(value) => encoding::encode_key(schema, &[u8::from(*value)]),
+        Value::U64(value) => encoding::encode_key(schema, &value.to_le_bytes()),
+        Value::I64(value) => encoding::encode_key(schema, &value.to_le_bytes()),
+        _ => encoding::encode_key(schema, &key.encode()),
+    }
+    .map_err(Error::Storage)
 }
 
 /// Read a typed key and return a typed value under the actual schema at the
@@ -213,10 +239,13 @@ pub fn get(
         .unwrap_or_else(|error| error.into_inner());
     let view = guard.as_ref().ok_or(Error::SnapshotRevoked)?;
     let table = live_table(view, table, snapshot.sequence(), &snapshot.claim.table)?;
-    let key = key_bytes(&table, key)?;
-    mvcc::get(view, table.id, &key, snapshot.sequence())
+    let table = table.table();
+    let key = key_bytes(table, key)?;
+    mvcc::read_value(view, table.table.id, &key, snapshot.sequence())
         .map_err(Error::Storage)?
-        .map(|bytes| vm::decode_value(&table.value, &bytes).map_err(super::persisted_read))
+        .map(|bytes| {
+            vm::decode_value(&table.table.value, bytes.as_bytes()).map_err(super::persisted_read)
+        })
         .transpose()
 }
 
@@ -250,7 +279,7 @@ pub fn catalogue(snapshot: &Snapshot) -> Result<Vec<CatalogueVersion>> {
 /// `Some(Err(SnapshotRevoked))` if revoked. It is deliberately not fused.
 pub struct SnapshotScan {
     snapshot: Snapshot,
-    table: Arc<Table>,
+    table: Arc<ReadTable>,
     lower: Bound<Vec<u8>>,
     upper: Bound<Vec<u8>>,
     done: bool,
@@ -272,6 +301,7 @@ pub fn scan(
         .unwrap_or_else(|error| error.into_inner());
     let view = guard.as_ref().ok_or(Error::SnapshotRevoked)?;
     let table = live_table(view, table, snapshot.sequence(), &snapshot.claim.table)?;
+    let table = table.table().clone();
     let bound = |bound| match bound {
         Bound::Unbounded => Ok(Bound::Unbounded),
         Bound::Included(key) => key_bytes(&table, key).map(Bound::Included),
@@ -317,7 +347,7 @@ impl Iterator for SnapshotScan {
         let read = || -> Result<Option<(Vec<u8>, Value, Value)>> {
             let mut rows = mvcc::scan(
                 view,
-                self.table.id,
+                self.table.table.id,
                 self.snapshot.sequence(),
                 self.lower.as_ref().map(Vec::as_slice),
                 self.upper.as_ref().map(Vec::as_slice),
@@ -326,14 +356,12 @@ impl Iterator for SnapshotScan {
             let Some((key, value)) = rows.next().transpose().map_err(Error::Storage)? else {
                 return Ok(None);
             };
-            let schema =
-                encoding::Schema::decode(&self.table.key.descriptor()).map_err(Error::Storage)?;
-            let decoded = encoding::decode_key(&schema, &key)
+            let decoded = encoding::decode_key(&self.table.key_schema, &key)
                 .map_err(|error| super::persisted_read(error.into()))?;
             let decoded =
-                vm::decode_value(&self.table.key, &decoded).map_err(super::persisted_read)?;
+                vm::decode_value(&self.table.table.key, &decoded).map_err(super::persisted_read)?;
             let value =
-                vm::decode_value(&self.table.value, &value).map_err(super::persisted_read)?;
+                vm::decode_value(&self.table.table.value, &value).map_err(super::persisted_read)?;
             Ok(Some((key, decoded, value)))
         };
         match read() {
@@ -393,8 +421,8 @@ mod tests {
             &database,
             CatalogueOperation::Create {
                 name: "other".into(),
-                key: Type::U64,
-                value: Type::I64,
+                key: Type::Bytes(4),
+                value: Type::String(8),
             },
         )
         .await
@@ -441,11 +469,35 @@ mod tests {
             rows.next().unwrap().unwrap(),
             (Value::U64(7), Value::I64(10))
         );
-        assert_eq!(get(&captured, other, &Value::U64(7)).unwrap(), None);
+        assert_eq!(get(&captured, other, &Value::Bytes(vec![7])).unwrap(), None);
         assert_eq!(
-            captured.claim.table.read().unwrap().as_ref().unwrap().id,
+            captured
+                .claim
+                .table
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .table
+                .id,
             other
         );
+        assert!(rows.next().is_none());
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let captured = &captured;
+                scope.spawn(move || {
+                    for _ in 0..64 {
+                        assert_eq!(
+                            get(captured, 1, &Value::U64(7)).unwrap(),
+                            Some(Value::I64(10))
+                        );
+                        assert_eq!(get(captured, other, &Value::Bytes(vec![7])).unwrap(), None);
+                        assert!(get(captured, other, &Value::Bytes(vec![7; 5])).is_err());
+                    }
+                });
+            }
+        });
         db::execute_catalogue(&database, CatalogueOperation::Drop { table: 1 })
             .await
             .unwrap();
@@ -474,7 +526,7 @@ mod tests {
             get(&current, 1, &Value::U64(7)),
             Err(Error::InvalidInput(_))
         ));
-        assert_eq!(get(&current, other, &Value::U64(7)).unwrap(), None);
+        assert_eq!(get(&current, other, &Value::Bytes(vec![7])).unwrap(), None);
         db::close(&reopened).await.unwrap();
     }
 

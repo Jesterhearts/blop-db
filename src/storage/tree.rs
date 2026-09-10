@@ -52,6 +52,68 @@ pub(super) fn get(
     }
 }
 
+/// Keeps the selected cell alive without copying its key or inline value.
+pub(super) struct LocatedCell {
+    node: Arc<Node>,
+    index: usize,
+}
+
+impl LocatedCell {
+    pub(super) fn cell(&self) -> &LeafCell {
+        let Node::Leaf(cells) = self.node.as_ref() else {
+            unreachable!("a located cell belongs to a leaf");
+        };
+        &cells[self.index]
+    }
+}
+
+/// Find the first cell at or above `key`. The caller keeps its view pinned
+/// while reading the cell's value, including any overflow pages.
+pub(super) fn seek(
+    reader: &PageReader,
+    tree: TreeId,
+    root: u64,
+    key: &[u8],
+) -> Result<Option<LocatedCell>> {
+    check_key(key)?;
+    if root == 0 {
+        return Ok(None);
+    }
+    let mut id = root;
+    let mut expected = None;
+    let mut successor = None;
+    loop {
+        let node = load_shared(reader, tree, id, expected)?;
+        match node.as_ref() {
+            Node::Leaf(cells) => {
+                let index = cells.partition_point(|cell| cell.key.as_slice() < key);
+                if index < cells.len() {
+                    return Ok(Some(LocatedCell { node, index }));
+                }
+                let Some((next, level)) = successor.take() else {
+                    return Ok(None);
+                };
+                id = next;
+                expected = Some(level);
+            }
+            Node::Internal {
+                level,
+                keys,
+                children,
+            } => {
+                let index = route(keys, key);
+                // Only the nearest right subtree can contain the next cell.
+                // Nodes are nonempty, so a point seek needs no ancestor stack.
+                if let Some(&next) = children.get(index + 1) {
+                    successor = Some((next, level - 1));
+                }
+                id = children[index];
+                expected = Some(level - 1);
+            }
+        }
+    }
+}
+
 struct Frame {
     node: Arc<Node>,
     next: usize,
@@ -984,6 +1046,59 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn point_seeks_match_ordered_successors_across_subtree_gaps_and_pinned_roots() {
+        let mut file = create();
+        file.enable_cache();
+        let a = leaf(&mut file, &[b"", b"a"]);
+        let c = leaf(&mut file, &[b"c", b"c\0"]);
+        let e = leaf(&mut file, &[b"e", b"f"]);
+        let h = leaf(&mut file, &[b"h", b"\xff"]);
+        let left = branch(&mut file, 1, &[b"c"], vec![a, c]);
+        let right = branch(&mut file, 1, &[b"h"], vec![e, h]);
+        let root = branch(&mut file, 2, &[b"e"], vec![left, right]);
+        let pinned = file.reader();
+        let changed = put(&mut file, TreeId::State, root, b"b", b"new").unwrap();
+        let keys: &[&[u8]] = &[
+            b"", b"\0", b"a", b"a\0", b"b", b"c", b"c\0", b"d", b"e", b"g", b"h", b"\xff",
+            b"\xff\0",
+        ];
+        for (reader, root) in [(pinned.clone(), root), (file.reader(), changed)] {
+            let expected = entries(&reader.uncached(), root);
+            for reader in [reader.uncached(), reader] {
+                for &key in keys {
+                    let actual = seek(&reader, TreeId::State, root, key)
+                        .unwrap()
+                        .map(|located| {
+                            let cell = located.cell();
+                            (
+                                cell.key.clone(),
+                                reader.value(TreeId::State, &cell.value).unwrap(),
+                            )
+                        });
+                    assert_eq!(
+                        actual.as_ref(),
+                        expected.iter().find(|(k, _)| k.as_slice() >= key)
+                    );
+                }
+            }
+        }
+        assert!(seek(&pinned, TreeId::State, 0, b"").unwrap().is_none());
+        assert!(matches!(
+            seek(&pinned, TreeId::State, changed, b"b"),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            seek(&pinned, TreeId::Outcomes, root, b"a"),
+            Err(Error::Corrupt(_))
+        ));
+        let wrong_level = branch(&mut file, 2, &[b"c"], vec![a, c]);
+        assert!(matches!(
+            seek(&file.reader(), TreeId::State, wrong_level, b"a"),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     #[test]

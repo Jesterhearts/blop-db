@@ -5,7 +5,7 @@ comparison exercises independent transactions through the public async API and c
 public snapshots. A separate, single-client buffered mode measures the reference VM. This is a
 small, reproducible workload comparison, not a general database ranking. The optimized results below
 include engine scaling changes; the comparison libraries remain development dependencies. The latest
-write optimisation results are in [Deferred Checkpoints](#deferred-checkpoints-2026-09-08).
+read optimisation results are in [Single-Client Follow-Up](#single-client-follow-up).
 
 ## Run
 
@@ -127,6 +127,190 @@ in a complete engine. These figures isolate execution/storage cost and must not 
 durable or parallel-engine throughput. Unsynchronized writes can still perform file I/O and
 encounter OS writeback. The VM and MVCC read diagnostics are not measurements of the public snapshot
 API; the MVCC diagnostic returns encoded bytes, verified against the expected encoding.
+
+## Single-Client Follow-Up
+
+This compares the point-read/worker-dispatch implementation documented below with a further
+single-client read optimisation. The baseline **already includes** those uncommitted changes; it is
+not revision `9676f05`. A separate baseline binary was built before this follow-up, so both binaries
+could run against fresh databases with the same harness and options.
+
+Changes in `src/database/snapshot.rs` and `src/storage/mvcc.rs`:
+
+- Cache the decoded key schema alongside the last resolved historical table.
+- Borrow cached table metadata during a point read instead of cloning its `Arc` on each hit.
+  Replacing that cache entry waits for in-flight cached readers; the cache still retains one table.
+- Encode primitive input values from stack bytes through the canonical key codec.
+- Identify the selected MVCC address by its exact escaped prefix, avoiding an allocated upper bound.
+- Validate a Put once and retain its immutable leaf or owned overflow buffer. Typed snapshot reads
+  decode that payload directly, avoiding the intermediate owned payload copy. Returned values still
+  own their contents.
+
+The same CPU set, filesystem, release profile and comparison libraries were used as below. Each
+trial contains 1,000 independent inserts, 1,000 updates and five million cached reads, with one
+client, one worker, discarded warm-up and three measured trials. Builds and tests ran separately.
+Full-value and checkpoint verification after reopen succeeded in every trial.
+
+```sh
+# Before changing the sources, retain a separate baseline build:
+cargo build --release --example kv_bench --target-dir /tmp/opencode/blop-single-baseline
+taskset -c 0-3 /tmp/opencode/blop-single-baseline/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 5000000 --repeats 3 --mode durable --clients 1 --workers 1
+# After the follow-up changes:
+cargo build --release --example kv_bench
+taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 5000000 --repeats 3 --mode durable --clients 1 --workers 1
+```
+
+Median blop operations/s, with read rates rounded:
+
+| Operation    |    Before |     After |
+| ------------ | --------: | --------: |
+| Insert       |     182.6 |     179.7 |
+| Update       |     155.1 |     173.4 |
+| Snapshot get | 3,374,776 | 4,499,538 |
+
+The read improvement is **1.33x**, or approximately 296 to 222 ns per completed read. These are
+inverse aggregate throughput figures, including the harness loop, not request-latency percentiles.
+Per-trial rates in trial order preserve the variation:
+
+| Operation       | Before                          | After                           |
+| --------------- | ------------------------------- | ------------------------------- |
+| Inserts/s       | 182.7, 182.6, 123.9             | 179.7, 181.6, 179.1             |
+| Updates/s       | 180.0, 155.1, 111.1             | 173.4, 177.5, 164.8             |
+| Snapshot gets/s | 3,643,162, 3,008,995, 3,374,776 | 4,543,521, 4,499,538, 4,371,044 |
+
+Write variability remains substantial, particularly in the baseline's last trial. No single-client
+durable write speedup is attributed to this change. An instrumented investigation of the five
+ordinary log-publication sync calls found roughly 1.0 to 1.3 ms per log/metadata file or database
+directory flush on this filesystem. The instrumentation included warm-up and lifecycle operations
+and was separate from the reported measurements. Early staging, data-only file sync and paired
+private-metadata flush experiments did not establish a useful, repeatable improvement; none of those
+experiments is included in the production changes. Larger write gains require investigating a
+publication protocol with fewer serial durability steps.
+
+A separate one-trial, four-client/one-worker check with the same key/read counts reached 7,096,978
+snapshot gets/s before and 7,685,552 after, about 1.08x. Inserts were 316.0/s before and 303.9/s
+after; updates were 310.9/s and 306.4/s. This is a scaling check, not a median. Use
+`--clients 4 --repeats 1` with the commands above to reproduce it.
+
+Regression coverage includes concurrent cache replacement between tables with different key schemas,
+bound rejection, historical scans, revocation, close/reopen and retained value bytes that survive
+page-tail truncation without pinning directory ownership. The complete workspace tests, all-target
+Clippy check and nightly formatting check passed. Cold data, mixed reads/writes and large-value
+performance remain outside these measurements.
+
+## Point Reads and Worker Dispatch: 2026-09-09
+
+This follow-up compares `9676f05` with direct MVCC point seeks, in-place key framing and earlier
+dispatch of already durable work. The harness, release profile, CPU set 0 through 3, filesystem,
+comparison libraries and default engine settings are unchanged. The main runs use 1,000 inserts,
+1,000 updates and **five million cached reads** per fresh database, with three measured trials and
+discarded warm-up. Builds, tests and measured workloads ran separately.
+
+A separate `perf record` run of the baseline, with four clients and four workers, identified point
+read costs in tree scan construction/destruction, key escaping, allocation, shared-node lookup and
+snapshot/table locking. That profile includes all three engines and setup/recovery; it is not a
+blop-only percentage breakdown. Source inspection also found the coordinator registering a prepared
+submission before dispatching existing durable work to idle workers.
+
+The changes are:
+
+- `src/storage/tree.rs`: a point seek retains just the selected leaf and the nearest right-subtree
+  reference. It avoids the range iterator, ancestor allocation and copied scan bounds/keys.
+- `src/storage/mvcc.rs`: compare the selected physical key with the already encoded address and
+  validate its sequence directly. Validate inline value framing through borrowed page bytes, then
+  return the owned payload. Overflow values still use the checked overflow reader.
+- `src/storage/encoding.rs`: append escaped bytes into the destination buffer with reserved
+  capacity, rather than constructing a separate frame and growing multiple buffers.
+- `src/database/scheduler.rs`: dispatch ready, already durable transactions before preparing and
+  publishing later submissions. Filesystem publication can then overlap worker execution instead of
+  leaving available workers idle. Dependencies, execution windows, admission budgets and observed
+  worker-failure priority still apply.
+
+There are no new cache budgets, dependencies, public APIs or file-format changes. Receipts still
+require durable logging and contiguous visibility; checkpoint and file/directory flush rules remain
+the same. Point reads still check pinned page prefixes, tree identity, child levels, state framing,
+historical table schemas and revocation.
+
+Run each configuration on the baseline and changed sources:
+
+```sh
+cargo build --release --example kv_bench
+taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 5000000 --repeats 3 --mode durable --clients 1 --workers 1
+taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 5000000 --repeats 3 --mode durable --clients 4 --workers 1
+taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 5000000 --repeats 3 --mode durable --clients 16 --workers 4
+```
+
+Median blop operations/s from those runs, with read rates rounded:
+
+| Clients | Workers | Operation    |    Before |     After | After / Before |
+| ------: | ------: | ------------ | --------: | --------: | -------------: |
+|       1 |       1 | Insert       |     180.9 |     138.3 |          0.76x |
+|       1 |       1 | Update       |     176.4 |     113.7 |          0.64x |
+|       1 |       1 | Snapshot get | 1,931,053 | 3,158,701 |          1.64x |
+|       4 |       1 | Insert       |     166.5 |     314.9 |          1.89x |
+|       4 |       1 | Update       |     169.4 |     302.2 |          1.78x |
+|       4 |       1 | Snapshot get | 5,082,348 | 7,368,257 |          1.45x |
+|      16 |       4 | Insert       |     970.7 |     971.8 |          1.00x |
+|      16 |       4 | Update       |     879.9 |     841.3 |          0.96x |
+|      16 |       4 | Snapshot get | 5,149,760 | 7,177,934 |          1.39x |
+
+Per-trial blop rates in trial order, with reads expressed in millions/s:
+
+| Clients / Workers | Operation | Before               | After                |
+| ----------------- | --------- | -------------------- | -------------------- |
+| 1 / 1             | Insert    | 180.9, 181.4, 166.3  | 138.3, 171.1, 121.8  |
+| 1 / 1             | Update    | 173.1, 176.4, 178.9  | 72.6, 173.2, 113.7   |
+| 1 / 1             | Get       | 1.950, 1.931, 1.667  | 3.532, 3.159, 2.992  |
+| 4 / 1             | Insert    | 166.5, 156.3, 170.5  | 321.0, 298.4, 314.9  |
+| 4 / 1             | Update    | 169.4, 169.7, 162.3  | 302.2, 325.7, 268.5  |
+| 4 / 1             | Get       | 4.605, 5.112, 5.082  | 6.998, 7.742, 7.368  |
+| 16 / 4            | Insert    | 831.3, 1041.0, 970.7 | 870.6, 1020.0, 971.8 |
+| 16 / 4            | Update    | 879.9, 814.7, 912.4  | 841.3, 895.2, 834.6  |
+| 16 / 4            | Get       | 5.150, 5.146, 5.245  | 7.018, 7.508, 7.178  |
+
+The four-client/one-worker write gain and cached-read gains repeat across these trials. The
+16-client write results overlap the baseline range and do not establish a throughput improvement.
+Read scaling still encounters shared snapshot/table locks and the decoded-node cache; these changes
+remove allocation and copying rather than all contention.
+
+The single-client write medians were substantially worse in the initial after-run. Comparison-engine
+timings also varied: redb insert rates were 732 to 1239/s before and 794 to 889/s after; SQLite
+inserts were 651 to 958/s before and 547 to 944/s after. To investigate, separate baseline and
+changed binaries were run with the same arguments and `--repeats 1`, first baseline/changed and then
+changed/baseline:
+
+| Run order | Revision | Inserts/s | Updates/s | Snapshot gets/s |
+| --------: | -------- | --------: | --------: | --------------: |
+|         1 | Baseline |     181.3 |     168.4 |       1,675,769 |
+|         2 | Changed  |     117.2 |     149.9 |       3,525,125 |
+|         3 | Changed  |     177.6 |     176.6 |       3,367,589 |
+|         4 | Baseline |     168.2 |     169.4 |       2,000,878 |
+
+Those checks do not reproduce a consistent single-client write regression or gain. All original
+trials are retained above; workstation I/O variation limits attribution. One outstanding request
+cannot benefit from dispatch/publication overlap with other requests, and its five ordinary log
+publication sync calls remain. No single-client write speedup is claimed.
+
+A separate, one-trial comparison with 10,000 keys and five million reads used 16 clients and four
+workers. It completed full-value reopen checks in both revisions:
+
+| Operation       |    Before |     After |
+| --------------- | --------: | --------: |
+| Inserts/s       |     845.8 |     848.6 |
+| Updates/s       |     727.9 |     789.9 |
+| Snapshot gets/s | 3,603,813 | 6,009,632 |
+
+Use the last command above with `--keys 10000 --repeats 1` for that larger run. Its 1.67x read gain
+is a single observation, not a median. It does not establish cold-I/O, mixed-workload or latency
+behaviour. All measured trials verified final values and checkpoints after reopen and completed
+temporary-directory cleanup.
+
+New regressions compare point seeks with ordered successors across leaf and internal-subtree gaps
+and pinned roots, and compare MVCC point results with snapshot scans across historical versions,
+tombstones, key extensions, maximum-size keys and overflow values. Malformed matching frames,
+unrelated invalid values, wrong tree identities, out-of-prefix roots and incorrect child levels are
+also covered. The complete workspace tests, nightly formatting check and all-target Clippy check
+passed, including the existing scheduler, crash/replay, revocation and publication-fault tests.
 
 ## Deferred Checkpoints: 2026-09-08
 

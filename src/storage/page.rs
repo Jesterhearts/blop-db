@@ -2,6 +2,7 @@
 
 mod cache;
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io;
@@ -289,8 +290,16 @@ impl PageReader {
         tree: TreeId,
         value: &Value,
     ) -> Result<Vec<u8>> {
+        self.value_bytes(tree, value).map(Cow::into_owned)
+    }
+
+    pub(super) fn value_bytes<'a>(
+        &self,
+        tree: TreeId,
+        value: &'a Value,
+    ) -> Result<Cow<'a, [u8]>> {
         match value {
-            Value::Inline(bytes) => Ok(bytes.clone()),
+            Value::Inline(bytes) => Ok(Cow::Borrowed(bytes)),
             Value::Overflow { len, head } => {
                 let mut output = Vec::with_capacity(*len);
                 walk_overflow(
@@ -301,7 +310,7 @@ impl PageReader {
                     &mut HashSet::new(),
                     Some(&mut output),
                 )?;
-                Ok(output)
+                Ok(Cow::Owned(output))
             }
         }
     }

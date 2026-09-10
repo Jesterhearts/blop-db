@@ -670,6 +670,17 @@ pub(super) fn run(
             break;
         }
         let mut progress = false;
+        // Keep already durable work running while the coordinator prepares and
+        // publishes later submissions. Publication can block on filesystem I/O.
+        match dispatch(&store, &mut schedule, &mut pool, options.execution_window) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                last_error = Some(error.to_string());
+                failed = true;
+                break;
+            }
+        }
         if pending_maintenance.is_none()
             && let Some(pending) = &head
         {
@@ -720,14 +731,6 @@ pub(super) fn run(
                     break;
                 }
                 progress = true;
-            }
-        }
-        match dispatch(&store, &mut schedule, &mut pool, options.execution_window) {
-            Ok(dispatched) => progress |= dispatched,
-            Err(error) => {
-                last_error = Some(error.to_string());
-                failed = true;
-                break;
             }
         }
         if progress {

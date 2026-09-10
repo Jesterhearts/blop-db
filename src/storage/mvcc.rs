@@ -5,6 +5,7 @@
 //! validate canonical keys and schema values against the table schema. These
 //! primitives neither enforce a published frontier nor merge a write overlay.
 
+use std::borrow::Cow;
 use std::ops::Bound;
 
 use super::Entry;
@@ -15,7 +16,7 @@ use super::TreeId;
 use super::View;
 use super::encoding::MAX_KEY_BYTES;
 use super::encoding::MAX_VALUE_BYTES;
-use super::encoding::escape;
+use super::encoding::escape_into;
 use super::encoding::unescape;
 
 const MAX_STATE_KEY_BYTES: usize = 8 + 2 * MAX_KEY_BYTES + 2 + 8;
@@ -146,8 +147,9 @@ fn address_prefix(
     table_id: u64,
     key: &[u8],
 ) -> Vec<u8> {
-    let mut prefix = table_id.to_be_bytes().to_vec();
-    prefix.extend_from_slice(&escape(key));
+    let mut prefix = Vec::with_capacity(18 + 2 * key.len());
+    prefix.extend_from_slice(&table_id.to_be_bytes());
+    escape_into(key, &mut prefix);
     prefix
 }
 
@@ -191,28 +193,79 @@ pub fn get(
     key: &[u8],
     sequence: u64,
 ) -> Result<Option<Vec<u8>>> {
+    Ok(read_value(view, table, key, sequence)?.map(|value| value.as_bytes().to_vec()))
+}
+
+/// A validated Put payload. Inline bytes retain their immutable leaf; overflow
+/// bytes are owned. Neither variant retains a file handle or directory lease.
+pub(crate) struct ReadValue(ReadSource);
+
+enum ReadSource {
+    Inline(super::tree::LocatedCell),
+    Overflow(Vec<u8>),
+}
+
+impl ReadValue {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        let encoded = match &self.0 {
+            ReadSource::Inline(located) => {
+                let super::page::Value::Inline(bytes) = &located.cell().value else {
+                    unreachable!("inline reads retain an inline cell");
+                };
+                bytes
+            }
+            ReadSource::Overflow(bytes) => bytes,
+        };
+        &encoded[5..]
+    }
+}
+
+pub(crate) fn read_value(
+    view: &View,
+    table: u64,
+    key: &[u8],
+    sequence: u64,
+) -> Result<Option<ReadValue>> {
     check_snapshot(table, sequence)?;
     check_key(key)?;
     let lower = seek_key(table, key, sequence);
-    let upper = after_key(table, key);
-    let mut physical = super::scan(
-        view,
+    let prefix_len = lower.len() - 8;
+    let Some(located) = super::tree::seek(
+        &view.reader,
         TreeId::State,
-        Bound::Included(&lower),
-        Bound::Excluded(&upper),
-    )?;
-    let Some((encoded_key, encoded_value)) = physical.next().transpose()? else {
+        view.roots[TreeId::State.index()],
+        &lower,
+    )?
+    else {
         return Ok(None);
     };
-    let state_key = StateKey::decode(&encoded_key).map_err(corrupt_input)?;
-    if state_key.table_id != table || state_key.key != key || state_key.sequence > sequence {
+    let cell = located.cell();
+    // For a candidate at or above the seek bound, this exact prefix test is
+    // equivalent to the exclusive upper bound ending in 00 01. It also checks
+    // the canonical address without decoding or allocating another key.
+    if !cell.key.starts_with(&lower[..prefix_len]) {
+        return Ok(None);
+    }
+    if cell.key.len() != lower.len() {
         return Err(Error::Corrupt(
             "state seeker returned an unexpected address",
         ));
     }
-    Ok(value_payload(&encoded_value)
+    let stored_sequence = !u64::from_be_bytes(cell.key[prefix_len..].try_into().unwrap());
+    if stored_sequence <= table || stored_sequence > sequence {
+        return Err(Error::Corrupt("invalid state seeker sequence"));
+    }
+    let encoded_value = view.reader.value_bytes(TreeId::State, &cell.value)?;
+    if value_payload(&encoded_value)
         .map_err(corrupt_input)?
-        .map(<[u8]>::to_vec))
+        .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(ReadValue(match encoded_value {
+        Cow::Borrowed(_) => ReadSource::Inline(located),
+        Cow::Owned(bytes) => ReadSource::Overflow(bytes),
+    })))
 }
 
 /// A lazy scan of logical `(canonical_key, schema_encoded_value)` entries.
@@ -595,6 +648,116 @@ mod tests {
         .unwrap();
         assert!(obsolete.next().unwrap().is_ok());
         assert!(matches!(obsolete.next(), Some(Err(Error::Corrupt(_)))));
+    }
+
+    #[test]
+    fn read_values_own_their_bytes_without_pinning_files_or_directory_ownership() {
+        let (directory, mut store) = create_store();
+        super::super::enable_runtime_cache(&mut store);
+        apply(
+            &mut store,
+            &[
+                mutation(1, b"inline", 2, StateValue::Put(vec![7; 128])),
+                mutation(1, b"overflow", 2, StateValue::Put(vec![9; 4096])),
+                mutation(1, b"empty", 2, StateValue::Put(vec![])),
+                mutation(1, b"deleted", 2, StateValue::Delete),
+            ],
+        )
+        .unwrap();
+        let pinned = view(&store);
+        let inline = read_value(&pinned, 1, b"inline", 2).unwrap().unwrap();
+        let overflow = read_value(&pinned, 1, b"overflow", 2).unwrap().unwrap();
+        let empty = read_value(&pinned, 1, b"empty", 2).unwrap().unwrap();
+        assert!(read_value(&pinned, 1, b"deleted", 2).unwrap().is_none());
+        let path = store.directory().to_owned();
+        drop(pinned);
+        drop(store);
+        // Recovery can truncate the uncheckpointed page suffix while returned
+        // bytes remain readable. A hidden storage lease would prevent reopen.
+        let reopened = super::super::open(path).unwrap();
+        assert_eq!(inline.as_bytes(), &[7; 128]);
+        assert_eq!(overflow.as_bytes(), &[9; 4096]);
+        assert!(empty.as_bytes().is_empty());
+        drop(reopened);
+        drop(directory);
+    }
+
+    #[test]
+    fn point_reads_match_snapshot_scans_for_versions_key_extensions_and_overflow() {
+        let (_directory, mut store) = create_store();
+        super::super::enable_runtime_cache(&mut store);
+        let keys: Vec<Vec<u8>> = std::iter::once(Vec::new())
+            .chain((0..80).map(|n| vec![n, 0, n]))
+            .chain([vec![0], vec![0, 0], vec![0xff], vec![0; MAX_KEY_BYTES]])
+            .collect();
+        let mut changes = Vec::new();
+        for table in [1, 2] {
+            for (index, key) in keys.iter().enumerate() {
+                for sequence in [9, 3, 6] {
+                    let value = if sequence == 6 && index % 2 == 0 {
+                        StateValue::Delete
+                    } else {
+                        StateValue::Put(vec![
+                            sequence as u8;
+                            if index % 3 == 0 { 2048 } else { index }
+                        ])
+                    };
+                    changes.push(mutation(table, key, sequence, value));
+                }
+            }
+        }
+        apply(&mut store, &changes).unwrap();
+        let pinned = view(&store);
+        for table in [1, 2, 3] {
+            for sequence in [0, 2, 3, 5, 6, 8, 9, u64::MAX - 1] {
+                let expected: std::collections::BTreeMap<_, _> =
+                    scan(&pinned, table, sequence, Bound::Unbounded, Bound::Unbounded)
+                        .unwrap()
+                        .collect::<Result<_>>()
+                        .unwrap();
+                for key in keys.iter().chain([&vec![0, 1], &vec![0xff, 0]]) {
+                    assert_eq!(
+                        get(&pinned, table, key, sequence).unwrap().as_ref(),
+                        expected.get(key)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn point_reads_reject_malformed_matching_frames_without_loading_unrelated_values() {
+        for suffix in [vec![], vec![0xff; 7], vec![0xff; 9]] {
+            let (_directory, mut store) = create_store();
+            let mut key = address_prefix(1, b"a");
+            key.extend_from_slice(&suffix);
+            apply(
+                &mut store,
+                &[Mutation {
+                    tree: TreeId::State,
+                    key,
+                    value: Some(vec![0]),
+                }],
+            )
+            .unwrap();
+            // A short prefix sorts before the seek bound, so it is not a
+            // candidate. Other malformed suffixes inside the interval fail.
+            let result = get(&view(&store), 1, b"a", u64::MAX - 1);
+            if !suffix.is_empty() {
+                assert!(matches!(result, Err(Error::Corrupt(_))));
+            } else {
+                assert_eq!(result.unwrap(), None);
+            }
+        }
+        let (_directory, mut store) = create_store();
+        let mut invalid = mutation(1, b"a\0", 3, StateValue::Delete);
+        invalid.value = Some(vec![2]);
+        apply(&mut store, &[invalid]).unwrap();
+        assert_eq!(get(&view(&store), 1, b"a", 5).unwrap(), None);
+        assert!(matches!(
+            get(&view(&store), 1, b"a\0", 5),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     #[test]

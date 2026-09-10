@@ -218,7 +218,7 @@ fn read_value(
                 return Err(Error::InvalidInput("invalid UTF-8 string"));
             }
             if let Some(key) = key {
-                key.extend_from_slice(&escape(bytes));
+                escape_into(bytes, key);
             }
         }
         TypeNode::Tuple(fields) => {
@@ -292,8 +292,11 @@ fn read_key(
     Ok(())
 }
 
-pub(crate) fn escape(bytes: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::new();
+pub(crate) fn escape_into(
+    bytes: &[u8],
+    encoded: &mut Vec<u8>,
+) {
+    encoded.reserve(2 * bytes.len() + 2);
     for &byte in bytes {
         encoded.push(byte);
         if byte == 0 {
@@ -301,7 +304,6 @@ pub(crate) fn escape(bytes: &[u8]) -> Vec<u8> {
         }
     }
     encoded.extend_from_slice(&[0, 0]);
-    encoded
 }
 
 /// Decode one Escape frame. Callers bound the enclosing key before decoding.
@@ -325,6 +327,12 @@ pub(crate) fn unescape(encoded: &[u8]) -> Result<(Vec<u8>, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn escape(bytes: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        escape_into(bytes, &mut encoded);
+        encoded
+    }
 
     fn schema(node: &[u8]) -> Schema {
         Schema::decode(&[&[1, 0], node].concat()).unwrap()

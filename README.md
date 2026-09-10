@@ -185,8 +185,11 @@ After full startup recovery, the live owner enables a 64 MiB decoded-node cache 
 descriptor. Cached nodes are immutable and shared across worker and snapshot views; hits still check
 the requesting view's pinned prefix. Cache retention is bounded, but active readers and older file
 descriptors pinned across compaction can retain additional memory. Overflow values are not cached.
-Each snapshot claim also caches its last successfully resolved historical table, releasing it on
-revocation. Low-level reference stores remain uncached.
+Each snapshot claim also caches its last successfully resolved historical table and decoded key
+schema, releasing the cache on revocation. Point reads borrow cached metadata under its read guard
+and decode inline values directly from retained leaf bytes. Cache replacement waits for those
+in-flight reads; a scan retains its own shared table metadata. Low-level reference stores remain
+uncached.
 
 Live publications reuse proofs for already validated immutable roots and log prefixes. New physical
 edits validate system key/value framing before inheriting root proofs; invalid edits force full
