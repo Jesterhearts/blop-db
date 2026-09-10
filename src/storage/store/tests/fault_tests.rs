@@ -123,7 +123,8 @@ fn every_publication_boundary_selects_exactly_one_complete_checkpoint() {
             drop(checkpoint);
             drop(store);
             let reopened = open(&path).unwrap();
-            assert_eq!(reopened.manifest, expected);
+            assert_eq!(reopened.selected, expected);
+            assert_eq!(reopened.manifest.durable_sequence, 3);
             assert_eq!(contents(&view(&reopened)), expected_contents);
             drop(reopened);
             // Neither an intact older manifest nor a plausible marker may
@@ -137,7 +138,7 @@ fn every_publication_boundary_selects_exactly_one_complete_checkpoint() {
 }
 
 #[test]
-fn partial_pending_metadata_and_unflushed_tails_are_not_authority() {
+fn pending_metadata_does_not_select_checkpoint_and_short_tails_are_trimmed() {
     for extend in [false, true] {
         let (_directory, store, next) = publication_fixture(extend);
         let path = store.directory.clone();
@@ -159,7 +160,8 @@ fn partial_pending_metadata_and_unflushed_tails_are_not_authority() {
             .unwrap()
             .write_all(b"partial page")
             .unwrap();
-        let log = path.join("log-00000000000000000001.bin");
+        let active = next.segments.last().unwrap();
+        let log = path.join(format!("log-{:020}.bin", active.segment_id));
         OpenOptions::new()
             .append(true)
             .open(&log)
@@ -168,28 +170,27 @@ fn partial_pending_metadata_and_unflushed_tails_are_not_authority() {
             .unwrap();
         drop(store);
         let reopened = open(&path).unwrap();
-        assert_eq!(reopened.manifest, old);
+        assert_eq!(reopened.selected, old);
+        assert_eq!(reopened.manifest.durable_sequence, 3);
         assert_eq!(contents(&view(&reopened)), expected);
         assert_eq!(fs::metadata(&pages).unwrap().len(), old.page_count * 16_384);
-        assert_eq!(
-            fs::metadata(&log).unwrap().len(),
-            old.segments[0].committed_bytes
-        );
+        assert_eq!(fs::metadata(&log).unwrap().len(), active.committed_bytes);
         drop(reopened);
         // Short selected files are committed corruption, not discarded tails.
-        for selected in [&pages, &log] {
+        let selected_log = path.join("log-00000000000000000001.bin");
+        for (selected, committed) in [
+            (&pages, old.page_count * 16_384),
+            (&selected_log, old.segments[0].committed_bytes),
+        ] {
             let original = fs::read(selected).unwrap();
             OpenOptions::new()
                 .write(true)
                 .open(selected)
                 .unwrap()
-                .set_len(original.len() as u64 - 1)
+                .set_len(committed - 1)
                 .unwrap();
             assert!(matches!(open(&path), Err(Error::Corrupt(_))));
-            assert_eq!(
-                fs::metadata(selected).unwrap().len(),
-                original.len() as u64 - 1
-            );
+            assert_eq!(fs::metadata(selected).unwrap().len(), committed - 1);
             fs::write(selected, original).unwrap();
         }
     }

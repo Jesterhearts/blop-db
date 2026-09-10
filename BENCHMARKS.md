@@ -5,7 +5,7 @@ comparison exercises independent transactions through the public async API and c
 public snapshots. A separate, single-client buffered mode measures the reference VM. This is a
 small, reproducible workload comparison, not a general database ranking. The optimized results below
 include engine scaling changes; the comparison libraries remain development dependencies. The latest
-read optimisation results are in [Single-Client Follow-Up](#single-client-follow-up).
+write optimisation results are in [Version-1 WAL Publication](#version-1-wal-publication).
 
 ## Run
 
@@ -127,6 +127,69 @@ in a complete engine. These figures isolate execution/storage cost and must not 
 durable or parallel-engine throughput. Unsynchronized writes can still perform file I/O and
 encounter OS writeback. The VM and MVCC read diagnostics are not measurements of the public snapshot
 API; the MVCC diagnostic returns encoded bytes, verified against the expected encoding.
+
+## Version-1 WAL Publication
+
+This compares optimisation commit `243b001` with the version-1 WAL publication protocol. The
+baseline already includes all point-read and dispatch improvements documented below. Both revisions
+use the unchanged harness, standard release profile, CPU set 0 through 3, filesystem and comparison
+libraries. Each fresh database has 1,000 inserts, 1,000 updates and five million cached reads, with
+three measured trials and discarded warm-up. Builds, tests and measured workloads ran separately.
+
+The storage format uses version-1 headers and self-committing WAL groups. An ordinary append to an
+existing log segment requests **one file flush instead of five file/directory flushes**. New segment
+creation adds a directory flush. Checkpoints retain the existing publication ordering and default
+64-record interval. Receipts still require complete installation and contiguous visibility after
+durable logging. The final partial checkpoint remains in close, outside timing. Group framing adds
+168 bytes per group, without changing canonical transaction or outcome bytes.
+
+Run these commands on `243b001`, then rebuild and repeat on the WAL sources:
+
+```sh
+cargo build --release --example kv_bench
+taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 5000000 --repeats 3 --mode durable --clients 1 --workers 1
+taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 5000000 --repeats 3 --mode durable --clients 16 --workers 4
+```
+
+Median blop operations/s, with read rates rounded:
+
+| Clients | Workers | Operation    |    Before |     After | After / Before |
+| ------: | ------: | ------------ | --------: | --------: | -------------: |
+|       1 |       1 | Insert       |     184.0 |     807.2 |          4.39x |
+|       1 |       1 | Update       |     181.3 |     786.4 |          4.34x |
+|       1 |       1 | Snapshot get | 4,715,682 | 4,700,292 |          1.00x |
+|      16 |       4 | Insert       |    1070.8 |    3063.3 |          2.86x |
+|      16 |       4 | Update       |    1017.1 |    2789.1 |          2.74x |
+|      16 |       4 | Snapshot get | 7,915,277 | 7,900,016 |          1.00x |
+
+Per-trial write rates, in trial order:
+
+| Clients / Workers | Operation | Before                 | After                  |
+| ----------------- | --------- | ---------------------- | ---------------------- |
+| 1 / 1             | Insert    | 184.4, 183.3, 184.0    | 807.2, 806.7, 807.2    |
+| 1 / 1             | Update    | 181.1, 182.3, 181.3    | 798.1, 786.4, 786.0    |
+| 16 / 4            | Insert    | 1046.3, 1072.4, 1070.8 | 3114.6, 3000.7, 3063.3 |
+| 16 / 4            | Update    | 930.6, 1017.1, 1020.0  | 2928.9, 2680.6, 2789.1 |
+
+Cached reads were effectively flat. Single-client reads ranged from 4.706 to 4.765 million/s before
+and 4.636 to 4.744 million/s after; 16-client reads ranged from 7.846 to 8.030 million/s before and
+7.721 to 8.016 million/s after. These results are workstation throughput measurements for
+independent one-key transactions, not latency percentiles or a general database ranking.
+
+Every measured trial completed full-value and checkpoint verification after reopen. Separate tests
+assert the actual flush count, recovery of complete groups after failed flushes, rejection of
+complete damaged groups, every physically short group prefix, native process exit at append
+boundaries, strict version and group-bound checks, and checkpoint/backup/replication behaviour. See
+[DESIGN.md, appendix I](DESIGN.md#appendix-i-wal-commit-groups) for the tail-recovery contract.
+
+A larger verification run also completed with 10,000 inserts, 10,000 updates and five million cached
+reads, using 16 clients and four workers. It reached 2,527.6 inserts/s, 2,061.1 updates/s and
+7,134,243 snapshot gets/s, with successful reopen verification. This was one trial, not a matched
+larger-dataset speedup comparison:
+
+```sh
+taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 10000 --reads 5000000 --repeats 1 --mode durable --clients 16 --workers 4
+```
 
 ## Single-Client Follow-Up
 

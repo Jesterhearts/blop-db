@@ -2,7 +2,7 @@
 
 This document maps the implemented engine to [DESIGN.md](DESIGN.md). It records implementation and
 test coverage, not a certification of every filesystem, hardware failure mode or possible execution.
-The design remains the authority for transaction semantics and version 1 bytes.
+The design remains the authority for transaction semantics and version-1 storage bytes.
 
 ## Implementation Map
 
@@ -23,6 +23,12 @@ The design remains the authority for transaction semantics and version 1 bytes.
 
 ## Verification Commands
 
+Version-1 WAL publication is specified in DESIGN appendix I and implemented in `src/storage/wal.rs`,
+`src/storage/store/wal.rs` and the CURRENT codec. It has one file flush per ordinary WAL group,
+linked-tail discovery and recovery flushing before replay. The engine, cursor/logical readers,
+backup capture and maintenance share one framed segment format. Canonical record and exchange bytes
+remain covered by their original tests.
+
 ```sh
 cargo test --workspace
 cargo +nightly fmt --all -- --check
@@ -41,6 +47,12 @@ The storage fault matrix covers before and after file flushes, directory flushes
 both new and extended segment publication, plus partial writes, incomplete metadata and
 committed-prefix truncation. Import and derived-consumer subprocess tests exit without cleanup at
 selected protocol boundaries. All fixtures use disposable directories.
+
+The WAL matrix additionally injects errors and partial writes before/after every group append I/O
+boundary, exits native child processes at each append boundary, truncates a group at every byte
+position, rejects complete damaged groups and forks, and verifies strict version and group bounds.
+Recovery tests include a checkpoint inside a group and backups with live D beyond the selected
+manifest.
 
 The directory lease explicitly unlocks when its final registered owner retires. This prevents a file
 descriptor briefly inherited during subprocess creation from extending the lock beyond close. Actual
@@ -67,6 +79,14 @@ views, scans, worker jobs and backups still retain the shared lease until safe r
   count, excluding reconstructible appended pages until roots change. Group tests cover publication
   failure and replay; a subprocess exits after successful deferred-checkpoint receipts and above-C
   cursor publication, then recovery verifies outcomes and both feed kinds.
+- Version-1 WAL append updates live D after one segment flush, plus a directory flush for a newly
+  created segment; CURRENT advances on checkpoints and storage metadata publication. Creation and
+  opening share one protocol. Full-sized malformed groups fail closed. Only physically short
+  terminal appends are discarded, so some full-length torn writes require explicit repair. Loss or
+  physical truncation of an uncheckpointed suffix caused by later damage cannot be distinguished
+  from an interrupted append.
+- Physical backup synthesizes destination metadata for its pinned live D and selected C. It copies
+  exact complete-group log bounds and preserves all cursor metadata captured at that point.
 - Maintenance is explicit. There is no automatic disk-pressure policy or automatic cursor release.
   Abandoned cursors must be observed and explicitly released; protected history is never silently
   discarded.

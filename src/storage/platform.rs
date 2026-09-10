@@ -241,6 +241,7 @@ pub(crate) mod faults {
     pub(crate) enum Failure {
         Error,
         PartialWrite,
+        Exit,
     }
 
     struct State {
@@ -303,6 +304,7 @@ pub(crate) mod faults {
             state.trace.push(Event(operation, phase));
             match state.failure {
                 Some((target, failure)) if target == index => match failure {
+                    Failure::Exit => std::process::exit(77),
                     Failure::PartialWrite if partial => Ok(true),
                     _ => Err(error()),
                 },

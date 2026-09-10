@@ -41,7 +41,7 @@ pub(crate) fn capture(store: &Store) -> Result<Image> {
     let current = store::read_bounded(&directory.join("CURRENT"), 64)?;
     let pointer = super::Current::decode(&current)?;
     if genesis != store.genesis().encode()?
-        || selected != manifest.encode()?
+        || selected != store.selected_manifest().encode()?
         || pointer.generation != manifest.generation
         || pointer.digest != <[u8; 32]>::from(Sha256::digest(&selected))
     {
@@ -49,6 +49,16 @@ pub(crate) fn capture(store: &Store) -> Result<Image> {
             "backup metadata differs from pinned publication",
         ));
     }
+    // A WAL owner can advance D without a CURRENT publication. Freeze its
+    // proven prefix into destination metadata while preserving the selected
+    // checkpoint roots, rather than copying a moving source tail.
+    let selected = manifest.encode()?;
+    let current = super::Current {
+        generation: manifest.generation,
+        digest: Sha256::digest(&selected).into(),
+    }
+    .encode()?
+    .to_vec();
     Ok(Image {
         manifest,
         genesis,

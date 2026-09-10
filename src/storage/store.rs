@@ -1,3 +1,5 @@
+pub(crate) mod wal;
+
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::TryLockError;
@@ -62,6 +64,7 @@ pub struct Store {
     pub(super) pages: PageFile,
     genesis: Genesis,
     manifest: Manifest,
+    selected: Manifest,
     roots: [u64; 5],
     poisoned: bool,
     pub(crate) rotate_next: bool,
@@ -72,6 +75,12 @@ pub struct Store {
 }
 
 impl Store {
+    pub(crate) fn selected_manifest(&self) -> &Manifest {
+        &self.selected
+    }
+
+    /// Latest durable log bounds with the selected checkpoint and retention
+    /// metadata. Under WAL publication, D can exceed the on-disk manifest's D.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
@@ -194,6 +203,7 @@ pub fn create(
         pages,
         genesis,
         roots: manifest.roots,
+        selected: manifest.clone(),
         manifest,
         poisoned: false,
         rotate_next: false,
@@ -210,9 +220,10 @@ pub fn create(
 /// Restore exactly the CURRENT-selected checkpoint and validate its reachable
 /// physical storage.
 ///
-/// Extra files are not alternative authorities. Unpublished page and active-log
-/// tails are truncated only after validation. Committed corruption never
-/// triggers checkpoint fallback. This does not replay `(checkpoint_sequence,
+/// Discovers and flushes complete, linked WAL groups beyond the selected log
+/// bounds before returning the recovered durable frontier.
+/// Physically short terminal appends are trimmed after validation; complete
+/// malformed groups are errors. This does not replay `(checkpoint_sequence,
 /// durable_sequence]`; the engine must do that before serving public reads or
 /// resuming transaction execution.
 pub fn open(path: impl AsRef<Path>) -> Result<Store> {
@@ -237,7 +248,7 @@ pub(super) fn open_directory(
     if <[u8; 32]>::from(Sha256::digest(&bytes)) != current.digest {
         return Err(Error::Corrupt("selected manifest digest mismatch"));
     }
-    let manifest = Manifest::decode(&bytes)?;
+    let mut manifest = Manifest::decode(&bytes)?;
     if manifest.generation != current.generation {
         return Err(Error::Corrupt("selected manifest generation mismatch"));
     }
@@ -261,6 +272,8 @@ pub(super) fn open_directory(
     )?;
     validate_checkpoint(&pages.reader(), &manifest, &genesis)?;
     metadata::validate_logs(&directory, &manifest)?;
+    let selected = manifest.clone();
+    manifest = wal::recover_tail(&directory, &manifest)?;
     pages.truncate_tail()?;
     if let Some(segment) = manifest.segments.last() {
         OpenOptions::new()
@@ -274,6 +287,7 @@ pub(super) fn open_directory(
         pages,
         genesis,
         roots: manifest.roots,
+        selected,
         manifest,
         poisoned: false,
         // A reopened owner always starts a new segment. No empty segment needs
@@ -536,6 +550,7 @@ pub fn publish(
         checkpoint::published(runtime, store.roots, &manifest, proofs);
         runtime.logs = logs;
     }
+    store.selected = manifest.clone();
     store.manifest = manifest;
     Ok(())
 }
@@ -879,6 +894,7 @@ pub(super) fn adopt(
         store.pages = pages;
     }
     store.roots = manifest.roots;
+    store.selected = manifest.clone();
     store.manifest = manifest;
     if store.runtime.is_some() {
         store.runtime = Some(RuntimeValidation::new(true));
@@ -904,6 +920,7 @@ pub(super) fn renew_namespace(
         store.poisoned = true;
         return Err(error);
     }
+    store.selected = manifest.clone();
     store.manifest = manifest;
     Ok(())
 }
@@ -1007,7 +1024,7 @@ mod tests {
             record.extend_from_slice(&crc.to_le_bytes());
             record.extend_from_slice(&212_u32.to_le_bytes());
             digests.push(Sha256::digest(&record).into());
-            bytes.extend_from_slice(&record);
+            bytes.extend_from_slice(&crate::storage::wal::tests::single(&record));
         }
         fs::write(store.directory.join(format!("log-{id:020}.bin")), &bytes).unwrap();
         let mut manifest = store.manifest.clone();

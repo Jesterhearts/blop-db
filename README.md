@@ -8,6 +8,12 @@ complete worker outcomes against the latest storage roots. A persistent worker p
 independent transactions in parallel. Receipts follow durable logging and contiguous visibility;
 materialized checkpoints are published periodically.
 
+Storage protocol version 1 uses complete checksummed WAL groups to establish durability with one
+file flush on an existing log segment. Manifests and CURRENT are published for checkpoints and
+storage metadata changes. Creation and opening use this same protocol. See
+[DESIGN.md, appendix I](DESIGN.md#appendix-i-wal-commit-groups) for the format and recovery
+contract.
+
 `tx!` compiles a small deterministic transaction program to the ISA 1 bytecode specified in
 [`DESIGN.md`](DESIGN.md), appendices A, B and C. Parsing, type checking, register allocation and
 branch resolution happen during Rust compilation. Runtime binding snapshots the captures and
@@ -151,13 +157,12 @@ versions below their own sequence. The coordinator installs each complete result
 crate-private VM installation hook, against the latest store, before satisfying any dependencies.
 Workers never publish stale roots or consume another transaction's tentative overlay.
 
-`F` is live visibility, `D` is the CURRENT-selected manifest's durable frontier, and `C` is the
-checkpoint. They are tracked separately. Receipts can follow a contiguous frontier advance without a
-new checkpoint: every record through F is already durable in the log and fully installed. Recovery
-discards post-checkpoint materialization and replays `(C, D]`, including acknowledged transactions,
-aborts and no-write outcomes. This preserves durability and visibility, but changes the former
-checkpoint-before-receipt default. Set `EngineOptions::checkpoint_interval` to 1 to retain that
-behaviour.
+`F` is live visibility, `D` is the durable log frontier, and `C` is the checkpoint. A flushed WAL
+group advances D while CURRENT can still select an older checkpoint manifest. Receipts can follow a
+frontier advance without a new checkpoint: every record through F is already durable in the log and
+fully installed. Recovery discards post-checkpoint materialization and replays `(C, D]`, including
+acknowledged transactions, aborts and no-write outcomes. Set `EngineOptions::checkpoint_interval` to
+1 to checkpoint before every receipt.
 
 The coordinator publishes a checkpoint when `F - C >= checkpoint_interval`, before releasing the
 receipts for that advance. It also checkpoints the drained prefix before catalogue/policy barriers,
@@ -206,6 +211,19 @@ unchanged prefixes need no repeated flush. Runtime publications that reuse the s
 retain their published page count, leaving reconstructible post-checkpoint pages outside the durable
 prefix until roots change. New manifests and CURRENT still follow the complete G.3 file-flush,
 rename and directory-flush ordering before durability is reported.
+
+Log appends validate and append up to 64 canonical records inside one checksummed group, flush its
+file, then advance D before dispatch. New segments also require a directory flush. Recovery
+validates the selected checkpoint and log prefixes, discovers complete linked WAL groups beyond
+them, flushes the recovered suffix, and replays `(C, D]`. Group framing adds 168 bytes per group;
+canonical record bytes and logical replication digests are preserved. Checkpoints may end inside a
+group, but durable physical log bounds end only at group boundaries.
+
+Physically short terminal appends are discarded. Complete-sized checksum-invalid groups, forks and
+gaps are errors; recovery never skips forward past damage. A full-length torn append can therefore
+require explicit repair. Loss or physical truncation of an uncheckpointed suffix caused by later
+damage cannot be distinguished from an interrupted append; already selected byte bounds remain
+strict. Low-level storage and the public database API use the same WAL format.
 
 Catalogue and policy requests stop later sequencing, drain the preceding prefix, then execute their
 durable barrier. Submissions queued behind a barrier are prepared against the resulting metadata.
@@ -411,8 +429,9 @@ Import has two separate execution stages:
    record with the sequential reference VM in that copy. Compare every generated canonical outcome
    byte-for-byte with the supplied outcome, including returned values, effects and abort details.
 1. Only after every comparison succeeds, append the exact validated canonical bytes through normal
-   G.3 publication. Then use the normal durable replay and installation path, publish a checkpoint
-   and return the new H.2 watermark. No supplied effects are substituted for VM execution.
+   versioned log publication. Then use the normal durable replay and installation path, publish a
+   checkpoint and return the new H.2 watermark. No supplied effects are substituted for VM
+   execution.
 
 The coordinator serializes the whole import. Local canonical submissions are prohibited by the
 persisted read-only role; snapshots, feeds, cursor changes, backups and maintenance controls wait
@@ -535,14 +554,15 @@ choose the actual copied directory, or the intended writable restore path after 
 primary. Calling `attach` on the wrong closed directory will invalidate that directory's old cursor
 tokens; the implementation cannot determine which copy the caller intended.
 
-`backup(&db, new_directory).await` captures and pins one published manifest on the coordinator, then
-copies on a blocking worker while the source continues executing. It returns the exact copied
-`storage::Manifest`, including its potentially earlier C and D. The image contains exact GENESIS and
-manifest bytes, exactly `page_count` complete pages, and exactly the listed committed log prefixes.
-Destination files and directory entries are flushed before a matching CURRENT is selected last. The
-destination must not exist; a failed copy may leave an incomplete directory and is never silently
-overwritten. At most four backup workers run per database; excess requests receive
-`OperationalLimit` for `backup_jobs`.
+`backup(&db, new_directory).await` captures and pins a durable physical prefix on the coordinator,
+then copies on a blocking worker while the source continues executing. It returns the exact copied
+`storage::Manifest`, including its potentially earlier C and D. The image contains exact GENESIS
+bytes, exactly `page_count` complete pages, and exactly the captured committed log prefixes. Its
+manifest and CURRENT describe live D at capture with the selected checkpoint roots. They can differ
+from the source's older CURRENT-selected metadata. Destination files and directory entries are
+flushed before a matching CURRENT is selected last. The destination must not exist; a failed copy
+may leave an incomplete directory and is never silently overwritten. At most four backup workers run
+per database; excess requests receive `OperationalLimit` for `backup_jobs`.
 
 Backup workers own their pins, not the waiting future. Cancellation after enqueue cannot release
 files while I/O continues. Close joins active backup workers before releasing the source directory
@@ -1081,10 +1101,10 @@ drains both assigned and queued work, snapshots are revoked before releasing the
 repeated close preserves its success/closed semantics. Shutdown tests also check definite rejection
 of unread controls. A checkpoint failure test obstructs only unpublished temporary output after
 durable append and installation, then verifies F/C/D diagnostics and replay without damaging
-committed history. Deferred-checkpoint tests cover interval thresholds, the interval-1 compatibility
-setting, old snapshots across checkpoints, final checkpoint failures and a real process exit after
-successful receipts. Reopening checks exact outcomes, non-duplicated increments and cursor baselines
-above C, including resolved and logical feed continuity.
+committed history. Deferred-checkpoint tests cover interval thresholds, the interval-1 setting, old
+snapshots across checkpoints, final checkpoint failures and a real process exit after successful
+receipts. Reopening checks exact outcomes, non-duplicated increments and cursor baselines above C,
+including resolved and logical feed continuity.
 
 To check the Windows code without running it, install the target with
 `rustup target add x86_64-pc-windows-gnu`, then run

@@ -1,12 +1,10 @@
-//! Version 1 metadata codecs and read-only validation of published log
-//! prefixes.
+//! Metadata codecs and read-only validation of specified log prefixes.
 //!
 //! These checks do not select a manifest, validate page contents, compare
 //! successive publications, or interpret log bodies. Those checks belong to the
 //! store and engine.
 
 use std::fs::File;
-use std::io::BufReader;
 use std::io::Read;
 use std::io::{
     self,
@@ -171,7 +169,9 @@ impl SegmentDescriptor {
     }
 }
 
-fn validate_descriptor(segment: &SegmentDescriptor) -> std::result::Result<(), &'static str> {
+pub(super) fn validate_descriptor(
+    segment: &SegmentDescriptor
+) -> std::result::Result<(), &'static str> {
     if !valid_id(segment.segment_id) {
         return Err("invalid segment ID");
     }
@@ -185,8 +185,10 @@ fn validate_descriptor(segment: &SegmentDescriptor) -> std::result::Result<(), &
     let Some(payload) = segment.committed_bytes.checked_sub(SEGMENT_HEADER_LENGTH) else {
         return Err("segment prefix is shorter than its header");
     };
-    if u128::from(payload) < records * 72
-        || u128::from(payload) > records * u128::from(MAX_RECORD_LENGTH)
+    let groups = records.div_ceil(super::wal::MAX_GROUP_RECORDS as u128);
+    if u128::from(payload) < records * 72 + groups * u128::from(super::wal::GROUP_OVERHEAD)
+        || u128::from(payload)
+            > records * u128::from(MAX_RECORD_LENGTH + super::wal::GROUP_OVERHEAD)
     {
         return Err("segment prefix length cannot contain its record range");
     }
@@ -538,8 +540,8 @@ fn u64_at(
     u64::from_le_bytes(array_at(bytes, offset))
 }
 
-/// Validate only manifest-authoritative log bytes without changing the
-/// directory.
+/// Validate exactly the supplied log prefixes without changing the directory.
+/// Every segment contains version-1 WAL groups.
 ///
 /// Bodies remain opaque, except for the fixed SetLimits body length. This
 /// checks framing and integrity, not transaction, catalogue, or policy body
@@ -558,28 +560,7 @@ pub fn validate_logs(
                 Error::Io(error)
             }
         })?;
-        // A bounded reader must not even prefetch bytes from an uncommitted
-        // tail.
-        let mut reader = BufReader::new(file.take(segment.committed_bytes));
-        let mut header = [0; SEGMENT_HEADER_LENGTH as usize];
-        read_committed(&mut reader, &mut header)?;
-        validate_segment_header(&header, &manifest.database_id, segment)?;
-        let mut remaining = segment.committed_bytes - SEGMENT_HEADER_LENGTH;
-        let mut predecessor = segment.predecessor_digest;
-        for sequence in segment.first_sequence..=segment.last_sequence {
-            let (length, digest) = validate_record(&mut reader, remaining, sequence, predecessor)?;
-            if sequence == manifest.checkpoint_sequence && digest != manifest.checkpoint_digest {
-                return Err(Error::Corrupt("log checkpoint digest mismatch"));
-            }
-            remaining -= length;
-            predecessor = digest;
-        }
-        if remaining != 0 {
-            return Err(Error::Corrupt("excess bytes inside committed log prefix"));
-        }
-        if predecessor != segment.last_digest {
-            return Err(Error::Corrupt("log final digest mismatch"));
-        }
+        super::wal::validate_segment(file, manifest, segment)?;
     }
     Ok(())
 }
@@ -769,7 +750,7 @@ mod tests {
                     segment_id: 11,
                     first_sequence: 1,
                     last_sequence: 2,
-                    committed_bytes: 240,
+                    committed_bytes: 408,
                     predecessor_digest: [0x11; 32],
                     last_digest: [0x22; 32],
                 },
@@ -777,7 +758,7 @@ mod tests {
                     segment_id: 21,
                     first_sequence: 3,
                     last_sequence: 4,
-                    committed_bytes: 240,
+                    committed_bytes: 408,
                     predecessor_digest: [0x22; 32],
                     last_digest: [0x44; 32],
                 },
@@ -916,7 +897,7 @@ mod tests {
         put_u64(&mut descriptor, 0, 11);
         put_u64(&mut descriptor, 8, 1);
         put_u64(&mut descriptor, 16, 2);
-        put_u64(&mut descriptor, 24, 240);
+        put_u64(&mut descriptor, 24, 408);
         descriptor[32..64].fill(0x11);
         descriptor[64..96].fill(0x22);
         assert_eq!(manifest.segments[0].encode().unwrap(), descriptor);
@@ -1023,11 +1004,11 @@ mod tests {
                 );
             }
             let mut bytes = original;
-            bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+            bytes[8..10].copy_from_slice(&3_u16.to_le_bytes());
             rewrite_crc(&mut bytes);
             assert!(matches!(
                 decode(&bytes),
-                Err(Error::Unsupported { version: 2, .. })
+                Err(Error::Unsupported { version: 3, .. })
             ));
         }
     }
@@ -1133,8 +1114,11 @@ mod tests {
             (284, 3),
             (292, 95),
             (292, 96),
-            (292, 239),
-            (292, 96 + 2 * MAX_RECORD_LENGTH + 1),
+            (292, 407),
+            (
+                292,
+                96 + 2 * (MAX_RECORD_LENGTH + super::super::wal::GROUP_OVERHEAD) + 1,
+            ),
             (364, 11),
             (372, 2),
             (372, 4),
@@ -1260,7 +1244,7 @@ mod tests {
             segment_id: u64::MAX - 1,
             first_sequence: u64::MAX - 1,
             last_sequence: u64::MAX - 1,
-            committed_bytes: 168,
+            committed_bytes: 336,
             predecessor_digest: manifest.checkpoint_digest,
             last_digest: manifest.durable_digest,
         });
@@ -1308,7 +1292,7 @@ mod tests {
         bytes[48..80].copy_from_slice(&predecessor_digest);
         rewrite_segment_crc(&mut bytes);
         for record in records {
-            bytes.extend_from_slice(record);
+            bytes.extend_from_slice(&crate::storage::wal::tests::single(record));
         }
         let last_record = records.last().unwrap();
         let descriptor = SegmentDescriptor {
@@ -1340,6 +1324,25 @@ mod tests {
         )
         .unwrap();
         (directory, manifest, bytes)
+    }
+
+    const RECORD_START: usize = 96 + crate::storage::wal::HEADER_BYTES;
+
+    fn replace_single_record(
+        directory: &Path,
+        manifest: &mut Manifest,
+        original: &[u8],
+        record: &[u8],
+    ) {
+        let mut bytes = original[..96].to_vec();
+        bytes.extend_from_slice(&crate::storage::wal::tests::frame(
+            1,
+            manifest.genesis_digest,
+            &[record],
+        ));
+        manifest.durable_digest = hash(record);
+        manifest.segments[0].last_digest = manifest.durable_digest;
+        fs::write(directory.join("log-00000000000000000001.bin"), bytes).unwrap();
     }
 
     fn logs() -> (tempfile::TempDir, Manifest, [Vec<u8>; 2]) {
@@ -1419,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn checksummed_and_corrupt_uncommitted_tails_are_ignored_without_mutation() {
+    fn prefix_validation_leaves_all_bytes_beyond_its_bound_untouched() {
         let (directory, manifest, mut bytes) = single_log(1, b"abc");
         let path = directory.path().join("log-00000000000000000001.bin");
         bytes.extend_from_slice(&record(
@@ -1441,7 +1444,7 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         validate_logs(directory.path(), &manifest).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
-        bytes[160] ^= 1;
+        bytes[RECORD_START + 64] ^= 1;
         fs::write(&path, &bytes).unwrap();
         assert!(matches!(
             validate_logs(directory.path(), &manifest),
@@ -1471,14 +1474,13 @@ mod tests {
     #[test]
     fn every_record_header_field_is_validated_even_with_valid_crc_and_final_digest() {
         let (directory, mut manifest, original) = single_log(1, b"abc");
-        let path = directory.path().join("log-00000000000000000001.bin");
+        let canonical =
+            &original[RECORD_START..original.len() - crate::storage::wal::TRAILER_BYTES];
         for index in 0..64 {
-            let mut bytes = original.clone();
-            bytes[96 + index] ^= 0x80;
-            rewrite_record_crc(&mut bytes[96..]);
-            manifest.durable_digest = hash(&bytes[96..]);
-            manifest.segments[0].last_digest = manifest.durable_digest;
-            fs::write(&path, bytes).unwrap();
+            let mut record = canonical.to_vec();
+            record[index] ^= 0x80;
+            rewrite_record_crc(&mut record);
+            replace_single_record(directory.path(), &mut manifest, &original, &record);
             assert!(
                 validate_logs(directory.path(), &manifest).is_err(),
                 "record header byte {index}"
@@ -1489,16 +1491,17 @@ mod tests {
     #[test]
     fn record_crc_precedes_version_interpretation_and_lengths_do_not_wrap() {
         let (directory, mut manifest, original) = single_log(1, b"abc");
-        let path = directory.path().join("log-00000000000000000001.bin");
-        let mut bytes = original.clone();
-        bytes[102] = 2;
-        fs::write(&path, &bytes).unwrap();
+        let canonical =
+            &original[RECORD_START..original.len() - crate::storage::wal::TRAILER_BYTES];
+        let mut record = canonical.to_vec();
+        record[6] = 2;
+        replace_single_record(directory.path(), &mut manifest, &original, &record);
         assert!(matches!(
             validate_logs(directory.path(), &manifest),
             Err(Error::Corrupt("log record CRC mismatch"))
         ));
-        rewrite_record_crc(&mut bytes[96..]);
-        fs::write(&path, &bytes).unwrap();
+        rewrite_record_crc(&mut record);
+        replace_single_record(directory.path(), &mut manifest, &original, &record);
         assert!(matches!(
             validate_logs(directory.path(), &manifest),
             Err(Error::Unsupported {
@@ -1511,22 +1514,20 @@ mod tests {
             (71, u32::MAX),
             (MAX_RECORD_LENGTH as u32 + 1, MAX_RECORD_LENGTH as u32 - 71),
         ] {
-            let mut bytes = original.clone();
-            bytes[104..108].copy_from_slice(&length.to_le_bytes());
-            bytes[108..112].copy_from_slice(&body_length.to_le_bytes());
-            rewrite_record_crc(&mut bytes[96..]);
-            fs::write(&path, bytes).unwrap();
+            let mut record = canonical.to_vec();
+            record[8..12].copy_from_slice(&length.to_le_bytes());
+            record[12..16].copy_from_slice(&body_length.to_le_bytes());
+            rewrite_record_crc(&mut record);
+            replace_single_record(directory.path(), &mut manifest, &original, &record);
             assert!(matches!(
                 validate_logs(directory.path(), &manifest),
                 Err(Error::Corrupt("invalid log record length"))
             ));
         }
-        let mut bytes = original;
-        let end = bytes.len();
-        bytes[end - 4] ^= 1;
-        manifest.durable_digest = hash(&bytes[96..]);
-        manifest.segments[0].last_digest = manifest.durable_digest;
-        fs::write(&path, bytes).unwrap();
+        let mut record = canonical.to_vec();
+        let end = record.len();
+        record[end - 4] ^= 1;
+        replace_single_record(directory.path(), &mut manifest, &original, &record);
         assert!(matches!(
             validate_logs(directory.path(), &manifest),
             Err(Error::Corrupt("log record repeated length mismatch"))
@@ -1537,13 +1538,14 @@ mod tests {
     fn log_prefix_must_end_exactly_at_descriptor_sequence_and_digest() {
         let (directory, mut manifest, mut bytes) = single_log(1, b"abc");
         let path = directory.path().join("log-00000000000000000001.bin");
+        let digest = manifest.durable_digest;
         manifest.durable_digest[0] ^= 1;
         manifest.segments[0].last_digest = manifest.durable_digest;
         assert!(matches!(
             validate_logs(directory.path(), &manifest),
             Err(Error::Corrupt("log final digest mismatch"))
         ));
-        manifest.durable_digest = hash(&bytes[96..]);
+        manifest.durable_digest = digest;
         manifest.segments[0].last_digest = manifest.durable_digest;
         bytes.push(0);
         manifest.segments[0].committed_bytes += 1;
@@ -1555,7 +1557,7 @@ mod tests {
         manifest.segments[0].committed_bytes -= 2;
         assert!(matches!(
             validate_logs(directory.path(), &manifest),
-            Err(Error::Corrupt("invalid log record length"))
+            Err(Error::Corrupt("WAL group does not match committed prefix"))
         ));
     }
 

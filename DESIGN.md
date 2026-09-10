@@ -5,6 +5,10 @@ _Design specification_
 _A Rust-native embedded database built around stable transaction bytecode, a total-order log,
 deterministic parallel execution, MVCC, and prefix visibility._
 
+Version 1 uses self-committing WAL groups. Appendices E and I define log durability and recovery;
+appendix G defines checkpoint and retention-metadata publication. This is one storage protocol,
+shared by creation, opening, reads and writes.
+
 ## Executive summary
 
 This database treats a transaction as a small deterministic program instead of a client-side
@@ -60,7 +64,7 @@ protect their unacknowledged history until advanced or explicitly released.
 This document defines the logical architecture, correctness model, and version 1 binary formats of
 an embedded database for Rust applications. It defines transaction semantics, bytecode rules,
 scheduling, MVCC, visibility, rollback, durability, recovery, and physical storage. Appendices A
-through H are normative: they specify the bytes and validation rules needed to implement compatible
+through I are normative: they specify the bytes and validation rules needed to implement compatible
 readers, writers, interpreters, and recovery tools without relying on Rust representations.
 
 The design is for a single database instance with one canonical transaction log. It may use many
@@ -2053,9 +2057,10 @@ protect feed history are authoritative; post-checkpoint outcome caches never sup
 ### E.1 Segment header
 
 The log consists of files named `log-<segment_id>.bin`, where the ID is 20 zero-padded decimal
-digits. A segment begins with this 96-byte header. Records follow contiguously without alignment or
-padding. A record cannot cross a segment boundary. Segment IDs increase in append order but need not
-be consecutive after a crash. Rotation may occur at any record boundary.
+digits. A segment begins with this 96-byte header, followed by the WAL groups in I.2 without
+alignment or padding. Neither a group nor a record can cross a segment boundary. Segment IDs
+increase in append order but need not be consecutive after a crash. Rotation occurs at group
+boundaries.
 
 | Offset | Bytes | Field                                                  |
 | ------ | ----- | ------------------------------------------------------ |
@@ -2094,10 +2099,11 @@ genesis anchor.
 | 64 + body_length | 4           | CRC-32C of header and body only.                             |
 | 68 + body_length | 4           | Repeated total record length.                                |
 
-There is no standalone commit record and no physical completion bit in this envelope. The manifest
-in appendix G records the committed byte prefix and final digest of each retained segment. A
-complete record with a valid checksum beyond that prefix is still an uncommitted append and must not
-execute or be treated as durable based on byte validity alone.
+This canonical envelope is contained in a WAL group. Its own checksum validates a record, not a
+commit boundary. A complete group is the local durability unit; its framing does not enter the
+canonical record digest. A manifest records guaranteed complete-group prefixes, and recovery may
+discover later complete groups using E.3 and I.4. Accepted recovered groups must be flushed before
+execution.
 
 Record CRC validation precedes interpretation. Validate both length copies, sequence continuity,
 kind/body compatibility, and the hash chain. Do not search forward for the next magic string after
@@ -2106,17 +2112,19 @@ last record. Missing bytes inside that prefix are also corruption, not a recover
 
 ### E.3 Durability boundary and tail handling
 
-The current manifest is the authority for D, the durable frontier. Each listed segment has an exact
-committed prefix length; the last one may have additional uncommitted bytes. Only the last listed
-segment may be extended in place, and its published prefix is immutable. Other unlisted segments and
-excess bytes are orphan output, not history. An implementation must discard or truncate such output
-before reusing append positions after recovery, without changing any published prefix.
+The selected manifest establishes a lower bound on D, the durable frontier, and exact guaranteed
+prefixes for its listed segments. The active segment can contain later complete groups; new linked
+segments can also extend the durable chain without a manifest update. Existing durable prefixes are
+immutable. Recovery discovers complete groups from the selected bounds, validates their framing and
+canonical chain, trims only physically incomplete terminal appends, and establishes durability
+before replay as specified in I.4. It never skips an invalid complete group to search for later
+records.
 
-Publish D only after flushing the log bytes, any newly created segment files, and their directory
-entries, then completing the manifest-pointer protocol in G.3. Dispatch and durable receipts wait
-for that publication. If a crash leaves the new pointer rather than the old one, recovery accepts
-its complete prefix, even if the caller never received a receipt. This is the uncertain-submission
-case, not permission to execute an uncommitted tail.
+Advance live D only after flushing a complete WAL group and, for a newly created segment, its
+directory entry. No manifest-pointer update is needed for this append. Dispatch waits for that
+durability step; receipts also wait for complete installation and contiguous visibility. A complete
+valid group may survive a failed flush or a lost receipt and be recovered after reopening. That is
+an uncertain submission. Checkpoints and cursor metadata use G.3 separately.
 
 Removing records uses whole-segment deletion after publication of a manifest that no longer needs
 those segments. The active segment may be rotated first. A retained segment can contain extra
@@ -2384,9 +2392,13 @@ A manifest is at most 16 MiB. It must satisfy
 `1 <= log_floor <= checkpoint_sequence + 1`. Segments are ordered by sequence, nonempty, and
 together cover exactly `[log_floor, durable_sequence]` without gaps or overlap. If the vector is
 empty, D = C and log_floor = D + 1. A descriptor's committed_bytes includes the 96-byte segment
-header and ends exactly after last_sequence. Segment headers, filenames, predecessor digests, and
-final digests must agree with the descriptors. Adjacent descriptors must chain to each other.
-Segment IDs are strictly increasing.
+header and ends at the complete group containing last_sequence, which must be that group's last
+record. Segment headers, filenames, predecessor digests, and final digests must agree with the
+descriptors. Adjacent descriptors must chain to each other. Segment IDs are strictly increasing.
+
+The manifest's durable_sequence is a guaranteed lower bound on live D. Later complete groups are
+discovered according to I.4. For N records, a descriptor needs at least
+`96 + 72 * N + 168 * ceil(N / 64)` bytes and at most `96 + N * (64 MiB + 168)` bytes.
 
 The chain at C must equal checkpoint_digest when C is in retained log coverage; when C is just
 before log_floor, the first descriptor must use checkpoint_digest as its predecessor. The last
@@ -2395,11 +2407,12 @@ checkpoint_digest. Published C, D, and the history/log floors never decrease. Th
 tree entry must exactly equal GENESIS. The roots, page_count, and logical tree contents must meet
 F.5; policy_root is always nonzero.
 
-The next-ID fields advance past every published ID in their namespaces, even after objects are
-released or files are deleted. `2^64 - 1` in a next-ID field means exhausted; it is not allocatable.
-Unpublished crash output does not allocate durable identities and must be removed before its names
-or append positions are reused. Manifest generations strictly increase after each publication; an
-implementation may skip generations to avoid an orphan filename collision.
+Each published manifest advances its next-ID fields past every durable ID known at that publication,
+even after objects are released or files are deleted. Recovery also advances the live segment
+counter past discovered complete WAL segments. `2^64 - 1` in a next-ID field means exhausted; it is
+not allocatable. Incomplete orphan output does not allocate durable identities; allocation skips its
+filenames rather than overwriting them. Manifest generations strictly increase after each metadata
+publication; an implementation may skip generations to avoid an orphan filename collision.
 
 `CURRENT` is exactly 64 bytes:
 
@@ -2415,8 +2428,8 @@ implementation may skip generations to avoid an orphan filename collision.
 | 60     | 4     | CRC-32C of preceding 60 bytes.         |
 
 The manifest filename is derived from the generation in CURRENT. Its own generation must agree.
-CURRENT is the only selection authority. A valid higher-generation manifest left by an interrupted
-publication is not committed just because its filename sorts last.
+CURRENT is the checkpoint and retention-metadata selection authority. A valid higher-generation
+manifest left by an interrupted publication is not committed just because its filename sorts last.
 
 ### G.3 Flush and atomic publication protocol
 
@@ -2428,9 +2441,12 @@ model. An implementation without these primitives must refuse durable mode or us
 versioned publication protocol, not assume that a sector-sized write is atomic.
 
 Serialize all publication operations, including log group commits, checkpoints, cursor changes, and
-compaction. Build each new manifest from the latest published manifest, preserving unrelated
+compaction. Build each new manifest from the latest live durable metadata, preserving unrelated
 updates. For example, a checkpoint built concurrently with checkout must incorporate the new cursor
 claim or restart with a sufficiently conservative history floor.
+
+The following steps publish checkpoints and storage metadata. Ordinary log appends use the one-flush
+WAL procedure in I.3 and can advance D without this metadata publication.
 
 1. Write new log bytes and new pages. Complete all referenced file contents, flush those files, and
    flush the directory for any new filenames. Never overwrite a published page or log prefix.
@@ -2438,19 +2454,20 @@ claim or restart with a sufficiently conservative history floor.
    filename, and flush the directory. Its C, D, roots, digests, and retention claims must describe
    only complete flushed data. The final filename must not replace a published manifest.
 1. Write a complete new CURRENT to a different temporary file and flush it. Atomically rename that
-   file over CURRENT, then flush the directory. Only now report the publication durable, dispatch
-   newly durable records, or acknowledge a cursor metadata operation.
+   file over CURRENT, then flush the directory. Only now report the metadata publication durable or
+   acknowledge a cursor metadata operation.
 1. Reclaim unreferenced old files or log segments only after the replacement pointer is durable and
    all in-flight users have released the old objects. Flush the directory after deletions when their
    durable removal matters to space accounting.
 
 On an uncertain failure during publication, stop new dispatch and reclamation until recovery
 establishes which CURRENT is selected. Never publish another manifest from a guessed base. A crash
-before pointer replacement uses the old manifest and ignores new files; a crash after replacement
-may use the complete new manifest even before its caller saw success. New referenced data was
-flushed first in either case. There is no fallback to an older checkpoint if a valid CURRENT points
-to missing or corrupt authoritative data: that could lose acknowledged transactions or cursor
-registrations. Explicit offline repair is distinct from normal recovery.
+before pointer replacement uses the old checkpoint and discovers its WAL suffix; a crash after
+replacement may use the complete new checkpoint even before its caller saw success. Unselected
+materialized pages are not recovery authority. New referenced data was flushed first in either case.
+There is no fallback to an older checkpoint if a valid CURRENT points to missing or corrupt
+authoritative data: that could lose acknowledged transactions or cursor registrations. Explicit
+offline repair is distinct from normal recovery.
 
 ### G.4 Durable cursor metadata
 
@@ -2511,29 +2528,31 @@ invalidates their handles, but live readers still block unsafe reclamation.
 ### G.5 Recovery and backup rules
 
 Recovery validates CURRENT, the selected manifest's digest and CRC, GENESIS and its digest, page 0,
-the reachable checkpoint/cursor trees, and each committed log prefix. Corruption of unreachable
-orphan pages does not invalidate a checkpoint; corruption of a referenced page does. Restore cursor
-registrations before reclamation, restore the four logical trees at C, and replay every record in
-`(C, D]` using the historical policy and catalogue. A record that fails replay validation indicates
-corruption or an unsupported implementation, not a newly invented abort. Set the recovered frontier
-to C initially and advance it only as replay resolves the contiguous prefix.
+the reachable checkpoint/cursor trees, and each selected log prefix, then discovers and flushes the
+complete WAL suffix under I.4. Corruption of unreachable orphan pages does not invalidate a
+checkpoint; corruption of a referenced page does. Restore cursor registrations before reclamation,
+restore the four logical trees at C, and replay every record in `(C, D]` using the historical policy
+and catalogue. A record that fails replay validation indicates corruption or an unsupported
+implementation, not a newly invented abort. Set the recovered frontier to C initially and advance it
+only as replay resolves the contiguous prefix.
 
 The manifest does not store a later live visibility frontier or a completion bitmap. Recovery
-reconstructs those from C and the durable log. Bytes beyond page_count pages and beyond listed log
-prefixes are excluded. After validating the authoritative view and excluding active readers, they
-may be truncated; unlisted files may be removed. Retained outcomes at or below C cannot be discarded
-as disposable caches. Post-C materialization is never a recovery starting point.
+reconstructs those from C and the durable log. Bytes beyond page_count pages are excluded; log bytes
+beyond selected prefixes are classified by I.4. After validating the recovered view and excluding
+active readers, incomplete tails and unused files may be removed. Retained outcomes at or below C
+cannot be discarded as disposable caches. Post-C materialization is never a recovery starting point.
 
-A physical backup is a database directory image, not an unspecified archive format. Pin one manifest
-generation and copy GENESIS, that manifest, exactly page_count complete pages of its page file, and
-exactly the listed committed prefixes of its log segments. Write a matching CURRENT last using the
-same flush protocol in the destination. Source files must remain pinned until copying finishes.
-Copying the live CURRENT and then independently copying whatever filenames happen to exist is not a
-consistent backup. Restore retains the backed-up cursor registrations; a restored consumer must
-resume from a watermark protected by that backup, not assume it contains later source history. A
-read replica may explicitly clear copied source-local cursor registrations by a new local manifest
-publication before applying its own retention policy. Source and replica retain the same genesis
-identity, but must not become independent writable primaries under it.
+A physical backup is a database directory image, not an unspecified archive format. Capture live D
+and its complete-group log bounds with the selected checkpoint roots, page count and retention
+metadata. Synthesize a manifest for that pinned prefix, copy GENESIS, exactly page_count complete
+pages and exactly those log prefixes, then write a matching CURRENT last using G.3 ordering in the
+destination. Source files must remain pinned until copying finishes. Copying the live CURRENT and
+then independently copying whatever filenames happen to exist is not a consistent backup. Restore
+retains the backed-up cursor registrations; a restored consumer must resume from a watermark
+protected by that backup, not assume it contains later source history. A read replica may explicitly
+clear copied source-local cursor registrations by a new local manifest publication before applying
+its own retention policy. Source and replica retain the same genesis identity, but must not become
+independent writable primaries under it.
 
 ## Appendix H. Exchange formats and conformance cases
 
@@ -2723,10 +2742,12 @@ In addition to section 26, an implementation must test these binary behaviours:
   counts before allocation, checked-arithmetic overflow, unknown flags/versions, extra trailing
   data, changed checksums, and broken record hash chains.
 - Crash before and after every file flush, rename, and directory flush in G.3. Recovery must use
-  exactly the old or new CURRENT-selected manifest, never an unselected higher generation, a
-  partially installed overlay, or a checksum-valid append beyond the selected committed prefix.
+  exactly the old or new CURRENT-selected checkpoint, then validate and flush complete WAL groups
+  beyond its log bounds. An unselected higher-generation manifest or partially installed overlay is
+  never a recovery starting point.
 - Corrupt or remove a record inside a published prefix and require corruption, not silent tail
-  truncation. A corrupt unpublished tail must be discardable without changing the durable prefix.
+  truncation. Physically incomplete terminal WAL appends must be discardable without changing the
+  preceding complete prefix; complete malformed groups must fail as specified in I.4.
 - Interleave cursor checkout, acknowledgement, release, checkpoint publication, and compaction.
   Verify that unrelated manifest updates are preserved and that protected history is never deleted
   using a stale retention root. Start compaction with C < F and installed versions above F, drain
@@ -2745,3 +2766,137 @@ In addition to section 26, an implementation must test these binary behaviours:
 Conformance requires both byte-level validation and the sequential-equivalence tests. Checksums
 alone cannot establish semantic validity, and matching final table contents alone cannot establish
 compatible outcomes, historical snapshots, resource accounting, or retention behaviour.
+
+## Appendix I. WAL commit groups
+
+### I.1 Checkpoint selection and live durability
+
+CURRENT uses the version-1 layout in G.2. WAL group and segment headers also use version 1; unknown
+versions are rejected. There is one publication protocol and one log reader/writer format.
+
+The selected manifest is authoritative for C, materialized roots, page-file prefix, cursor metadata,
+retention floors and allocation counters. Its D and log descriptors are a durable lower bound, not
+necessarily the latest durable frontier. The live owner maintains an expanded manifest-shaped value
+with current D and exact complete-group log bounds. Normal WAL appends do not change CURRENT or its
+selected manifest generation.
+
+Segments use the 96-byte E.1 header and magic `BLOPLG01`. Canonical E.2 record bytes are wrapped in
+local groups; group framing does not consume a sequence number and does not enter canonical record
+hashes or logical replication bytes.
+
+### I.2 Group framing
+
+All integer fields below are little-endian. A group is a 112-byte header, consecutive complete E.2
+records, and a 56-byte trailer. It contains 1 through 64 records. Total group length is
+`168 + sum(canonical_record_lengths)`, from `168 + 72 * count` through `168 + 64 MiB * count`.
+Arithmetic is checked before allocation or traversal. The first sequence is nonzero, and
+`first + count` must fit u64, so no record uses the reserved u64 maximum.
+
+| Header offset | Bytes | Field                                             |
+| ------------: | ----: | ------------------------------------------------- |
+|             0 |     8 | Magic `BLOPWG01`.                                 |
+|             8 |     2 | Group version = 1.                                |
+|            10 |     2 | Flags = 0.                                        |
+|            12 |     4 | Header length = 112.                              |
+|            16 |     8 | Total group length, including header and trailer. |
+|            24 |     8 | First canonical sequence number.                  |
+|            32 |     4 | Canonical record count.                           |
+|            36 |     4 | Reserved = 0.                                     |
+|            40 |    32 | Predecessor canonical record digest.              |
+|            72 |    32 | Last canonical record digest in this group.       |
+|           104 |     4 | Reserved = 0.                                     |
+|           108 |     4 | CRC-32C of header bytes 0 through 107.            |
+
+| Trailer offset | Bytes | Field                                                                              |
+| -------------: | ----: | ---------------------------------------------------------------------------------- |
+|              0 |     8 | Magic `BLOPGE01`.                                                                  |
+|              8 |     8 | Repeated total group length.                                                       |
+|             16 |    32 | SHA256 of the complete header, including its CRC, and every canonical record byte. |
+|             48 |     4 | Reserved = 0.                                                                      |
+|             52 |     4 | CRC-32C of trailer bytes 0 through 51.                                             |
+
+Every canonical envelope must also pass its own length, CRC, version, kind, sequence and predecessor
+checks. The group must contain exactly its declared record count and bytes and end at its declared
+last digest. Selected segment endpoints must coincide with complete group endpoints. A checkpoint
+sequence may lie inside a group; the whole group remains in the retained log. Descriptor byte counts
+include framing, with the minimum and maximum sizes specified in G.2.
+
+### I.3 Append and checkpoint ordering
+
+Serialize append and metadata publication on the directory owner:
+
+1. Validate the bounded group and reserve its canonical sequences in order.
+1. Write its header, canonical records and trailer to the active segment without changing an
+   existing committed prefix. On rotation, create a fresh noncolliding segment ID and write its
+   complete version-1 segment header first.
+1. Flush the segment file once. For a new segment, also flush its directory entry. Failure stops
+   dispatch and further writes until recovery; a failed or cancelled submission remains uncertain.
+1. Advance live D and the in-memory descriptor only after those operations succeed. Dispatch is now
+   allowed. Receipts still wait for complete installation and contiguous visibility F.
+
+The trailer shares the same file flush as the records. An ordinary append on an existing segment
+requires one file flush and no rename, directory flush or manifest publication. A group is a local
+durability unit, not a semantic transaction merge.
+
+Checkpoints and cursor/retention/layout changes continue to use G.3. Their manifests incorporate the
+latest live D and exact segment bounds. Files already flushed by WAL append need no repeated flush
+for unchanged prefixes. Page roots are published only after their referenced contents are durable.
+Retention and reclamation preserve every log record needed by C or any durable claim. Administrative
+canonical records use WAL publication, then their existing checkpoint barrier.
+
+### I.4 Recovery and tail classification
+
+Under the exclusive directory lease:
+
+1. Validate CURRENT, the selected manifest, GENESIS, checkpoint pages and every selected log prefix.
+   Missing or corrupt bytes within selected prefixes are always errors.
+1. Extend the last selected segment from its recorded boundary using complete groups.
+1. Enumerate potential successor log files at or above the selected next_segment_id in increasing
+   file-ID order. Validate their database/file identities and require version 1. Follow only a
+   contiguous sequence/digest chain from the preceding accepted endpoint. Reject complete forks,
+   gaps, foreign identities, unsupported versions and malformed headers. Never resynchronise at a
+   later magic string after invalid data. Discovery retains at most 1,048,576 candidate IDs.
+1. Discard a physically short terminal group: fewer than 112 remaining header bytes, or a valid
+   header whose declared group extends beyond physical EOF. A physically short segment header, or a
+   valid unlisted segment containing no complete group, is orphan output. A later complete successor
+   after an incomplete accepted segment is an error. Complete-sized groups with invalid CRCs,
+   hashes, framing or envelopes fail closed.
+1. Only after validating the candidate chain, truncate incomplete accepted tails, flush recovered
+   suffix files and flush newly discovered filenames. Readable bytes left in an OS cache after a
+   process crash do not by themselves establish durability-before-execution.
+1. Discard post-checkpoint materialization and replay every canonical record in `(C, D]`, including
+   aborts and records whose receipts may already have succeeded. Publish the resulting checkpoint
+   before serving public requests.
+
+A complete valid group may be recovered although its writer never observed a successful flush or
+sent a receipt. That is an uncertain submission. These rules do not claim that checksums prove a
+past flush occurred. In particular, loss or physical truncation of an uncheckpointed suffix caused
+by later damage is indistinguishable from an interrupted append. The selected manifest's existing
+byte bounds remain strict; complete malformed suffix groups are never silently rolled back. A
+full-length torn append that fails those checks is an explicit recovery error, not an automatically
+discarded tail. This conservative distinction is part of the version-1 recovery contract.
+
+### I.5 Backup and logical consumers
+
+A backup captures the live durable descriptor set with the selected checkpoint roots and page
+prefix. Verify that source CURRENT and its selected manifest still match the owner's selected
+metadata, then synthesize a destination manifest and matching CURRENT for the frozen live D. Copy
+exactly those pinned file prefixes and use G.3 ordering at the destination. The copied manifest can
+therefore differ from the source's older selected manifest without observing tentative state or a
+moving log tail. Attachment and namespace renewal follow G.4-G.5.
+
+Logical feeds and imports transport the unchanged E.2 bytes and canonical outcomes, omitting local
+group headers and trailers. Source and replica group boundaries may differ. Import still validates
+the complete batch by isolated reference execution before the first local durable append, and can
+recover an already verified shorter prefix after interruption. Maintenance validates retained
+segments and reclaims whole segments only after replacement metadata is durable.
+
+### I.6 Verification obligations
+
+Test one-flush append counts, immutable CURRENT across WAL-only commits, exact group boundaries,
+checksummed malformed frames, every physically short group prefix, segment forks and missing
+predecessors, process exit and partial writes at append boundaries, recovery flushing before replay,
+checkpoint sequences inside groups, unsupported versions, orphan filenames, and backups captured
+while live D exceeds the selected manifest. Existing sequential-equivalence, retention, revocation
+and replica outcome checks remain required. Fault injection and process exit are not simulations of
+hardware power loss or arbitrary filesystem write reordering.

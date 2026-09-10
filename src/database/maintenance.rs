@@ -1,8 +1,6 @@
 //! Local maintenance controls, separate from canonical sequence assignment.
 
 use std::fs::File;
-use std::io::BufReader;
-use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
@@ -119,7 +117,7 @@ pub async fn maintain(
     })?
 }
 
-/// Copy one pinned published C,D image on a blocking thread while the source
+/// Copy one pinned durable C,D image on a blocking thread while the source
 /// continues executing. Destination must not exist. Close waits for accepted
 /// copies, even if their waiters were cancelled. The result is the exact copied
 /// manifest, not the source's later frontier. Output requires explicit
@@ -157,35 +155,20 @@ fn validate(
                 .join(format!("log-{:020}.bin", segment.segment_id)),
         )
         .map_err(|e| Error::Storage(e.into()))?;
-        let mut reader = BufReader::new(file.take(segment.committed_bytes));
-        let mut header = [0; 96];
-        reader
-            .read_exact(&mut header)
-            .map_err(|e| Error::Storage(e.into()))?;
-        if header != engine::segment_header(manifest.database_id, segment) {
-            return Err(Error::Storage(storage::Error::Corrupt(
-                "maintenance log header mismatch",
-            )));
-        }
-        let mut remaining = segment.committed_bytes - 96;
-        let mut predecessor = segment.predecessor_digest;
-        for sequence in segment.first_sequence..=segment.last_sequence {
-            let (bytes, digest) =
-                engine::read_record(&mut reader, remaining, sequence, predecessor)
-                    .map_err(Error::Storage)?;
-            remaining -= bytes.len() as u64;
+        for record in storage::wal::Records::new(file, manifest.database_id, segment)
+            .map_err(Error::Storage)?
+        {
+            let storage::wal::Record {
+                sequence,
+                digest,
+                bytes,
+            } = record.map_err(Error::Storage)?;
             let command = record::decode(bytes[24], &bytes[64..bytes.len() - 8])
                 .map_err(super::persisted_read)?;
             engine::validate_checkpoint_record(
                 view, &history, sequence, digest, bytes[24], &command,
             )
             .map_err(super::persisted_read)?;
-            predecessor = digest;
-        }
-        if remaining != 0 || predecessor != segment.last_digest {
-            return Err(Error::Storage(storage::Error::Corrupt(
-                "maintenance log endpoint mismatch",
-            )));
         }
     }
     Ok(())
@@ -334,6 +317,9 @@ mod tests {
     use std::task::Waker;
     use std::time::Duration;
     use std::time::Instant;
+
+    use sha2::Digest;
+    use sha2::Sha256;
 
     use super::*;
     use crate::database as db;
@@ -861,6 +847,7 @@ mod tests {
     async fn rotation_without_append_survives_close_and_reopen_with_a_fresh_chained_segment() {
         let (directory, database) = fixture().await;
         let path = directory.path().join("db");
+        maintain(&database, only_rotate()).await.unwrap();
         let before = published(&path);
         let original_log = path.join(format!("log-{:020}.bin", before.segments[0].segment_id));
         let original_bytes = fs::read(&original_log).unwrap();
@@ -883,6 +870,7 @@ mod tests {
             .sequence,
             3
         );
+        db::close(&database).await.unwrap();
         let appended = published(&path);
         assert_eq!(appended.segments.len(), 2);
         assert_eq!(appended.segments[0], before.segments[0]);
@@ -893,20 +881,17 @@ mod tests {
         assert_eq!((segment.first_sequence, segment.last_sequence), (3, 3));
         assert_eq!(segment.predecessor_digest, before.durable_digest);
         let bytes = fs::read(path.join(format!("log-{:020}.bin", segment.segment_id))).unwrap();
-        assert_eq!(
-            &bytes[..96],
-            &engine::segment_header(appended.database_id, segment)
-        );
-        let (_, digest) = engine::read_record(
-            &mut &bytes[96..],
-            segment.committed_bytes - 96,
-            3,
-            before.durable_digest,
-        )
-        .unwrap();
+        assert_eq!(&bytes[8..10], &1_u16.to_le_bytes());
+        let records =
+            storage::wal::Records::new(std::io::Cursor::new(bytes), appended.database_id, segment)
+                .unwrap()
+                .collect::<storage::Result<Vec<_>>>()
+                .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sequence, 3);
+        let digest = records[0].digest;
         assert_eq!(digest, segment.last_digest);
         assert_eq!(digest, appended.durable_digest);
-        db::close(&database).await.unwrap();
         let database = db::open(&path).await.unwrap();
         let snapshot = db::snapshot(&database).await.unwrap();
         assert_eq!(snapshot.sequence(), 3);
@@ -1223,14 +1208,22 @@ mod tests {
         assert!(source.join("pages-00000000000000000001.bin").exists());
         copier.release();
         let copied = copied.await.unwrap().unwrap();
-        assert_eq!(copied, original);
+        assert_eq!(copied.generation, original.generation);
+        assert_eq!(copied.roots, original.roots);
+        assert_eq!(copied.page_count, original.page_count);
+        assert_eq!(copied.next_cursor_id, original.next_cursor_id);
         assert_eq!(
             (copied.checkpoint_sequence, copied.durable_sequence),
             (1, 4)
         );
         assert_eq!(
             fs::read(destination.join("CURRENT")).unwrap(),
-            current.encode().unwrap()
+            storage::Current {
+                digest: Sha256::digest(copied.encode().unwrap()).into(),
+                ..current
+            }
+            .encode()
+            .unwrap()
         );
         assert_eq!(
             fs::read(destination.join("GENESIS")).unwrap(),

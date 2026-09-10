@@ -13,7 +13,6 @@ use blop_db::database::CursorToken;
 use blop_db::database::Error;
 use blop_db::database::FeedBatch;
 use blop_db::database::FeedRecords;
-use blop_db::database::LogicalRecord;
 use blop_db::database::Watermark;
 use blop_db::database::{
     self as db,
@@ -772,7 +771,7 @@ async fn cursor_tokens_and_watermarks_reject_malformed_frames_before_fields() {
 
 #[tokio::test]
 async fn feed_codecs_validate_real_log_envelopes_digests_chains_and_bounded_counts() {
-    let (directory, database) = fixture().await;
+    let (_directory, database) = fixture().await;
     let zero = watermark(&database, 0);
     let cursor = db::checkout_cursor(&database, zero, CursorKind::Resolved, "codec")
         .await
@@ -828,20 +827,25 @@ async fn feed_codecs_validate_real_log_envelopes_digests_chains_and_bounded_coun
         records[1].sequence = 1;
     }
     assert!(invalid.encode().is_err());
-    let log = std::fs::read(directory.path().join("db/log-00000000000000000001.bin")).unwrap();
-    let FeedRecords::Resolved(records) = batch.records else {
-        unreachable!();
+    let logical_cursor = db::checkout_cursor(&database, zero, CursorKind::Logical, "codec")
+        .await
+        .unwrap();
+    let source = db::read_logical_feed(&database, &logical_cursor, zero, BatchLimits::default())
+        .await
+        .unwrap();
+    let FeedRecords::Logical(logical) = source.records else {
+        unreachable!()
     };
-    let mut offset = 96;
-    let mut logical = Vec::new();
-    for outcome in records {
-        let length = u32::from_le_bytes(log[offset + 8..offset + 12].try_into().unwrap()) as usize;
-        logical.push(LogicalRecord {
-            log_record: log[offset..offset + length].to_vec(),
-            outcome,
-        });
-        offset += length;
-    }
+    let FeedRecords::Resolved(outcomes) = batch.records else {
+        unreachable!()
+    };
+    assert_eq!(
+        logical
+            .iter()
+            .map(|record| record.outcome.clone())
+            .collect::<Vec<_>>(),
+        outcomes
+    );
     let batch = FeedBatch {
         database_id: database.database_id(),
         start_exclusive: 0,

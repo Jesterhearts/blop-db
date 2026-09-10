@@ -1,13 +1,17 @@
 //! Serial durability-before-execution and checkpoint-based log replay.
 
 use std::fs::File;
+#[cfg(test)]
 use std::fs::OpenOptions;
 use std::io;
-use std::io::BufReader;
+#[cfg(test)]
 use std::io::Read;
+#[cfg(test)]
 use std::io::Write;
 
+#[cfg(test)]
 use sha2::Digest;
+#[cfg(test)]
 use sha2::Sha256;
 
 use super::Error;
@@ -17,6 +21,7 @@ use super::record;
 use crate::storage;
 use crate::vm;
 
+#[cfg(test)]
 const SEGMENT_HEADER_LENGTH: usize = 96;
 const RECORD_HEADER_LENGTH: usize = 64;
 const RECORD_OVERHEAD: usize = 72;
@@ -86,23 +91,6 @@ pub(super) fn envelope(
     Ok(bytes)
 }
 
-pub(super) fn segment_header(
-    database_id: [u8; 16],
-    segment: &storage::SegmentDescriptor,
-) -> [u8; SEGMENT_HEADER_LENGTH] {
-    let mut bytes = [0; SEGMENT_HEADER_LENGTH];
-    bytes[..8].copy_from_slice(b"BLOPLG01");
-    bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
-    bytes[10..12].copy_from_slice(&(SEGMENT_HEADER_LENGTH as u16).to_le_bytes());
-    bytes[16..32].copy_from_slice(&database_id);
-    bytes[32..40].copy_from_slice(&segment.segment_id.to_le_bytes());
-    bytes[40..48].copy_from_slice(&segment.first_sequence.to_le_bytes());
-    bytes[48..80].copy_from_slice(&segment.predecessor_digest);
-    let crc = crc32c::crc32c(&bytes);
-    bytes[92..96].copy_from_slice(&crc.to_le_bytes());
-    bytes
-}
-
 pub(super) fn append(
     store: &mut storage::Store,
     sequence: u64,
@@ -116,65 +104,7 @@ pub(super) fn append_batch<'a>(
     store: &mut storage::Store,
     records: impl IntoIterator<Item = (u64, &'a [u8])>,
 ) -> storage::Result<[u8; 32]> {
-    let mut records = records.into_iter().peekable();
-    let &(first, _) = records
-        .peek()
-        .ok_or(storage::Error::InvalidInput("empty log group"))?;
-    let mut manifest = store.manifest().clone();
-    let mut file = if !store.rotate_next
-        && let Some(segment) = manifest.segments.last()
-    {
-        let file = OpenOptions::new().append(true).open(
-            store
-                .directory()
-                .join(format!("log-{:020}.bin", segment.segment_id)),
-        )?;
-        match file.metadata()?.len().cmp(&segment.committed_bytes) {
-            std::cmp::Ordering::Less => {
-                return Err(storage::Error::Corrupt("truncated active log segment"));
-            }
-            std::cmp::Ordering::Greater => return Err(storage::Error::NeedsRecovery),
-            std::cmp::Ordering::Equal => {}
-        }
-        file
-    } else {
-        let (mut file, segment_id) =
-            storage::maintenance::allocate(store, "log", manifest.next_segment_id)?;
-        manifest.next_segment_id = segment_id + 1;
-        let segment = storage::SegmentDescriptor {
-            segment_id,
-            first_sequence: first,
-            last_sequence: first,
-            committed_bytes: SEGMENT_HEADER_LENGTH as u64,
-            predecessor_digest: manifest.durable_digest,
-            last_digest: manifest.durable_digest,
-        };
-        file.write_all(&segment_header(manifest.database_id, &segment))?;
-        manifest.segments.push(segment);
-        file
-    };
-    for (sequence, bytes) in records {
-        if sequence == u64::MAX || manifest.durable_sequence.checked_add(1) != Some(sequence) {
-            return Err(storage::Error::InvalidInput("noncontiguous log group"));
-        }
-        let digest = Sha256::digest(bytes).into();
-        let segment = manifest.segments.last_mut().unwrap();
-        segment.committed_bytes = segment
-            .committed_bytes
-            .checked_add(bytes.len() as u64)
-            .ok_or(storage::Error::Exhausted)?;
-        file.write_all(bytes)?;
-        segment.last_sequence = sequence;
-        segment.last_digest = digest;
-        manifest.durable_sequence = sequence;
-        manifest.durable_digest = digest;
-    }
-    let digest = manifest.durable_digest;
-    let checkpoint = storage::checkpoint_view(store);
-    // Publication flushes log files and directory entries before selecting D.
-    storage::publish(store, &checkpoint, manifest)?;
-    store.rotate_next = false;
-    Ok(digest)
+    storage::append_wal(store, records)
 }
 
 pub(super) fn publish_checkpoint(store: &mut storage::Store) -> storage::Result<()> {
@@ -200,24 +130,13 @@ pub(super) fn recover(store: &mut storage::Store) -> storage::Result<()> {
                 .join(format!("log-{:020}.bin", segment.segment_id)),
         )
         .map_err(authoritative_io)?;
-        let mut reader = BufReader::new(file.take(segment.committed_bytes));
-        let mut header = [0; SEGMENT_HEADER_LENGTH];
-        reader.read_exact(&mut header).map_err(authoritative_io)?;
-        if header != segment_header(manifest.database_id, segment) {
-            return Err(storage::Error::Corrupt(
-                "log segment header disagrees with manifest",
-            ));
-        }
-        let mut remaining = segment
-            .committed_bytes
-            .checked_sub(SEGMENT_HEADER_LENGTH as u64)
-            .ok_or(storage::Error::Corrupt(
-                "invalid committed log prefix length",
-            ))?;
         let mut predecessor = segment.predecessor_digest;
-        for sequence in segment.first_sequence..=segment.last_sequence {
-            let (bytes, digest) = read_record(&mut reader, remaining, sequence, predecessor)?;
-            remaining -= bytes.len() as u64;
+        for record in storage::wal::Records::new(file, manifest.database_id, segment)? {
+            let storage::wal::Record {
+                sequence,
+                digest,
+                bytes,
+            } = record?;
             if sequence == manifest.checkpoint_sequence && digest != manifest.checkpoint_digest {
                 return Err(storage::Error::Corrupt("log checkpoint digest mismatch"));
             }
@@ -247,7 +166,7 @@ pub(super) fn recover(store: &mut storage::Store) -> storage::Result<()> {
             }
             predecessor = digest;
         }
-        if remaining != 0 || predecessor != segment.last_digest {
+        if predecessor != segment.last_digest {
             return Err(storage::Error::Corrupt(
                 "committed log prefix endpoint mismatch",
             ));
@@ -323,61 +242,15 @@ fn replay_error(error: vm::Error) -> storage::Error {
     }
 }
 
+#[cfg(test)]
 pub(super) fn read_record(
     reader: &mut impl Read,
     remaining: u64,
     sequence: u64,
     predecessor: [u8; 32],
 ) -> storage::Result<(Vec<u8>, [u8; 32])> {
-    if remaining < RECORD_OVERHEAD as u64 {
-        return Err(storage::Error::Corrupt(
-            "record crosses committed log prefix",
-        ));
-    }
-    let mut header = [0; RECORD_HEADER_LENGTH];
-    reader.read_exact(&mut header).map_err(authoritative_io)?;
-    let length = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
-    let body_length = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
-    if !(RECORD_OVERHEAD..=MAX_RECORD_LENGTH).contains(&length)
-        || length as u64 > remaining
-        || body_length != length - RECORD_OVERHEAD
-    {
-        return Err(storage::Error::Corrupt("invalid log record length"));
-    }
-    let mut bytes = vec![0; length];
-    bytes[..RECORD_HEADER_LENGTH].copy_from_slice(&header);
-    reader
-        .read_exact(&mut bytes[RECORD_HEADER_LENGTH..])
-        .map_err(authoritative_io)?;
-    let crc = u32::from_le_bytes(bytes[length - 8..length - 4].try_into().unwrap());
-    let repeated_length = u32::from_le_bytes(bytes[length - 4..].try_into().unwrap()) as usize;
-    if crc32c::crc32c(&bytes[..length - 8]) != crc || repeated_length != length {
-        return Err(storage::Error::Corrupt("invalid log record trailer"));
-    }
-    if &header[..4] != b"BLR1"
-        || u16::from_le_bytes(header[4..6].try_into().unwrap()) != RECORD_HEADER_LENGTH as u16
-    {
-        return Err(storage::Error::Corrupt("invalid log record header"));
-    }
-    let version = u16::from_le_bytes(header[6..8].try_into().unwrap());
-    if version != 1 {
-        return Err(storage::Error::Unsupported {
-            format: "log record",
-            version,
-        });
-    }
-    if !(1..=3).contains(&header[24])
-        || header[25..28] != [0; 3]
-        || header[60..64] != [0; 4]
-        || u64::from_le_bytes(header[16..24].try_into().unwrap()) != sequence
-        || header[28..60] != predecessor
-    {
-        return Err(storage::Error::Corrupt(
-            "invalid log record fields or hash chain",
-        ));
-    }
-    let digest = Sha256::digest(&bytes).into();
-    Ok((bytes, digest))
+    let record = storage::wal::read_canonical(reader, remaining, sequence, predecessor)?;
+    Ok((record.bytes, record.digest))
 }
 
 #[cfg(test)]
@@ -524,7 +397,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(digest, predecessor);
-            assert_eq!(store.manifest().generation, before.generation + 1);
+            assert_eq!(store.manifest().generation, before.generation);
             assert_eq!(store.manifest().checkpoint_sequence, 1);
             assert_eq!(store.manifest().durable_sequence, 3);
             assert_eq!(store.manifest().segments.len(), if rotate { 2 } else { 1 });
@@ -542,10 +415,14 @@ mod tests {
             };
             assert_eq!(
                 &log[offset..],
-                records
-                    .into_iter()
-                    .flat_map(|(_, bytes)| bytes)
-                    .collect::<Vec<_>>()
+                storage::wal::tests::frame(
+                    2,
+                    before.durable_digest,
+                    &records
+                        .iter()
+                        .map(|(_, bytes)| bytes.as_slice())
+                        .collect::<Vec<_>>()
+                )
             );
             assert_eq!(&fs::read(&first).unwrap()[..prefix.len()], prefix);
             let path = store.directory().to_owned();
@@ -576,15 +453,14 @@ mod tests {
             let second = envelope(2, before.durable_digest, kind, &body).unwrap();
             let third = envelope(3, Sha256::digest(&second).into(), kind, &body).unwrap();
             let path = store.directory().to_owned();
-            let blocked = path.join("manifest.pending");
-            fs::create_dir(&blocked).unwrap();
+            let fault = storage::faults::Guard::new(Some((0, storage::faults::Failure::Error)));
             assert!(
                 append_batch(&mut store, [(2, second.as_slice()), (3, third.as_slice())]).is_err()
             );
+            drop(fault);
             assert_eq!(store.manifest(), &before);
             assert_eq!(entries(&store, TreeId::Outcomes).len(), 1);
             drop(store);
-            fs::remove_dir(blocked).unwrap();
             let mut reopened = storage::open(path).unwrap();
             recover(&mut reopened).unwrap();
             assert_eq!(reopened.manifest().durable_sequence, 1);
@@ -617,9 +493,17 @@ mod tests {
             manifest: None,
         };
         commit(&mut store, &command).unwrap();
-        let log = fs::read(store.directory().join("log-00000000000000000001.bin")).unwrap();
-        let length = u32::from_le_bytes(log[log.len() - 4..].try_into().unwrap()) as usize;
-        let body = &log[log.len() - length + RECORD_HEADER_LENGTH..log.len() - 8];
+        let log = storage::wal::Records::new(
+            File::open(store.directory().join("log-00000000000000000001.bin")).unwrap(),
+            store.genesis().database_id,
+            &store.manifest().segments[0],
+        )
+        .unwrap()
+        .last()
+        .unwrap()
+        .unwrap()
+        .bytes;
+        let body = &log[RECORD_HEADER_LENGTH..log.len() - 8];
         let decoded = record::decode(1, body).unwrap();
         assert_eq!(record::encode(&decoded).unwrap().1, body);
         let record::Command::Transaction { manifest, .. } = decoded else {
@@ -1013,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn unpublished_valid_tail_is_ignored_and_append_reuses_only_its_position() {
+    fn physically_incomplete_group_is_discarded_without_reusing_committed_sequences() {
         let (_directory, mut store) = create();
         commit(&mut store, &transaction(tx! { return 1; }.unwrap())).unwrap();
         let segment = store.manifest().segments[0];
@@ -1022,8 +906,9 @@ mod tests {
         let prefix = fs::read(&log).unwrap();
         let (kind, body) = record::encode(&transaction(tx! { return 999; }.unwrap())).unwrap();
         let bytes = envelope(2, segment.last_digest, kind, &body).unwrap();
+        let frame = storage::wal::tests::single(&bytes);
         let mut file = OpenOptions::new().append(true).open(&log).unwrap();
-        file.write_all(&bytes).unwrap();
+        file.write_all(&frame[..frame.len() - 1]).unwrap();
         file.sync_all().unwrap();
         drop(file);
         drop(store);

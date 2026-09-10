@@ -5,10 +5,8 @@
 //! modifying or replacing those bytes outside the owner invalidates the proof.
 
 use std::fs::File;
-use std::io::BufReader;
 use std::io::Read;
 use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::{
     self,
 };
@@ -22,6 +20,26 @@ use super::metadata;
 use super::metadata::SEGMENT_HEADER_LENGTH;
 
 const MAX_PENDING_ANCHORS: u64 = 4096;
+
+/// Extend a live-owner proof with canonical records checked before its own WAL
+/// append and flushed as one complete group. No file or generation was
+/// replaced.
+pub(super) fn committed(
+    proof: &LogValidation,
+    previous: &Manifest,
+    next: &Manifest,
+    digests: &[[u8; 32]],
+) -> Option<LogValidation> {
+    if &proof.manifest != previous
+        || next.durable_sequence - next.checkpoint_sequence > MAX_PENDING_ANCHORS
+    {
+        return None;
+    }
+    let mut proof = proof.clone();
+    proof.pending.extend_from_slice(digests);
+    proof.manifest = next.clone();
+    Some(proof)
+}
 
 /// Validated immutable prefixes and the digests needed by later checkpoints.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,39 +204,31 @@ pub(super) fn validate_extension(
 }
 
 fn validate_segment_extension(
-    mut file: impl Read + Seek,
+    file: impl Read + Seek,
     manifest: &Manifest,
     segment: &SegmentDescriptor,
     offset: u64,
     first_sequence: u64,
-    mut predecessor: [u8; 32],
+    predecessor: [u8; 32],
     pending: &mut Vec<[u8; 32]>,
 ) -> Result<()> {
-    let mut header = [0; SEGMENT_HEADER_LENGTH as usize];
-    metadata::read_committed(&mut file, &mut header)?;
-    metadata::validate_segment_header(&header, &manifest.database_id, segment)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut remaining = segment.committed_bytes - offset;
-    // Take must be inside BufReader so prefetch never crosses the committed
-    // end.
-    let mut reader = BufReader::new(file.take(remaining));
-    for sequence in first_sequence..=segment.last_sequence {
-        let (length, digest) =
-            metadata::validate_record(&mut reader, remaining, sequence, predecessor)?;
-        if sequence == manifest.checkpoint_sequence && digest != manifest.checkpoint_digest {
+    for record in super::wal::Records::suffix(
+        file,
+        manifest.database_id,
+        segment,
+        offset,
+        first_sequence,
+        predecessor,
+    )? {
+        let record = record?;
+        if record.sequence == manifest.checkpoint_sequence
+            && record.digest != manifest.checkpoint_digest
+        {
             return Err(Error::Corrupt("log checkpoint digest mismatch"));
         }
-        if sequence > manifest.checkpoint_sequence {
-            pending.push(digest);
+        if record.sequence > manifest.checkpoint_sequence {
+            pending.push(record.digest);
         }
-        remaining -= length;
-        predecessor = digest;
-    }
-    if remaining != 0 {
-        return Err(Error::Corrupt("excess bytes inside committed log prefix"));
-    }
-    if predecessor != segment.last_digest {
-        return Err(Error::Corrupt("log final digest mismatch"));
     }
     Ok(())
 }
@@ -227,6 +237,7 @@ fn validate_segment_extension(
 mod tests {
     use std::fs;
     use std::fs::OpenOptions;
+    use std::io::SeekFrom;
     use std::io::Write;
     use std::ops::Range;
 
@@ -328,10 +339,11 @@ mod tests {
         let mut digests = Vec::new();
         for sequence in previous.durable_sequence + 1..=previous.durable_sequence + count {
             let bytes = record(sequence, tail.last_digest);
-            file.write_all(&bytes).unwrap();
+            let frame = crate::storage::wal::tests::single(&bytes);
+            file.write_all(&frame).unwrap();
             tail.last_sequence = sequence;
             tail.last_digest = hash(&bytes);
-            tail.committed_bytes += bytes.len() as u64;
+            tail.committed_bytes += frame.len() as u64;
             digests.push(tail.last_digest);
         }
         next.durable_sequence = tail.last_sequence;
@@ -553,13 +565,21 @@ mod tests {
         let original = fs::read(&path).unwrap();
         let offset = previous.segments[0].committed_bytes as usize;
         for index in 0..64 {
-            let mut bytes = original.clone();
-            bytes[offset + index] ^= 0x80;
-            let end = bytes.len() - 8;
-            let crc = crc32c::crc32c(&bytes[offset..end]);
-            bytes[end..end + 4].copy_from_slice(&crc.to_le_bytes());
+            let mut record = original[offset + crate::storage::wal::HEADER_BYTES
+                ..original.len() - crate::storage::wal::TRAILER_BYTES]
+                .to_vec();
+            record[index] ^= 0x80;
+            let end = record.len() - 8;
+            let crc = crc32c::crc32c(&record[..end]);
+            record[end..end + 4].copy_from_slice(&crc.to_le_bytes());
+            let mut bytes = original[..offset].to_vec();
+            bytes.extend_from_slice(&crate::storage::wal::tests::frame(
+                previous.durable_sequence + 1,
+                previous.durable_digest,
+                &[&record],
+            ));
             let mut forged = next.clone();
-            forged.durable_digest = hash(&bytes[offset..]);
+            forged.durable_digest = hash(&record);
             forged.segments[0].last_digest = forged.durable_digest;
             forged.encode().unwrap();
             fs::write(&path, bytes).unwrap();

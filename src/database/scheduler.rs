@@ -1598,7 +1598,7 @@ mod tests {
         .unwrap();
         assert!(barrier.is_none());
         assert!(head.is_none());
-        assert_eq!(store.manifest().generation, generation + 1);
+        assert_eq!(store.manifest().generation, generation);
         assert_eq!(store.manifest().durable_sequence, 3);
         assert_eq!(store.manifest().checkpoint_sequence, 0);
         assert_eq!(schedule.entries.len(), 3);
@@ -1628,7 +1628,7 @@ mod tests {
             options.checkpoint_interval,
         )
         .unwrap();
-        assert_eq!(store.manifest().generation, generation + 1);
+        assert_eq!(store.manifest().generation, generation);
         assert_eq!(store.manifest().checkpoint_sequence, 0);
         assert_eq!(schedule.frontier, 3);
         assert!(schedule.entries.is_empty());
@@ -1642,7 +1642,7 @@ mod tests {
         drop(store);
         let mut reopened = storage::open(directory.path().join("group")).unwrap();
         engine::recover(&mut reopened).unwrap();
-        assert_eq!(reopened.manifest().generation, generation + 2);
+        assert_eq!(reopened.manifest().generation, generation + 1);
     }
 
     #[tokio::test]
@@ -1892,7 +1892,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store.manifest().durable_sequence, 64);
-        assert_eq!(store.manifest().generation, 2);
+        assert_eq!(store.manifest().generation, 1);
         assert_eq!(schedule.entries.len(), 64);
         assert!(head.is_none());
         assert_eq!(receiver.len(), 6);
@@ -1919,9 +1919,6 @@ mod tests {
             )
             .await;
             let path = store.directory().to_owned();
-            if publication_failure {
-                std::fs::create_dir(path.join("manifest.pending")).unwrap();
-            }
             let (_, control) = mpsc::channel(1);
             let (status, observed) = watch::channel(initial_status(options.clone()));
             let hooks = Arc::new(workers::test_support::Hooks::default());
@@ -1929,6 +1926,9 @@ mod tests {
             let pool = workers::start(options.workers, hooks.clone()).unwrap();
             let writer_queue = queue.clone();
             thread::spawn(move || {
+                let _fault = storage::faults::Guard::new(
+                    publication_failure.then_some((0, storage::faults::Failure::Error)),
+                );
                 run(
                     store,
                     receiver,
@@ -1961,15 +1961,9 @@ mod tests {
                 );
             }
             assert_eq!(queue.count.available_permits(), queue.max_count);
-            if publication_failure {
-                std::fs::remove_dir(path.join("manifest.pending")).unwrap();
-            }
             let mut reopened = storage::open(path).unwrap();
             assert_eq!(reopened.manifest().checkpoint_sequence, 0);
-            assert_eq!(
-                reopened.manifest().generation,
-                if publication_failure { 1 } else { 2 }
-            );
+            assert_eq!(reopened.manifest().generation, 1);
             engine::recover(&mut reopened).unwrap();
             let expected = if publication_failure { 0 } else { 3 };
             assert_eq!(reopened.manifest().checkpoint_sequence, expected);

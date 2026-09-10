@@ -550,8 +550,8 @@ async fn import_fault_phases_recover_only_preverified_durable_prefixes() {
         let _ = db::close(&replica).await;
         assert!(db::status(&replica).poisoned);
         assert_eq!(
-            std::fs::read(directory.path().join("replica/CURRENT")).unwrap() == selected,
-            expected == 2
+            std::fs::read(directory.path().join("replica/CURRENT")).unwrap(),
+            selected
         );
         let store = storage::open(directory.path().join("replica")).unwrap();
         assert_eq!(store.manifest().durable_sequence, expected);
@@ -726,8 +726,8 @@ async fn process_exit_discards_validation_or_recovers_selected_verified_prefix_w
             .unwrap();
         assert_eq!(exit.code(), Some(77));
         assert_eq!(
-            std::fs::read(directory.path().join("replica/CURRENT")).unwrap() == selected,
-            expected == 2
+            std::fs::read(directory.path().join("replica/CURRENT")).unwrap(),
+            selected
         );
         let replica = db::open(directory.path().join("replica")).await.unwrap();
         let snapshot = db::snapshot(&replica).await.unwrap();

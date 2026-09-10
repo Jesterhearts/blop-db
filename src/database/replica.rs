@@ -2,8 +2,6 @@
 //! replay.
 
 use std::fs::File;
-use std::io::BufReader;
-use std::io::Read;
 
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -97,28 +95,17 @@ pub(super) fn batch(
                 .join(format!("log-{:020}.bin", segment.segment_id)),
         )
         .map_err(|e| Error::Storage(e.into()))?;
-        let mut reader = BufReader::new(file.take(segment.committed_bytes));
-        let mut header = [0; 96];
-        reader
-            .read_exact(&mut header)
-            .map_err(|e| Error::Storage(e.into()))?;
-        if header != engine::segment_header(manifest.database_id, segment) {
-            return Err(corrupt("logical feed segment header mismatch"));
-        }
-        let mut remaining = segment
-            .committed_bytes
-            .checked_sub(96)
-            .ok_or_else(|| corrupt("short logical segment"))?;
-        let mut predecessor = segment.predecessor_digest;
+        let mut reader = storage::wal::Records::new(file, manifest.database_id, segment)
+            .map_err(Error::Storage)?;
         for sequence in segment.first_sequence..=segment.last_sequence {
             if sequence > frontier || records.len() == limits.max_records {
                 break 'segments;
             }
-            let (log_record, digest) =
-                engine::read_record(&mut reader, remaining, sequence, predecessor)
-                    .map_err(Error::Storage)?;
-            remaining -= log_record.len() as u64;
-            predecessor = digest;
+            let storage::wal::Record {
+                bytes: log_record,
+                digest,
+                ..
+            } = reader.next().unwrap().map_err(Error::Storage)?;
             if sequence == manifest.checkpoint_sequence && digest != manifest.checkpoint_digest {
                 return Err(corrupt("logical feed checkpoint anchor mismatch"));
             }
@@ -148,9 +135,6 @@ pub(super) fn batch(
                 outcome,
             });
             end = sequence;
-        }
-        if remaining != 0 || predecessor != segment.last_digest {
-            return Err(corrupt("logical feed segment endpoint mismatch"));
         }
     }
     if end < frontier && records.len() < limits.max_records && !byte_limited {

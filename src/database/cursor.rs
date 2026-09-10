@@ -2,8 +2,6 @@
 //! log.
 
 use std::fs::File;
-use std::io::BufReader;
-use std::io::Read;
 use std::ops::Bound;
 
 use super::BatchLimits;
@@ -16,7 +14,6 @@ use super::FeedBatch;
 use super::Result;
 use super::Snapshot;
 use super::Watermark;
-use super::engine;
 use super::feed;
 use super::snapshot;
 use crate::storage::Mutation;
@@ -457,29 +454,10 @@ fn log_available(
         {
             return Err(Error::HistoryUnavailable);
         }
-        let mut reader = BufReader::new(file.take(segment.committed_bytes));
-        let mut header = [0; 96];
-        reader
-            .read_exact(&mut header)
-            .map_err(|error| Error::Storage(error.into()))?;
-        if header != engine::segment_header(manifest.database_id, segment) {
-            return Err(Error::Storage(storage::Error::Corrupt(
-                "cursor log header mismatch",
-            )));
-        }
-        let mut remaining = segment.committed_bytes - 96;
-        let mut predecessor = segment.predecessor_digest;
-        for sequence in segment.first_sequence..=segment.last_sequence {
-            let (bytes, digest) =
-                engine::read_record(&mut reader, remaining, sequence, predecessor)
-                    .map_err(Error::Storage)?;
-            remaining -= bytes.len() as u64;
-            predecessor = digest;
-        }
-        if remaining != 0 || predecessor != segment.last_digest {
-            return Err(Error::Storage(storage::Error::Corrupt(
-                "cursor log trailer mismatch",
-            )));
+        for record in storage::wal::Records::new(file, manifest.database_id, segment)
+            .map_err(Error::Storage)?
+        {
+            record.map_err(Error::Storage)?;
         }
         next = segment.last_sequence + 1;
     }

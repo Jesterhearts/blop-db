@@ -710,7 +710,7 @@ mod tests {
         log[48..80].copy_from_slice(&store.manifest().genesis_digest);
         let crc = crc32c::crc32c(&log);
         log[92..96].copy_from_slice(&crc.to_le_bytes());
-        log.extend_from_slice(&record);
+        log.extend_from_slice(&storage::wal::tests::single(&record));
         std::fs::write(store.directory().join("log-00000000000000000001.bin"), &log).unwrap();
         let mut manifest = store.manifest().clone();
         manifest.durable_sequence = 1;

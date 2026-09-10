@@ -1,5 +1,5 @@
-//! Append-only, copy-on-write storage using the version 1 page and publication
-//! formats.
+//! Append-only, copy-on-write storage using version 1 pages and WAL
+//! publication.
 //!
 //! This is an engine-facing API, not a transaction execution API. Physical
 //! batches contain already-validated system entries. The caller owns
@@ -22,8 +22,11 @@ mod metadata;
 pub mod mvcc;
 mod page;
 mod platform;
+#[cfg(test)]
+pub(crate) use platform::faults;
 mod store;
 mod tree;
+pub(crate) mod wal;
 
 use std::fmt;
 use std::io;
@@ -47,6 +50,7 @@ pub use store::prepare_checkpoint;
 pub use store::publish;
 pub use store::scan;
 pub use store::view;
+pub(crate) use store::wal::append_wal;
 
 /// A physical system-tree identity from storage format 1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
