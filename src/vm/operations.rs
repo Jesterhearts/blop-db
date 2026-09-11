@@ -1,4 +1,4 @@
-//! Pure transforms on values whose operand shapes the reader has verified.
+//! Compute pure value transforms after the reader has verified operand shapes.
 
 use sha2::Digest;
 

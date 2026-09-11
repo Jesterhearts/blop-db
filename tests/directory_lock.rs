@@ -1,5 +1,7 @@
-//! Isolated from parallel unit tests: fork temporarily inherits their file
-//! descriptions until exec, which can otherwise delay unrelated lock release.
+//! Check directory locking in a separate test process.
+//!
+//! Keeping this test separate prevents forked children from temporarily
+//! inheriting parallel unit tests' file descriptions and delaying their locks.
 
 #![cfg(any(unix, windows))]
 

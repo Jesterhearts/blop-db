@@ -1,5 +1,7 @@
-//! Per-descriptor, bounded decoded-node storage. Overflow values are never
-//! retained. Readers can keep nodes alive after eviction, outside this budget.
+//! Cache decoded nodes within a byte budget for each page-file descriptor.
+//!
+//! The cache excludes overflow values. Readers may retain evicted nodes; that
+//! memory is outside the cache's retention budget.
 
 use std::sync::Arc;
 use std::sync::Mutex;

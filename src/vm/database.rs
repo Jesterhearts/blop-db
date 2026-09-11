@@ -1,10 +1,10 @@
-//! Storage adaptation for the single-threaded reference interpreter.
+//! Connect the reference interpreter to historical metadata and physical
+//! storage.
 //!
-//! Callers protect historical reads and supply the pre-record snapshot.
-//! Installing a result changes physical roots only: it neither writes a log nor
-//! publishes a durable or visible frontier. Recovery must exclude
-//! post-checkpoint materialization before replay; this module does not retry
-//! resolved sequences.
+//! Callers must protect history and supply the state before the record.
+//! Installation updates physical roots, but does not write a log or publish
+//! durability or visibility. Before replay, exclude all materialization after
+//! the checkpoint. Installation cannot be repeated at a resolved sequence.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -29,8 +29,9 @@ use crate::storage::mvcc;
 
 pub(super) type Overlay = BTreeMap<(u64, Vec<u8>), Option<Vec<u8>>>;
 
-/// A catalogue request, validated before its state-dependent outcome is
-/// computed.
+/// A table creation, rename, or drop request.
+///
+/// Validate its format before computing the outcome from historical state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogueOperation {
     Create {
@@ -47,7 +48,9 @@ pub enum CatalogueOperation {
     },
 }
 
-/// Complete immutable-schema catalogue metadata at one effective sequence.
+/// A table's complete catalogue metadata at one effective sequence.
+///
+/// The table's schemas remain immutable across catalogue versions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogueVersion {
     pub live: bool,
@@ -452,8 +455,9 @@ fn administrative_abort(reason: AbortReason) -> Outcome {
     })
 }
 
-/// Validate syntax only; name conflicts and table liveness are durable
-/// outcomes.
+/// Validate catalogue request syntax before sequencing.
+///
+/// Name conflicts and live-table checks produce durable execution outcomes.
 pub(crate) fn validate_catalogue(operation: &CatalogueOperation) -> Result<()> {
     match operation {
         CatalogueOperation::Create { name, key, value } => {
@@ -539,9 +543,10 @@ pub(super) fn limits(policy: &LimitPolicy) -> Outcome {
     }
 }
 
-/// Install validated interpreter output once, with its complete D.3 outcome.
-/// The caller owns sequencing and must exclude speculative materialization when
-/// replaying from a checkpoint. This is not an idempotent replay API.
+/// Install validated interpreter output and its complete D.3 outcome once.
+///
+/// The caller controls sequencing. For replay, start from the checkpoint
+/// without later materialization. Repeating installation is not idempotent.
 pub(crate) fn install(
     store: &mut Store,
     sequence: u64,

@@ -1,8 +1,7 @@
-//! Metadata codecs and read-only validation of specified log prefixes.
+//! Encode metadata and validate specified log prefixes without changing files.
 //!
-//! These checks do not select a manifest, validate page contents, compare
-//! successive publications, or interpret log bodies. Those checks belong to the
-//! store and engine.
+//! The store and engine separately select manifests, check pages and
+//! publication transitions, and interpret log bodies.
 
 use std::fs::File;
 use std::io::Read;
@@ -44,7 +43,9 @@ const LIMIT_CEILINGS: [u64; 17] = [
     16 * 1024 * 1024,
 ];
 
-/// Validated limits in ascending resource-ID order. Zero disables a resource.
+/// Validated resource limits in ascending resource-ID order.
+///
+/// Zero is valid and prevents use of that resource.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LimitPolicy([u64; 17]);
 
@@ -543,9 +544,9 @@ fn u64_at(
 /// Validate exactly the supplied log prefixes without changing the directory.
 /// Every segment contains version-1 WAL groups.
 ///
-/// Bodies remain opaque, except for the fixed SetLimits body length. This
-/// checks framing and integrity, not transaction, catalogue, or policy body
-/// semantics.
+/// Check framing and integrity. Apart from the fixed SetLimits body length,
+/// body contents are left to the engine's transaction, catalogue, and policy
+/// validation.
 pub fn validate_logs(
     directory: &Path,
     manifest: &Manifest,

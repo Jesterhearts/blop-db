@@ -1,5 +1,7 @@
-//! Normalized C.4 access declarations, independent of execution and storage
-//! rows.
+//! Normalize and encode access declarations under design section C.4.
+//!
+//! These declarations describe possible accesses without executing the program
+//! or reading stored rows.
 
 use std::collections::BTreeMap;
 
@@ -10,8 +12,11 @@ use crate::storage::LimitPolicy;
 use crate::storage::encoding;
 use crate::storage::encoding::Schema;
 
-/// An address set. Key bytes use the table's canonical ordered key encoding,
-/// not its value encoding. An empty key is distinct from a whole-table scope.
+/// A set of addresses: one canonical key or every possible key in a table.
+///
+/// Key bytes use the table's ordered key encoding rather than its value
+/// encoding. An empty encoded key still identifies a point, not the whole
+/// table.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Scope {
     Table(u64),
@@ -33,7 +38,10 @@ impl Scope {
     }
 }
 
-/// C.4 wire modes. Blind STORE and DELETE need only Write; INSERT needs both.
+/// Read and write modes in the C.4 encoding.
+///
+/// Unconditional STORE and DELETE need Write only. INSERT checks presence and
+/// therefore needs both Read and Write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum AccessMode {
@@ -51,9 +59,12 @@ fn mode(bits: u8) -> Result<AccessMode> {
     }
 }
 
-/// Sorted, duplicate-free declarations with table suppression applied per mode.
-/// Construction checks structural invariants. Preparation additionally checks
-/// historical schemas, program table membership, coverage and resource 7.
+/// Sorted unique access declarations, normalized separately for reads and
+/// writes.
+///
+/// A table scope suppresses point scopes of the same mode. Construction checks
+/// structure. Preparation also checks historical schemas, program table
+/// membership, access coverage, and resource 7 usage.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AccessManifest {
     entries: Vec<(Scope, AccessMode)>,
@@ -132,9 +143,11 @@ impl AccessManifest {
         Ok(bytes)
     }
 
-    /// Decode canonical C.4 bytes. Unlike `new`, this rejects rather than fixes
-    /// duplicate, unsorted or suppressed entries. Key schemas are checked later
-    /// by `prepare_transaction` against the historical catalogue.
+    /// Decode canonical C.4 bytes without repairing invalid declarations.
+    ///
+    /// Reject duplicates, unsorted entries, and points suppressed by table
+    /// scopes. `prepare_transaction` later checks keys against historical
+    /// schemas.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut input = bytes;
         let count = u32::from_le_bytes(take(&mut input, 4)?.try_into().unwrap()) as usize;
@@ -197,8 +210,10 @@ impl AccessManifest {
     }
 }
 
-/// Whether two address sets intersect. Modes and sequence order belong to the
-/// caller: section 8 dependencies compare earlier writes with later reads only.
+/// Return whether two address sets intersect.
+///
+/// The caller supplies mode and sequence rules. Design section 8 requires
+/// dependencies from earlier writes to later reads only.
 pub fn overlap(
     left: &Scope,
     right: &Scope,

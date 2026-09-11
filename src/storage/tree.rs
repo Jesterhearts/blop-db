@@ -1,5 +1,6 @@
-//! Immutable-root B+ tree operations. Only the changed path and repair siblings
-//! are copied.
+//! Read and edit B+ trees through immutable roots.
+//!
+//! Edits copy the changed path and any sibling nodes needed for repair.
 
 use std::collections::HashSet;
 use std::ops::Bound;
@@ -52,7 +53,7 @@ pub(super) fn get(
     }
 }
 
-/// Keeps the selected cell alive without copying its key or inline value.
+/// A retained leaf cell whose key and inline value can be read without copying.
 pub(super) struct LocatedCell {
     node: Arc<Node>,
     index: usize,
@@ -119,8 +120,9 @@ struct Frame {
     next: usize,
 }
 
-/// Owns a pinned reader, one leaf, and the ancestor path, not the complete
-/// result set.
+/// A scan holding a pinned reader, one leaf, and its ancestor path.
+///
+/// Results are read incrementally rather than stored as a complete set.
 pub struct Scan {
     reader: PageReader,
     tree: TreeId,
@@ -566,7 +568,7 @@ fn split_point(
         .ok_or(Error::InvalidInput("node cannot be split"))
 }
 
-/// Checks every reachable node and overflow page, including unique ownership.
+/// Check every reachable node and overflow page, including unique ownership.
 pub(super) fn validate(
     reader: &PageReader,
     tree: TreeId,

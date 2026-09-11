@@ -1,5 +1,7 @@
-//! Error injection exercises real files, but does not emulate power loss, lost
-//! device caches, or reordered writes. Recovery always follows CURRENT.
+//! Test publication errors using real files and CURRENT-selected recovery.
+//!
+//! Error injection does not emulate power loss, lost device caches, or
+//! reordered writes.
 
 use super::*;
 use crate::storage::platform::faults::Event;

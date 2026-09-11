@@ -1,6 +1,9 @@
-//! Durable registration -> dependency-ready interpretation -> serial
-//! installation -> visible receipts -> periodic checkpoints. No worker
-//! publishes roots or tentative state.
+//! Schedule durable transactions and publish only complete visible prefixes.
+//!
+//! Register dependencies, dispatch ready work, then install complete results
+//! on the coordinator. Advance visibility and release receipts, publishing a
+//! checkpoint first when its interval is reached. Workers never publish roots
+//! or tentative state.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -38,9 +41,10 @@ use super::workers;
 use crate::storage;
 use crate::vm;
 
-/// Last coordinator sample. Available without waiting for workers or storage
-/// I/O. Byte fields report reserved capacity, not measured allocator or disk
-/// usage.
+/// The latest sampled engine status, available without waiting for workers or
+/// I/O.
+///
+/// Byte fields show reserved capacity rather than measured memory or disk use.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineStatus {
     pub options: EngineOptions,

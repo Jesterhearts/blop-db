@@ -1,9 +1,9 @@
-//! Canonical record bodies for the serial writer and replay.
+//! Encode, decode, and validate canonical records for the writer and recovery.
 //!
-//! Decoding checks the body format; validation checks the complete program and
-//! arguments against the historical catalogue and policy before execution.
-//! Preparation fills absent manifests. Decoded declarations are never replaced
-//! with a narrower derivation: the recorded count defines resource 7 usage.
+//! Decoding checks the body format. Validation checks the complete program and
+//! arguments against their historical catalogue and policy before execution.
+//! Preparation derives a manifest only when none was supplied. Preserve
+//! decoded declarations because their recorded count defines resource 7 usage.
 
 use crate::Transaction;
 use crate::storage;

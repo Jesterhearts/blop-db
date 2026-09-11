@@ -1,17 +1,20 @@
-//! Append-only, copy-on-write storage using version 1 pages and WAL
-//! publication.
+//! Store immutable pages and publish version 1 write-ahead log (WAL) groups.
 //!
-//! This is an engine-facing API, not a transaction execution API. Physical
-//! batches contain already-validated system entries. The caller owns
-//! catalogue/schema consistency, outcomes, durability-before-execution,
-//! resolved-prefix selection and retention claims. A [`View`] is an immutable
-//! physical root set, not an externally visible database snapshot.
+//! This engine-facing API uses append-only, copy-on-write pages. Supply
+//! validated system entries in physical batches. The caller must check schemas
+//! and catalogue consistency, record complete outcomes, make logs durable
+//! before execution, select resolved prefixes, and protect retention claims.
 //!
-//! Durability requires atomic same-directory rename and working file and
-//! directory synchronization. The Windows backend is experimental and has not
-//! been runtime-tested; synchronization errors are propagated, not ignored. One
-//! process owns the directory until its store, views and scans have all been
-//! dropped. No VM, sequencer, logical log writer or changefeed is included.
+//! A [`View`] pins physical roots; it does not establish public visibility. Use
+//! [`crate::database`] for transaction execution, sequencing, logical log
+//! writing, and changefeeds.
+//!
+//! # Platform requirements
+//!
+//! Durability requires atomic same-directory replacement and working file and
+//! directory synchronization. Synchronization failures are returned as errors.
+//! The Windows backend is experimental and has not been runtime-tested. One
+//! process owns the directory until its store, views, and scans are dropped.
 
 pub(crate) mod backup;
 mod checkpoint;
@@ -69,7 +72,7 @@ impl TreeId {
     }
 }
 
-/// An owned physical key and value, in unsigned lexicographic key order.
+/// An owned physical key and value; scans order entries by unsigned key bytes.
 pub type Entry = (Vec<u8>, Vec<u8>);
 
 /// A storage failure, never a transaction's semantic abort.

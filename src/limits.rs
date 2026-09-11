@@ -1,26 +1,25 @@
-//! Named transaction claims and database limit policies.
+//! Set named resource limits for transactions and database policy.
 
 use crate::storage::Error;
 use crate::storage::LimitPolicy;
 
-/// Semantic resource bounds for transaction claims or a database limit policy.
+/// Logical resource bounds used as transaction claims or database policy.
 ///
-/// Fields follow ascending resource-ID order from DESIGN D.2. Zero is valid and
-/// can disable a category of work. Conversion to [`LimitPolicy`] validates
-/// every field against its hard ceiling.
+/// Fields follow ascending resource-ID order in design section D.2. Zero is
+/// valid and can disable a category of work. Conversion to [`LimitPolicy`]
+/// checks each field against its format ceiling.
 ///
 /// Byte limits measure logical encodings, not physical memory or disk usage.
 /// They exclude page framing, allocation overhead, hashing costs, and obsolete
 /// MVCC entries. Shared backing memory does not reduce the logical charge.
 ///
-/// [`Default`] uses generous, finite format ceilings, not an
-/// application-specific policy. Override individual fields with struct update
-/// syntax, for example `Limits { writes: 100, ..Limits::default() }`. Defaults
-/// are selected only at submission or database creation, never during decoding
-/// or replay. Persisted claims and policies remain authoritative.
+/// [`Default`] uses finite format ceilings. Override fields for the
+/// application, for example `Limits { writes: 100, ..Limits::default() }`.
+/// Defaults apply only when creating a database or submitting a transaction.
+/// Decoding and replay use the stored claims and policies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
-    /// Entire Program encoding in bytes, including its header and constants.
+    /// Maximum program bytes, including its header and constants.
     pub program_bytes: u64,
     /// Decoded instruction count at admission; instruction visits at execution.
     pub instructions: u64,
@@ -28,7 +27,7 @@ pub struct Limits {
     pub registers: u64,
     /// Declared and supplied argument count.
     pub arguments: u64,
-    /// Entire Arguments encoding in bytes, including count and Blob prefixes.
+    /// Maximum argument bytes, including the count and Blob length prefixes.
     pub argument_bytes: u64,
     /// Program table count.
     pub tables: u64,
@@ -63,7 +62,7 @@ pub struct Limits {
     /// Replacing an entry replaces its charge; tombstones have zero value
     /// length.
     pub overlay_bytes: u64,
-    /// Returned value encoding bytes, excluding its TypeDesc and Blob wrapper.
+    /// Maximum returned value bytes, excluding its TypeDesc and Blob wrapper.
     pub result_bytes: u64,
 }
 

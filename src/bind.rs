@@ -2,7 +2,7 @@ use std::fmt;
 
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024 * 1024;
 
-/// A compiled transaction program and its separately encoded arguments.
+/// A compiled program paired with a separate encoding of its captured inputs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Transaction {
     program: Vec<u8>,
@@ -10,7 +10,9 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// Reconstruct replay input. The record layer must validate it before use.
+    /// Reconstruct input from saved bytes for validation and replay.
+    ///
+    /// The record layer must validate these bytes before execution.
     #[cfg(any(unix, windows))]
     pub(crate) fn from_parts(
         program: Vec<u8>,
@@ -24,7 +26,7 @@ impl Transaction {
         &self.program
     }
 
-    /// Return the encoded arguments, including their count and Blob lengths.
+    /// Return encoded arguments, including their count and length prefixes.
     pub fn argument_bytes(&self) -> &[u8] {
         &self.arguments
     }
@@ -35,7 +37,7 @@ impl Transaction {
     }
 }
 
-/// A failure to bind runtime inputs to a compiled transaction program.
+/// An error while binding captured inputs or table IDs to a compiled program.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuildError {
     /// A captured byte or string value exceeds its declared byte bound.
@@ -77,7 +79,7 @@ impl fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
-/// Append one length-prefixed Blob without changing `out` on error.
+/// Append one length-prefixed Blob, leaving `out` unchanged if encoding fails.
 pub fn push_blob(
     out: &mut Vec<u8>,
     bytes: &[u8],
@@ -101,13 +103,12 @@ pub fn push_blob(
     Ok(())
 }
 
-/// Bind table IDs to a compiler-validated template and attach encoded
-/// arguments.
+/// Bind table IDs and encoded arguments to a compiler-validated template.
 ///
-/// Each patch contains an absolute byte offset and an original table
-/// declaration index. Only the table array and these u16 operands are
-/// rewritten. Checks here protect binding ranges and indices; they do not
-/// validate bytecode or arguments.
+/// Each patch identifies an absolute byte offset and an original table
+/// declaration index. Rewrite only the table array and those u16 operands.
+/// These checks validate binding ranges and indices; the VM must still
+/// validate bytecode and arguments.
 pub fn bind_program(
     template: &'static [u8],
     table_offset: usize,

@@ -1,5 +1,7 @@
-//! Complete D.3 framing. Schema and exact-version correspondence belong to
-//! history validation.
+//! Encode and decode complete outcomes using design section D.3.
+//!
+//! History validation separately checks schemas and agreement with exact
+//! sequence-tagged versions.
 
 use super::Abort;
 use super::AbortReason;
@@ -21,7 +23,7 @@ use crate::storage::View;
 
 const MAX_OUTCOME_BYTES: usize = 128 * 1024 * 1024;
 
-/// An outcome bound to its canonical log record, independent of page layout.
+/// A resolved outcome identified by its canonical log record and sequence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutcomeRecord {
     pub sequence: u64,
@@ -168,9 +170,10 @@ fn validate_success(
     Ok(())
 }
 
-/// Decode exactly one complete outcome. Invalid input remains a codec error;
-/// authoritative readers must classify it as corruption, preserving
-/// Unsupported.
+/// Decode exactly one outcome and reject incomplete or trailing data.
+///
+/// Readers of authoritative history must classify invalid encoding as
+/// corruption while preserving unsupported-version errors.
 pub fn decode_outcome(bytes: &[u8]) -> Result<OutcomeRecord> {
     if bytes.len() > MAX_OUTCOME_BYTES {
         return Err(Error::Invalid("outcome exceeds 128 MiB"));
@@ -337,8 +340,10 @@ fn descriptor(ty: &Type) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Encode a validated D.3 record, canonicalizing final effect order. Duplicate
-/// addresses are errors, not last-write-wins input to this final-outcome codec.
+/// Encode a validated D.3 outcome with effects in canonical order.
+///
+/// Duplicate addresses are errors. Resolve repeated writes before encoding
+/// this final outcome rather than relying on last-write-wins handling here.
 pub fn encode_outcome(
     sequence: u64,
     digest: [u8; 32],
@@ -421,8 +426,10 @@ pub fn encode_outcome(
     Ok(bytes)
 }
 
-/// Read authoritative history, checking the tree key and preserving unsupported
-/// versions.
+/// Read an authoritative outcome and check that its sequence matches the tree
+/// key.
+///
+/// Preserve unsupported-version errors when classifying invalid history.
 pub fn read_outcome(
     view: &View,
     sequence: u64,

@@ -1,4 +1,4 @@
-//! Version 1 page encoding and positional, append-only file access.
+//! Encode version 1 pages and access append-only files at explicit offsets.
 
 mod cache;
 
@@ -33,8 +33,9 @@ pub(super) struct PageFile {
     poisoned: bool,
 }
 
-/// A pinned descriptor and immutable readable prefix, independent of later
-/// appends.
+/// A pinned file descriptor with a fixed readable prefix.
+///
+/// Later appends do not extend this reader's prefix.
 #[derive(Clone)]
 pub(super) struct PageReader {
     file: Arc<File>,
@@ -74,7 +75,7 @@ impl Node {
 }
 
 impl PageFile {
-    /// Creates page zero in an empty file; never overwrites an existing file.
+    /// Create page zero in a new file without overwriting an existing file.
     pub(super) fn create(
         file: File,
         database_id: [u8; 16],
@@ -101,7 +102,7 @@ impl PageFile {
         })
     }
 
-    /// Checks the committed prefix and identities without discarding a crash
+    /// Check the committed prefix and identities while retaining any crash
     /// tail.
     pub(super) fn open(
         file: File,
@@ -136,9 +137,11 @@ impl PageFile {
         self.reader.clone()
     }
 
-    /// Enables bounded decoded-node reuse for subsequently captured readers.
-    /// Call only after recovery; explicit disk verification must use
-    /// `uncached`.
+    /// Enable a bounded decoded-node cache for readers captured after this
+    /// call.
+    ///
+    /// Call only after recovery. Use `uncached` when checking the actual disk
+    /// bytes.
     pub(super) fn enable_cache(&mut self) {
         self.reader
             .cache
@@ -236,7 +239,7 @@ impl PageFile {
 }
 
 impl PageReader {
-    /// Keeps the descriptor and pinned prefix, but bypasses cached contents.
+    /// Keep the descriptor and pinned prefix while bypassing cached contents.
     pub(super) fn uncached(&self) -> Self {
         Self {
             file: self.file.clone(),

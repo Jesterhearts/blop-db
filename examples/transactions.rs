@@ -1,4 +1,8 @@
-//! Run with `cargo run --example transactions -- /path/to/new-database`.
+//! Create accounts, transfer 25 units, and verify balances after reopening.
+//!
+//! Run `cargo run --example transactions -- /path/to/new-database` from the
+//! repository root. The database directory must be new and its parent must
+//! exist. The example verifies that both final balances are 75.
 
 #[cfg(any(unix, windows))]
 use blop_db::Limits;

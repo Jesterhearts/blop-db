@@ -1,5 +1,4 @@
-//! Validated storage schemas and binary transforms between values and canonical
-//! keys.
+//! Validate storage schemas and convert between values and ordered key bytes.
 
 use super::Error;
 use super::Result;
@@ -19,10 +18,10 @@ enum TypeNode {
     Tuple(Vec<TypeNode>),
 }
 
-/// A canonical, non-Rows storage schema whose maximum value fits 16 MiB.
+/// A validated non-Rows schema whose maximum encoded value fits within 16 MiB.
 ///
-/// Value schemas may have a maximum key size above 1,024 bytes. Table schema
-/// validation and the key transforms must reject such schemas for keys.
+/// A value schema may imply keys larger than 1,024 bytes. Table validation and
+/// key conversion must reject such a schema when it is used for table keys.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Schema {
     descriptor: Vec<u8>,
@@ -306,7 +305,7 @@ pub(crate) fn escape_into(
     encoded.extend_from_slice(&[0, 0]);
 }
 
-/// Decode one Escape frame. Callers bound the enclosing key before decoding.
+/// Decode one Escape frame after the caller checks the enclosing key's size.
 pub(crate) fn unescape(encoded: &[u8]) -> Result<(Vec<u8>, usize)> {
     let mut bytes = Vec::new();
     let mut input = encoded;

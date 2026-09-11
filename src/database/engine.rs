@@ -1,4 +1,4 @@
-//! Serial durability-before-execution and checkpoint-based log replay.
+//! Make log records durable before execution and replay from checkpoints.
 
 use std::fs::File;
 #[cfg(test)]
@@ -99,7 +99,7 @@ pub(super) fn append(
     append_batch(store, [(sequence, bytes)])
 }
 
-/// Publish a caller-bounded group without selecting intermediate frontiers.
+/// Publish a bounded group without advancing durability through partial groups.
 pub(super) fn append_batch<'a>(
     store: &mut storage::Store,
     records: impl IntoIterator<Item = (u64, &'a [u8])>,
@@ -115,8 +115,10 @@ pub(super) fn publish_checkpoint(store: &mut storage::Store) -> storage::Result<
     storage::publish(store, &checkpoint, manifest)
 }
 
-/// Replay from freshly opened checkpoint roots, never from cached outcomes or
-/// a store left partially materialized by a failed recovery attempt.
+/// Replay using freshly opened checkpoint roots.
+///
+/// Do not use cached outcomes or partially installed state from a failed
+/// recovery attempt as the starting point.
 pub(super) fn recover(store: &mut storage::Store) -> storage::Result<()> {
     let manifest = store.manifest().clone();
     let checkpoint = storage::checkpoint_view(store);

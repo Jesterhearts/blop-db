@@ -1,8 +1,11 @@
-//! Live-owner proofs for immutable roots and bounded above-checkpoint edits.
-//! Full validation remains the boundary for recovery and untrusted root sets.
-//! Only successful library-owned COW edits inherit a proof, after checking new
-//! system entries. Deletions keep conservative sequence maxima. Root identities
-//! are never reused within a file, and file handover discards every proof.
+//! Reuse validation results for immutable roots owned by the live database.
+//!
+//! Successful library-owned copy-on-write edits may inherit a proof after new
+//! system entries pass validation. Deletions preserve conservative sequence
+//! maxima. A bounded index tracks edits above the checkpoint.
+//!
+//! Recovery and untrusted roots require full validation. Root identities are
+//! never reused within a file, and file handover discards all proofs.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;

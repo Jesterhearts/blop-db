@@ -1,9 +1,9 @@
-//! State-tree framing and snapshot reads over pinned physical roots.
+//! Encode versioned state and read it through pinned physical roots.
 //!
-//! A `View` is internal, not an externally admitted snapshot. Callers supply a
-//! protected historical or log-prior sequence, check catalogue liveness, and
-//! validate canonical keys and schema values against the table schema. These
-//! primitives neither enforce a published frontier nor merge a write overlay.
+//! A `View` does not establish public visibility. Supply a protected historical
+//! sequence or the sequence before a transaction. Check table liveness and
+//! validate keys and values against its schema. These functions do not enforce
+//! the visible frontier or merge private transaction writes.
 
 use std::borrow::Cow;
 use std::ops::Bound;
@@ -181,8 +181,9 @@ fn corrupt_input(error: Error) -> Error {
     }
 }
 
-/// Return the newest Put at or before `sequence`; a tombstone is terminal
-/// absence.
+/// Return the newest value at or before `sequence`, unless it is a tombstone.
+///
+/// A tombstone means absence; do not fall back to an older Put.
 ///
 /// The caller protects the snapshot and checks table liveness and schema
 /// validity. Sequence zero is a valid seek bound even though it is not a stored
@@ -196,8 +197,10 @@ pub fn get(
     Ok(read_value(view, table, key, sequence)?.map(|value| value.as_bytes().to_vec()))
 }
 
-/// A validated Put payload. Inline bytes retain their immutable leaf; overflow
-/// bytes are owned. Neither variant retains a file handle or directory lease.
+/// A validated Put payload backed by retained bytes.
+///
+/// Inline bytes retain their immutable leaf; overflow bytes use an owned
+/// buffer. Neither form retains a file handle or directory lease.
 pub(crate) struct ReadValue(ReadSource);
 
 enum ReadSource {
@@ -270,10 +273,9 @@ pub(crate) fn read_value(
 
 /// A lazy scan of logical `(canonical_key, schema_encoded_value)` entries.
 ///
-/// Owns the physical scan's pinned reader, not a borrowed view or complete
-/// result set. Every consumed physical key and value frame is validated,
-/// including invisible and obsolete versions. Schema validation belongs to the
-/// caller.
+/// The iterator owns a pinned physical reader rather than the complete result
+/// set. It validates each consumed physical key and value frame, including
+/// invisible and obsolete versions. The caller must validate schemas.
 pub struct StateScan {
     physical: Scan,
     table_id: u64,
@@ -282,8 +284,9 @@ pub struct StateScan {
     done: bool,
 }
 
-/// Scan a table at a caller-protected sequence, without catalogue or overlay
-/// handling.
+/// Scan a table at a sequence whose history the caller protects.
+///
+/// The caller must check the catalogue and handle any transaction overlay.
 pub fn scan(
     view: &View,
     table: u64,

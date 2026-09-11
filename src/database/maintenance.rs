@@ -1,4 +1,4 @@
-//! Local maintenance controls, separate from canonical sequence assignment.
+//! Back up, attach, and maintain storage without assigning canonical sequences.
 
 use std::fs::File;
 use std::path::Path;
@@ -20,20 +20,25 @@ use super::snapshot;
 use crate::storage;
 use crate::vm;
 
-/// Attachment does not create a new canonical history. A writable restore is
-/// permitted only when the caller has retired the source primary. This local
-/// library cannot fence a primary running on another machine.
+/// The role to assign when attaching a physical database copy.
+///
+/// Attachment preserves canonical history. Before choosing a writable restore,
+/// retire the source primary. This library cannot stop another machine's
+/// writer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttachMode {
     RestorePrimarySourceRetired,
-    /// Reject canonical submissions, not local storage writes. Cursor changes,
-    /// GC and compaction may apply this replica's own retention policy.
+    /// Reject new canonical submissions while allowing local storage changes.
+    ///
+    /// Cursor changes, garbage collection, and compaction may apply the
+    /// replica's own retention policy.
     ReadOnlyReplica,
 }
 
-/// Explicitly attach a physical copy with a fresh random cursor namespace.
-/// Registrations and counters survive unchanged; old tokens do not. Normal
-/// reopen preserves both the attached namespace and the read-only role.
+/// Attach a physical copy and publish a fresh random cursor namespace.
+///
+/// Registrations and counters remain, but old tokens become invalid. Normal
+/// reopening preserves the attached namespace and read-only role.
 ///
 /// Every call renews the namespace, even on an unmarked or already attached
 /// directory. `ATTACH_REQUIRED` is not a precondition. Use `open` for normal
@@ -56,9 +61,11 @@ pub async fn attach_with_options(
     super::start(path.as_ref().to_owned(), None, options, Some(mode)).await
 }
 
-/// Manual maintenance. Default collects eligible history, compacts all five
-/// trees and seals the current log. All-false only validates and reclaims
-/// files.
+/// Select which maintenance operations to run.
+///
+/// Defaults collect eligible history, compact all five trees, and seal the
+/// current log. With every switch false, maintenance validates the checkpoint
+/// and retries obsolete-file cleanup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaintenanceOptions {
     pub collect_history: bool,
@@ -95,12 +102,15 @@ pub struct MaintenanceReport {
     pub reclaimed: Reclaimed,
 }
 
-/// Pause assignment, drain durable work, publish and adopt a validated
-/// candidate, then reclaim whole files whose directory leases have retired.
-/// Cancellation after enqueue does not cancel maintenance. No canonical
-/// sequence is consumed.
-/// Read-only replicas also permit local GC and compaction: these change
-/// retained physical history, not the canonical sequence or its resolved state.
+/// Run maintenance after finishing all durably logged work.
+///
+/// Pause assignment, build and validate candidate storage, publish and adopt
+/// its roots, then reclaim whole files whose leases have retired. This consumes
+/// no canonical sequence. Cancellation after enqueueing does not stop it.
+///
+/// Read-only replicas also permit garbage collection and compaction. These
+/// operations change retained physical history without changing the canonical
+/// sequence or its resolved state.
 pub async fn maintain(
     database: &Database,
     options: MaintenanceOptions,
@@ -117,11 +127,14 @@ pub async fn maintain(
     })?
 }
 
-/// Copy one pinned durable C,D image on a blocking thread while the source
-/// continues executing. Destination must not exist. Close waits for accepted
-/// copies, even if their waiters were cancelled. The result is the exact copied
-/// manifest, not the source's later frontier. Output requires explicit
-/// `attach`.
+/// Copy a pinned durable database image while the source continues executing.
+///
+/// The destination must not exist. A blocking worker copies the captured
+/// checkpoint and log prefix, then returns their exact manifest. Later source
+/// progress does not change that result. Use `attach` before opening the copy.
+///
+/// Close waits for accepted copies even if their waiting futures were
+/// cancelled.
 pub async fn backup(
     database: &Database,
     destination: impl AsRef<Path>,
@@ -138,9 +151,11 @@ pub async fn backup(
     result.await.map_err(|_| Error::Closed)?
 }
 
-/// Validate correspondence against ALL still-present source records before
-/// retiring any segment. History completeness is preserved by candidate
-/// construction, not inferred merely from a checksum or latest values.
+/// Check candidate history against every retained source record before
+/// deletion.
+///
+/// Candidate construction must preserve complete history. Checksums or latest
+/// values alone cannot prove that no historical records were omitted.
 fn validate(
     store: &storage::Store,
     view: &storage::View,
@@ -233,8 +248,10 @@ pub(super) fn run(
     Ok(report)
 }
 
-/// Join on every exit, including coordinator unwind. No public idle backup
-/// handle holds a pin or can keep the directory locked after close completes.
+/// Join backup workers on every exit, including coordinator unwinding.
+///
+/// Idle public backup results hold no pins and cannot retain the directory lock
+/// after close completes.
 #[derive(Default)]
 pub(super) struct Backups {
     jobs: Vec<thread::JoinHandle<()>>,

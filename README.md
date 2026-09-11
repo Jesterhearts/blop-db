@@ -1,31 +1,90 @@
 # blop-db
 
-This repository contains a transaction compiler, a single-threaded reference VM, an engine-facing
-storage layer and an async database API with revocable snapshots, durable retention cursors,
-resolved and logical feeds, verified replica import, manual maintenance and pinned physical backups.
-A coordinator sequences transactions, publishes their log records before dispatch, and installs
-complete worker outcomes against the latest storage roots. A persistent worker pool interprets
-independent transactions in parallel. Receipts follow durable logging and contiguous visibility;
-materialized checkpoints are published periodically.
+blop-db is an embedded database for Rust applications. Write a transaction as a small `tx!` program
+that reads and changes data atomically. The database records the program and its inputs durably
+before running it. Independent transactions can run in parallel, but their results match execution
+in log order.
 
-Storage protocol version 1 uses complete checksummed WAL groups to establish durability with one
-file flush on an existing log segment. Manifests and CURRENT are published for checkpoints and
-storage metadata changes. Creation and opening use this same protocol. See
-[DESIGN.md, appendix I](DESIGN.md#appendix-i-wal-commit-groups) for the format and recovery
-contract.
+Use the asynchronous `blop_db::database` API for application work. It provides writes,
+fixed-sequence snapshots, changefeeds, logical replication, manual maintenance, and physical
+backups. The lower-level virtual machine (VM) and storage APIs support engine development and
+reference testing.
 
-`tx!` compiles a small deterministic transaction program to the ISA 1 bytecode specified in
-[`DESIGN.md`](DESIGN.md), appendices A, B and C. Parsing, type checking, register allocation and
-branch resolution happen during Rust compilation. Runtime binding snapshots the captures and
-resolves table IDs. It does not evaluate the VM program.
+## Find the information you need
 
-See [CONFORMANCE.md](CONFORMANCE.md) for the implementation map, verification commands, optional
-implementation choices and platform qualification limits.
+- [Run the example](#run-the-example) to create a database and transfer a balance.
+- [Submit writes](#async-writes) and [handle results](#handle-results-and-retries).
+- [Set execution capacity](#bounded-execution) and understand checkpoints.
+- [Read snapshots and feeds](#snapshots-and-feeds).
+- [Replicate a database](#logical-replication) or [maintain a SQLite index](#derived-sqlite).
+- [Reclaim storage](#maintenance) and [back up or attach a database](#backup-and-attach).
+- [Write transaction programs](#transaction-construction).
+- [Use reference execution](#reference-execution) or [physical storage](#storage).
+- [Check platform support](#platform-support).
+- [Run development checks](#development).
 
-## Async Writes
+For binary formats and required semantics, read the [design specification](DESIGN.md). For
+implemented features and test coverage, read the [conformance guide](CONFORMANCE.md). For
+measurements and their limits, read the [benchmark report](BENCHMARKS.md).
 
-Use `blop_db::database` to create or open a database and submit bound `tx!` programs. Its free
-functions accept a cloneable `Database` handle:
+## Run the example
+
+You need a Rust toolchain with Cargo. Runtime tests have run on Linux; see
+[platform support](#platform-support) for other systems. Run this command from the repository root
+and choose a database directory that does not yet exist. Its parent directory must exist.
+
+```sh
+cargo run --example transactions -- /tmp/blop-example-db
+```
+
+The [balance-transfer example](examples/transactions.rs) creates a balances table and two accounts,
+then transfers 25 units atomically. It reopens the database and verifies that both balances are 75.
+The example uses Tokio's current-thread executor and handles transaction aborts explicitly. It
+refuses to overwrite an existing directory.
+
+The verification transaction also enters the log. For reads that do not consume a transaction
+sequence number, use [snapshots](#snapshots-and-feeds).
+
+## Terms used in this guide
+
+| Term                                     | Meaning                                                                                    |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Sequence                                 | A record's permanent position in the database log.                                         |
+| Prefix                                   | All records from the start of the log through a given sequence, with no gaps.              |
+| Durable frontier, D                      | The last sequence in the contiguous durable log.                                           |
+| Visible frontier, F                      | The last sequence through which every record is durable and fully resolved.                |
+| Checkpoint, C                            | The sequence whose materialized state has been published for recovery.                     |
+| Outcome                                  | A transaction's success result or deterministic abort result.                              |
+| Catalogue                                | Table identities, names, schemas, and live or dropped status.                              |
+| Canonical encoding                       | The stable byte representation required by a format.                                       |
+| Resolved                                 | Finished with success or a deterministic abort, with the complete result installed.        |
+| Access manifest                          | Declarations of the keys or tables a transaction may read or write.                        |
+| Storage manifest                         | Published metadata identifying checkpoint roots, durable log bounds, and retained history. |
+| Overlay                                  | A transaction's private pending writes, discarded if it aborts.                            |
+| Multi-version concurrency control (MVCC) | Storage of sequence-tagged versions so readers can select a historical state.              |
+| Tombstone                                | A version that records deletion and stops a lookup from returning an older value.          |
+| Cursor                                   | A durable registration that protects history for a feed consumer.                          |
+| Watermark                                | A database identity and sequence that identify the source state a consumer has processed.  |
+| Pin                                      | A reference that keeps needed storage from being reclaimed.                                |
+| Copy-on-write (COW)                      | Writing new pages and roots instead of modifying published pages.                          |
+| UUID                                     | A universally unique identifier.                                                           |
+
+`1 KiB = 1,024 bytes` and `1 MiB = 1,048,576 bytes`. Materialized state means the stored data and
+metadata computed by executing the log.
+
+A write-ahead log (WAL) group holds complete records and checksums. On an existing segment, one file
+flush makes the group durable. Checkpoint and storage-metadata publication use manifests and the
+`CURRENT` selection file. Creation and reopening use this same version 1 protocol. See
+[WAL commit groups](DESIGN.md#appendix-i-wal-commit-groups) for its recovery rules.
+
+`tx!` compiles to instruction set architecture (ISA) 1 bytecode during Rust compilation. It parses,
+checks types, allocates registers, and resolves branches at that stage. At runtime, binding copies
+captured inputs and resolves table IDs. Binding does not execute the program.
+
+## Async writes
+
+Create or open a database, submit a bound `tx!` program, check its outcome, and close the database
+when you finish. The free functions in `blop_db::database` use a cloneable `Database` handle:
 
 - `create(path, options).await` creates a new directory. `CreateOptions::default()` generates a UUID
   database ID and cursor namespace, and supplies default named limits. The parent directory must
@@ -34,7 +93,7 @@ functions accept a cloneable `Database` handle:
   work.
 - `create_with_options(path, create_options, engine_options).await` and
   `open_with_options(path, engine_options).await` select nonpersistent worker and capacity settings.
-  Existing `CreateOptions` initializers are unchanged.
+  These settings belong to the process and are separate from `CreateOptions`.
 - `execute(&db, transaction, claims).await` returns a `Receipt { sequence, outcome }` after the
   transaction is durable, resolved and included in the contiguous visible prefix. Its materialized
   checkpoint may lag behind; recovery replays the durable log suffix.
@@ -49,9 +108,12 @@ functions accept a cloneable `Database` handle:
   and checkpoints accepted work, but does not wait or report shutdown failures.
 - `status(&db)` returns the latest `EngineStatus` sample without waiting for workers or storage I/O.
 
-Both transaction claims and creation limits use `Limits`, a struct with semantic names for all 17
-resources. Defaults are the generous, finite format ceilings. Override individual fields for your
-application, and keep each transaction's claims within the database's current policy:
+### Set transaction limits
+
+Both transaction claims and database policy use `Limits`, which names all 17 logical resources. A
+claim states the maximum a transaction may use. Defaults are the finite format ceilings. Override
+individual fields for your application, and keep each transaction's claims within the current
+database policy:
 
 ```rust
 # #[cfg(any(unix, windows))]
@@ -88,13 +150,36 @@ must be unique and nonzero. Inspect the selected identities with `db.database_id
 never substituted during replay. For the low-level APIs, `LimitPolicy::try_from(limits)` validates
 the same named fields and `Limits::from(&policy)` exposes a stored policy by name.
 
+### Understand where work runs
+
 The API uses Tokio channels and semaphores, but its futures can run on any executor. Validation,
 blocking publication I/O and installation run on one coordinator thread per database. Persistent
 standard-library worker threads interpret typed `vm::PreparedTransaction` values without mutating
 storage. Recovery remains sequential and uses the recorded historical catalogue and semantic policy,
 not the live scheduler's operational limits.
 
-### Bounded Execution
+### Handle results and retries
+
+Check both the call's `Result` and the receipt's `Outcome`:
+
+| Result                                | Meaning and action                                                                                                     |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `Ok(Receipt)` with `Outcome::Success` | The transaction is durable and visible. Use its returned value and effects.                                            |
+| `Ok(Receipt)` with `Outcome::Aborted` | The abort is durable and consumes its sequence. All business writes were discarded. Handle the abort reason.           |
+| `Error::Rejected`                     | Validation failed before sequencing. Correct the request before resubmitting.                                          |
+| `Error::OperationalLimit`             | The request exceeds process capacity and was rejected before sequencing. Increase that capacity or reduce the request. |
+| `Error::Storage`                      | A startup or pre-append system operation failed. Inspect the error.                                                    |
+| `Error::Uncertain`                    | The request may have committed. Close and reopen the database to recover before proceeding.                            |
+| `Error::Closed` on submission         | That request did not execute because the writer was closed.                                                            |
+
+After a system failure, the writer stops. Close and reopen it before submitting more work.
+
+**Dropping a future after enqueueing does not cancel its transaction.** Neither cancellation nor an
+uncertain result proves that no writes occurred. Retrying creates a new transaction. If your
+application needs deduplication, include its request-ID check and business writes in the same `tx!`
+program.
+
+### Bounded execution
 
 `EngineOptions` controls live admission and scheduling independently of `Limits`:
 
@@ -110,30 +195,45 @@ not the live scheduler's operational limits.
 | `execution_bytes`        | 512 MiB                               | Aggregate lifetime reservations for assigned transactions.                             |
 | `preparation_bytes`      | 512 MiB                               | Separate capacity for one active validation or prepared queue head.                    |
 
-Count and byte permits are acquired before enqueueing. Waiting producers retain their own inputs;
-those inputs have not been accepted by the engine. Count permits can also be held while waiting for
-byte permits, so diagnostics report admission reservations rather than only channel occupancy.
-Cancelling such a wait releases its permits. The writer never drops a sequenced transaction to make
-space.
+In the execution-window rule, N is the transaction's sequence and W is the configured window size. F
+is the visible frontier and D is the durable frontier. Use overflow-safe sequence arithmetic.
 
-Logical imports share these count and byte budgets. At most one import is parsing, queued or running
-per database; other callers wait with their own borrowed input. An accepted batch reserves its total
-record count (one for an empty poll), canonical bytes, decoded commands, supplied outcomes and codec
-scratch until completion. Its canonical record count and bytes must also fit the assigned-backlog
-limits. Reference execution is sequential, so preparation and execution capacity cover the retained
-batch plus one record's interpreter reservation, not concurrent interpreters for the whole batch.
-H.1 decoding is format-bounded and runs on the caller before enqueueing; historical validation and
-reference execution run on the coordinator. Prefix-copy disk space and retained history are separate
-from these accounting budgets.
+#### Admission and queue limits
 
-Before assigning a transaction, the coordinator reserves its decoded program, scopes, dependency
-list, registers, distinct-address set, overlay, pending outcome and above-frontier logical versions.
-The reservation includes representation and temporary-buffer allowances, including zero-width tuple
-values and scan results built before destination checks. It remains charged until the record is
-installed and visible. Reserving the full lifetime in sequence order, then dispatching the oldest
-ready work first, prevents later work from taking capacity needed by the oldest record. Preparation
-separately bounds decoding and conservative access-analysis scratch before those stages run. These
-estimates deliberately favour safety over accepting every program that might fit in practice.
+The engine acquires count and byte permits before enqueueing. Waiting producers retain their own
+inputs; those inputs have not been accepted by the engine. Count permits can also be held while
+waiting for byte permits, so diagnostics report admission reservations rather than only channel
+occupancy. Cancelling such a wait releases its permits. The writer never drops a sequenced
+transaction to make space.
+
+#### Import reservations
+
+Logical imports share the count and byte budgets. Only one import may be parsing, queued, or running
+per database. Other callers wait while retaining their own borrowed input.
+
+An accepted batch reserves its record count, canonical bytes, decoded commands, supplied outcomes,
+and codec scratch space until completion. An empty poll reserves one count permit. The batch's
+canonical record count and bytes must also fit the assigned-backlog limits.
+
+Reference execution is sequential. Preparation and execution capacity therefore cover the retained
+batch plus one record's interpreter reservation. H.1 decoding runs on the caller before enqueueing,
+within format bounds. Historical validation and execution run on the coordinator. Disk space for the
+prefix copy and retained history is outside these budgets.
+
+#### Transaction reservations
+
+Before assigning a transaction, the coordinator reserves capacity for its decoded program, scopes,
+dependencies, registers, distinct addresses, overlay, pending outcome, and versions above the
+visible frontier. The reservation covers data representation and temporary buffers, including
+zero-width tuples and scan results built before destination checks.
+
+The reservation remains charged until the record is installed and visible. Reserving each record's
+full lifetime in sequence order, then dispatching the oldest ready work first, protects the oldest
+record's ability to finish. Preparation separately reserves decoding and access-analysis scratch
+space before running them. These conservative estimates may reject a program that would fit in
+practice.
+
+#### Respond to capacity errors
 
 Resource pressure delays admission. If a single record cannot fit the configured capacity,
 submission returns `Error::OperationalLimit { resource, required, limit }` before sequencing. It
@@ -142,27 +242,32 @@ the transaction. Reopening with smaller operational settings still replays alrea
 under their original semantics. A process must nevertheless have enough actual resources to perform
 that replay.
 
-Reservations are accounting bounds, not an RSS or total disk-space cap. Storage traversal buffers,
-thread stacks, allocator/OS overhead, public read/feed results and retained visible history are
-separate. Administrative operations drain transactions and use fixed format-bounded scratch rather
-than transaction execution reservations. Their canonical record must still fit the assigned byte
-limit. Retained history and maintenance scratch are separate from these budgets. Manual maintenance
-can reclaim eligible history and obsolete files; without it, total disk usage continues to grow.
+Reservations limit accounted capacity. They do not cap resident memory or total disk space. Storage
+traversal buffers, thread stacks, allocator/OS overhead, public read/feed results and retained
+visible history are separate. Administrative operations drain transactions and use fixed
+format-bounded scratch rather than transaction execution reservations. Their canonical record must
+still fit the assigned byte limit. Retained history and maintenance scratch are separate from these
+budgets. Manual maintenance can reclaim eligible history and obsolete files; without it, total disk
+usage continues to grow.
 
-Dependency registration follows durable sequence order. A reader waits for **all** unresolved
-earlier possible writers that overlap its reads, including table-wide declarations, aborted
-predecessors and successful branches that omit writes. Blind writers remain independent. When
-dependencies become ready, the coordinator captures the latest pinned roots; workers read only
+### Dependencies and visibility
+
+The coordinator registers dependencies in durable sequence order. A reader waits for **all**
+unresolved earlier possible writers that overlap its reads, including table-wide declarations,
+aborted predecessors and successful branches that omit writes. Blind writers remain independent.
+When dependencies become ready, the coordinator captures the latest pinned roots; workers read only
 versions below their own sequence. The coordinator installs each complete result with the
 crate-private VM installation hook, against the latest store, before satisfying any dependencies.
 Workers never publish stale roots or consume another transaction's tentative overlay.
 
-`F` is live visibility, `D` is the durable log frontier, and `C` is the checkpoint. A flushed WAL
-group advances D while CURRENT can still select an older checkpoint manifest. Receipts can follow a
-frontier advance without a new checkpoint: every record through F is already durable in the log and
-fully installed. Recovery discards post-checkpoint materialization and replays `(C, D]`, including
-acknowledged transactions, aborts and no-write outcomes. Set `EngineOptions::checkpoint_interval` to
-1 to checkpoint before every receipt.
+### Checkpoints and recovery work
+
+A flushed WAL group advances D while `CURRENT` can still select an older checkpoint at C. A receipt
+can follow an advance of F without a new checkpoint: every record through F is already durable and
+fully installed. Recovery discards materialized state after C and replays every record after C
+through D, written `(C, D]`. This includes acknowledged transactions, aborts, and no-write outcomes.
+
+Set `EngineOptions::checkpoint_interval` to 1 to checkpoint before every receipt.
 
 The coordinator publishes a checkpoint when `F - C >= checkpoint_interval`, before releasing the
 receipts for that advance. It also checkpoints the drained prefix before catalogue/policy barriers,
@@ -172,13 +277,17 @@ the threshold, and unresolved assigned records can extend D beyond F. Lower the 
 transactions or tighter recovery-work requirements. Logs needed for replay remain protected by C,
 even when snapshots and cursor baselines have advanced beyond it.
 
-Checkpoints are filtered at F. When F equals D, the live roots already satisfy that boundary.
-Otherwise, a bounded index of above-checkpoint edits avoids rescanning retained history when
-possible. The coordinator groups up to 64 already queued local transactions within existing count
-and byte budgets, without waiting to fill a group. All group records are published durably before
-any dispatch. Administrative requests, queued controls and reported worker completions stop group
-collection. There is no asynchronous checkpoint writer or semantic merging of transactions. See
-[BENCHMARKS.md](BENCHMARKS.md) for measured workloads.
+### Grouped publication
+
+Checkpoint roots exclude entries above F. When F equals D, the live roots already satisfy that
+boundary. Otherwise, a bounded index of above-checkpoint edits avoids rescanning retained history
+when possible. The coordinator groups up to 64 already queued local transactions within existing
+count and byte budgets, without waiting to fill a group. All group records are published durably
+before any dispatch. Administrative requests, queued controls and reported worker completions stop
+group collection. There is no asynchronous checkpoint writer or semantic merging of transactions.
+See [BENCHMARKS.md](BENCHMARKS.md) for measured workloads.
+
+### Recover from a checkpoint failure
 
 A failed checkpoint stops the writer and requires reopening. Previously successful receipts remain
 durable through replay; receipts still waiting on the failed publication are uncertain. Diagnostics
@@ -186,31 +295,38 @@ retain F rather than lowering it. If `close` was accepted and the writer stops i
 returns `Error::Storage(storage::Error::NeedsRecovery)` after releasing the storage handles. The
 error detail is available in `status(&db).last_error`.
 
-After full startup recovery, the live owner enables a 64 MiB decoded-node cache per page-file
-descriptor. Cached nodes are immutable and shared across worker and snapshot views; hits still check
-the requesting view's pinned prefix. Cache retention is bounded, but active readers and older file
-descriptors pinned across compaction can retain additional memory. Overflow values are not cached.
-Each snapshot claim also caches its last successfully resolved historical table and decoded key
-schema, releasing the cache on revocation. Point reads borrow cached metadata under its read guard
-and decode inline values directly from retained leaf bytes. Cache replacement waits for those
-in-flight reads; a scan retains its own shared table metadata. Low-level reference stores remain
-uncached.
+### Caches and validation
 
-Live publications reuse proofs for already validated immutable roots and log prefixes. New physical
-edits validate system key/value framing before inheriting root proofs; invalid edits force full
-publication validation. Log suffixes still undergo complete envelope, CRC, hash-chain and anchor
-checks. Pending log digests are capped at 4096 records, and the above-checkpoint edit index at 1 MiB
-of accounted entries; unsupported transitions or exhausted caches fall back to full validation or
-filtering. These caches are separate from transaction admission reservations. They do not persist
-across reopen or replace recovery checks. Full checkpoint validation bypasses the page cache, and
-file handover resets the runtime proofs. Modifying an owner's immutable files externally is not a
-supported live operation; caching does not continuously scrub for later external corruption.
+After startup recovery, each live page-file descriptor has a 64 MiB decoded-node cache. Workers and
+snapshots share its immutable nodes. A cache hit still checks the requesting view's pinned prefix.
+The cache excludes overflow values. Active readers and older descriptors pinned across compaction
+can retain memory beyond that cache budget.
 
-Publication flushes changed page/log files and directories for new filenames. Already published,
-unchanged prefixes need no repeated flush. Runtime publications that reuse the selected roots also
-retain their published page count, leaving reconstructible post-checkpoint pages outside the durable
-prefix until roots change. New manifests and CURRENT still follow the complete G.3 file-flush,
-rename and directory-flush ordering before durability is reported.
+Each snapshot claim caches its last resolved historical table and decoded key schema until
+revocation. Point reads borrow that metadata under a read guard and decode inline values from
+retained leaf bytes. Replacing the cached table waits for those reads; scans retain their own shared
+table metadata. Low-level reference stores do not use these caches.
+
+Live publication reuses validation results, called proofs, for immutable roots and log prefixes. New
+physical edits must pass system key/value framing checks before inheriting a root proof. Invalid
+edits require full publication validation. New log suffixes still receive complete envelope,
+checksum, hash-chain, and anchor checks.
+
+The engine retains at most 4,096 pending record digests and 1 MiB of accounted above-checkpoint edit
+entries. Unsupported transitions or full caches trigger full validation or filtering. These caches
+are separate from admission reservations and do not persist across reopening. Full checkpoint
+validation bypasses the page cache, and file handover resets proofs.
+
+External changes to an owner's immutable files are unsupported while it is live. Caches do not
+continuously detect later external corruption.
+
+### File publication and damaged tails
+
+Publication flushes changed page and log files, and flushes directories for new filenames. Already
+published, unchanged prefixes need no repeated flush. Runtime publications that reuse the selected
+roots also retain their published page count, leaving reconstructible post-checkpoint pages outside
+the durable prefix until roots change. New manifests and CURRENT still follow the complete G.3
+file-flush, rename and directory-flush ordering before durability is reported.
 
 Log appends validate and append up to 64 canonical records inside one checksummed group, flush its
 file, then advance D before dispatch. New segments also require a directory flush. Recovery
@@ -225,7 +341,9 @@ require explicit repair. Loss or physical truncation of an uncheckpointed suffix
 damage cannot be distinguished from an interrupted append; already selected byte bounds remain
 strict. Low-level storage and the public database API use the same WAL format.
 
-Catalogue and policy requests stop later sequencing, drain the preceding prefix, then execute their
+### Administrative requests and controls
+
+Catalogue and policy requests stop later sequencing, finish the preceding prefix, then execute their
 durable barrier. Submissions queued behind a barrier are prepared against the resulting metadata.
 Snapshots and cursor/feed operations use a separate bounded control queue and can run at F while a
 worker or transaction admission is blocked. They serialize with coordinator I/O and installation, so
@@ -233,6 +351,8 @@ they are not a hard latency guarantee. Cursor publication preserves current rete
 filtering the four logical checkpoint roots at C, including when `C < F < D`. On normal shutdown or
 a handled system failure, unread control requests receive `Error::Closed` without executing, rather
 than an uncertain result caused by dropping their replies.
+
+### Inspect engine status
 
 `status(&db)` reports the configured budgets, log tail, D/F/C, queue reservations, assigned backlog,
 reserved execution and preparation bytes, active workers, oldest unresolved sequence, dependency
@@ -243,51 +363,30 @@ are diagnostics, not receipts. Worker system errors and caught panics stop dispa
 reopening; they are never encoded as semantic aborts. Unwinding coordinator panics also close
 admission. A process configured to abort on panic must recover after process restart instead.
 
-The writer derives normalized point and table scopes using C.4 abstract value analysis. Known keys
-use canonical point scopes; unknown keys and scans use table scopes. Both sides of every branch
-contribute, even when a condition or runtime failure is predictable. Reads and writes remain
-separate: a table-wide write does not broaden a point read. Unused table declarations add no scopes,
-but must still name live tables. Resource 7 (`manifest_scopes`) charges the actual normalized
-manifest entry count, with a read/write entry counted once.
+### Access declarations
+
+An access scope declares a key or table that a transaction may read or write. The writer derives
+normalized scopes using the abstract value analysis in design section C.4. Known keys use canonical
+point scopes; unknown keys and scans use table scopes. Both sides of every branch contribute, even
+when a condition or runtime failure is predictable. Reads and writes remain separate: a table-wide
+write does not broaden a point read. Unused table declarations add no scopes, but must still name
+live tables. Resource 7 (`manifest_scopes`) charges the actual normalized manifest entry count, with
+a read/write entry counted once.
 
 Recovery supports the full C.4 codec, including older broad-table manifests. It validates supplied
 coverage, canonical key encodings, table-array membership and counts under the historical catalogue
 and policy. It preserves the recorded declarations rather than replacing them with a narrower
 derivation. Log rotation and retention-aware reclamation are explicit local maintenance operations.
 
-`Ok(Receipt)` is a durability receipt, but its `Outcome` can be `Success` or `Aborted`. A semantic
-abort discards all business writes, records the abort durably and consumes its sequence.
-`Error::Rejected` means validation failed before sequencing; `Error::OperationalLimit` is a definite
-pre-sequence process-capacity rejection. `Error::Storage` reports a startup or pre-append system
-failure. `Error::Uncertain` means the request may have committed. After a system failure, the writer
-stops; close and reopen it to recover before proceeding. `Error::Closed` on a submission means that
-request did not execute.
+## Snapshots and feeds
 
-Cancellation after enqueueing does not cancel a transaction. Never assume that a dropped future or
-an uncertain result means no writes occurred. Retrying submits a new transaction; applications
-needing deduplication must encode their request-ID checks and business writes in the same `tx!`
-program.
+Call `snapshot(&db).await` to capture the visible frontier. Use `get`, `scan`, and `catalogue` to
+read that fixed sequence, including the table names, status, and schemas that applied then.
 
-Run the complete [balance-transfer example](examples/transactions.rs) against a **new** directory:
-
-```sh
-cargo run --example transactions -- /tmp/blop-example-db
-```
-
-The example generates database identities, creates a balances table, inserts two accounts, transfers
-25 units atomically and reopens the database to verify both balances are 75. It uses Tokio's
-current-thread executor and explicitly handles semantic aborts. It refuses to overwrite an existing
-directory. Its result-only verification transaction still enters the log. Use the snapshot API below
-for external reads that do not consume a transaction sequence.
-
-## Snapshots and Feeds
-
-`snapshot(&db).await` captures the durable visible frontier. The free `get`, `scan` and `catalogue`
-functions read that fixed sequence, including its original table names, liveness and schemas. Reads
-perform synchronous local I/O on the calling thread; use your executor's blocking facility for large
-reads. Keys and range endpoints are `vm::Value` values, not raw canonical-key bytes. The actual
-stored key schema is checked before encoding. Scans return typed `(Value, Value)` pairs in key
-order. `catalogue` returns metadata for live and dropped tables at the snapshot sequence.
+Reads perform synchronous local I/O on the calling thread. Use your executor's blocking facility for
+large reads. Supply keys and range endpoints as `vm::Value` values. The API checks the stored key
+schema before encoding them. Scans return typed `(Value, Value)` pairs in key order. `catalogue`
+includes both live and dropped tables.
 
 ```rust
 # #[cfg(any(unix, windows))]
@@ -324,6 +423,8 @@ database::close(&db).await?;
 # fn main() {}
 ```
 
+### Revoke a snapshot
+
 Snapshot clones and iterators share one revocable claim. `revoke(&snapshot)` releases its view once,
 after in-flight reads finish safely at their original sequence. New reads report `SnapshotRevoked`.
 An iterator reports `Some(Err(SnapshotRevoked))`, not ordinary exhaustion, even if it previously
@@ -336,8 +437,10 @@ lock. Idle snapshots and iterators do not delay close and cannot read after it. 
 database handle also shuts down and revokes snapshots asynchronously. There is no automatic
 pressure-based revocation policy yet.
 
-For a rebuild, `snapshot_and_cursor` atomically selects F and durably registers its tail at F. The
-cursor survives snapshot revocation, handle loss, close and ordinary restart. If the snapshot is
+### Start a snapshot build and its feed
+
+For a rebuild, `snapshot_and_cursor` selects F and durably registers a cursor at F in one operation.
+The cursor survives snapshot revocation, handle loss, close and ordinary restart. If the snapshot is
 revoked, discard the incomplete build and explicitly release any cursor you no longer need.
 
 ```rust
@@ -375,31 +478,50 @@ database::close(&db).await?;
 # fn main() {}
 ```
 
-An existing consumer uses `checkout_cursor(&db, recovered_watermark, kind, label)` to establish a
-claim when sufficient history remains, or `reopen_cursor` with its saved token to use an existing
-claim. Tokens check the database ID, local cursor namespace, issued ID and registered kind. They are
-identity references, not secrets or authorization credentials. Watermarks identify source state, not
-an index library's internal operation stamp. A watermark alone does not reserve history.
+### Resume a consumer
 
-`read_feed` does not acknowledge progress. It returns consecutive, complete `vm::OutcomeRecord`
-values, including aborts, successful no-write transactions, catalogue events and policy events.
-Effects are canonical encoded keys and values checked against exact sequence-tagged versions, not
-current values. Consumers need the baseline catalogue and subsequent catalogue events to interpret
-them. No table filtering omits source sequences. Limits include the complete batch header and CRC;
-the maximum is 256 MiB. A first record that cannot fit reports `BatchTooSmall { required }` rather
-than returning an empty batch. A zero record limit or a poll at F returns a valid empty batch.
+If you have a saved token, call `reopen_cursor` to use its existing registration. Otherwise, call
+`checkout_cursor(&db, recovered_watermark, kind, label)` to establish a claim, provided the required
+history remains.
 
-Acknowledgements are monotonic, bounded by F, and require the matching database identity. Repeating
-the current acknowledgement succeeds. Releasing an absent, previously issued ID succeeds; reopening
-or acknowledging it reports `CursorReleased`. IDs are never reused. `list_cursors` exposes tokens,
-baselines and nonunique diagnostic labels for abandoned-claim administration. Use an explicit listed
-token with `release_cursor`, never a label. `retention_status` reports the current conservative
-history and log claim floors. None of these operations consumes a transaction sequence or deletes
-history. A cancelled checkout can still leave a durable registration; inspect the list rather than
-assuming cancellation released it.
+The API checks the token's database ID, local cursor namespace, issued ID, and registered kind.
+Tokens identify registrations; they are not authorization credentials. A watermark identifies source
+state, not an index library's internal operation stamp. Saving a watermark alone does not reserve
+history.
 
-All three cursor kinds are supported: resolved feed (1), logical feed (2) and log replica (3). Kinds
-2 and 3 additionally check and protect original log availability from baseline + 1.
+### Read complete feed records
+
+`read_feed` returns consecutive complete `vm::OutcomeRecord` values without advancing the cursor. It
+includes aborts, no-write successes, catalogue events, and policy events. It does not omit source
+sequences through table filtering.
+
+Effects contain canonical key and value bytes checked against the exact sequence-tagged versions.
+Consumers need the baseline catalogue and later catalogue events to interpret them.
+
+Batch limits include the header and checksum, with a maximum of 256 MiB. If the first complete
+record cannot fit, the call returns `BatchTooSmall { required }`. A zero record limit or a poll at F
+returns a valid empty batch.
+
+### Acknowledge and release cursors
+
+Commit derived data and its watermark atomically before acknowledging progress. An acknowledgement
+requires the matching database identity and may stay at the current position or advance through F.
+Repeating it succeeds.
+
+Release a cursor with its token. Releasing an already absent, previously issued ID succeeds, but
+reopening or acknowledging that ID returns `CursorReleased`. IDs are never reused.
+
+Use `list_cursors` to inspect tokens, baselines, and diagnostic labels, then pass the selected token
+to `release_cursor`. Labels are not unique and cannot select a registration. A cancelled checkout
+may still leave a durable registration, so inspect the list for abandoned claims.
+
+`retention_status` reports conservative history and log claim floors. Cursor operations consume no
+transaction sequence and do not themselves delete history.
+
+### Choose a feed kind
+
+The cursor kinds are resolved feed (1), logical feed (2), and log replica (3). Kinds 2 and 3
+additionally check and protect original log availability from baseline + 1.
 `read_logical_feed(&db, &cursor, after, limits).await` accepts either kind and returns
 `FeedRecords::Logical`: the exact canonical record bytes together with each resolved outcome. It
 uses the same complete-record limits, visible-only prefix and no-acknowledgement rules as
@@ -410,15 +532,23 @@ H.1 codecs support both feed kinds, checking CRCs, bounded counts, consecutive s
 envelope/outcome hash-chain agreement, including decode-side inter-record chaining. Codec validation
 alone does not prove that supplied effects match VM execution or the destination's prefix.
 
-## Logical Replication
+## Logical replication
 
-Use a retained kind-2 or kind-3 source cursor, `backup`, and
-`attach(path, AttachMode::ReadOnlyReplica)` to establish a replica with the same database identity.
-Read its actual recovered `snapshot(&replica).await?.watermark()`, request the source's logical
-suffix from that position, encode the batch and call `import_logical(&replica, &encoded).await`. The
-source must have made that baseline visible before it can serve the suffix. Acknowledge the source
-cursor only after the replica returns its durable visible watermark. Reading or importing does not
-acknowledge any source or local cursor automatically.
+To create and update a replica:
+
+1. Retain a kind-2 or kind-3 cursor on the source to protect the required log history.
+1. Create a physical image with `backup`, then attach it with
+   `attach(path, AttachMode::ReadOnlyReplica)`.
+1. Read the replica's recovered `snapshot(&replica).await?.watermark()`.
+1. Request the source's logical feed after that watermark. The source must have made the baseline
+   visible before it can serve the following records.
+1. Encode the batch and call `import_logical(&replica, &encoded).await`.
+1. After the replica returns its durable visible watermark, acknowledge that position to the source
+   cursor.
+
+Reading or importing does not acknowledge a source or local cursor automatically.
+
+### How import validates records
 
 Import has two separate execution stages:
 
@@ -433,12 +563,14 @@ Import has two separate execution stages:
    checkpoint and return the new H.2 watermark. No supplied effects are substituted for VM
    execution.
 
-The coordinator serializes the whole import. Local canonical submissions are prohibited by the
-persisted read-only role; snapshots, feeds, cursor changes, backups and maintenance controls wait
-until the import finishes. Previously captured snapshots keep their original views and existing
-cursors keep their baselines. A malformed, gapped, wrong-anchor or divergent batch is rejected
-without changing the live prefix, and the replica remains usable. An empty logical batch still
-checks its database identity and exact local baseline.
+### Import isolation and temporary storage
+
+The coordinator runs one complete import at a time. The persisted read-only role prohibits local
+canonical submissions. Snapshots, feeds, cursor changes, backups and maintenance controls wait until
+the import finishes. Previously captured snapshots keep their original views and existing cursors
+keep their baselines. A malformed, gapped, wrong-anchor or divergent batch is rejected without
+changing the live prefix, and the replica remains usable. An empty logical batch still checks its
+database identity and exact local baseline.
 
 Validation uses real copied files, not snapshots that share mutable storage. Temporary copies are
 removed on normal completion, rejection and unwinding. A process crash can leave a `blop-import-*`
@@ -448,27 +580,34 @@ copies the whole selected physical prefix per batch, so it favours a simple isol
 large-database replication throughput. It needs sufficient temporary disk space and working file and
 directory synchronization there as well as at the replica.
 
-All outcomes are checked before the first append, but appends publish D individually. A system error
-or crash can therefore leave a shorter, already verified durable prefix. System failures stop the
-replica until reopen. `Error::Uncertain` and cancellation after enqueueing do not mean that nothing
-was imported. Close and reopen, inspect the recovered snapshot watermark, and request only the
-remaining source suffix. Do not blindly retry the previous batch. There is no pending-verification
-journal, group commit or raw-segment transport API.
+### Resume an interrupted import
+
+The importer checks all outcomes before the first append, but each append publishes D separately. A
+system error or crash can therefore leave a shorter, already verified durable prefix. System
+failures stop the replica until reopen. `Error::Uncertain` and cancellation after enqueueing do not
+mean that nothing was imported. Close and reopen, inspect the recovered snapshot watermark, and
+request only the remaining source suffix. Do not retry the previous batch without checking that
+position. Import has no pending-verification journal, multi-record group commit, or raw-segment
+transport API.
 
 ## Derived SQLite
 
-[`examples/derived_sqlite.rs`](examples/derived_sqlite.rs) is a persisted resolved-feed consumer:
+The [SQLite example](examples/derived_sqlite.rs) builds a persistent mirror from a resolved feed.
+Initial creation requires source history from sequence zero. Use one consumer process per index and
+keep the SQLite file and its journals together. Run:
 
 ```sh
 cargo run --example derived_sqlite -- /path/to/source-db /path/to/index.sqlite
 ```
 
-It maintains a SQLite mirror of live source keys and values as opaque canonical blobs, a typed table
-catalogue with names and liveness, and a deterministic secondary index on SHA256 of each encoded
-value. Table IDs and source sequences use eight-byte big-endian blobs, avoiding SQLite's signed
-integer limit. The hash is a lookup aid, not a substitute for comparing complete values. An audit
-table retains the canonical outcome at every source record boundary, including aborts and ignored
-policy events. This demonstration retains that audit history without compaction.
+The example maintains a SQLite mirror of live source keys and values as opaque canonical blobs, a
+typed table catalogue with names and liveness, and a deterministic secondary index on SHA256 of each
+encoded value. Table IDs and source sequences use eight-byte big-endian blobs, avoiding SQLite's
+signed integer limit. The hash is a lookup aid, not a substitute for comparing complete values. An
+audit table retains the canonical outcome at every source record boundary, including aborts and
+ignored policy events. This demonstration retains that audit history without compaction.
+
+### Commit progress and resume safely
 
 Each SQLite transaction applies complete source records and writes their final H.2 watermark blob in
 the same durable commit. Only then does it acknowledge the source cursor. SQLite uses rollback
@@ -478,35 +617,40 @@ baseline, advances an older cursor and resumes after the committed position. An 
 commit requires reopening SQLite and inspecting that committed watermark, not repeating staged
 effects based on a guessed commit result.
 
-Initial creation requires source history from sequence zero. Missing history, a wrong database or
-cursor namespace, a cursor ahead of the derived watermark, and an unsupported saved format are
-errors, not reasons to publish an empty mirror. This example deliberately does not implement a
-snapshot rebuild. It uses one consumer process per index, processes bounded batches until it reaches
-the current source frontier, and can be invoked again to consume later records. An interrupted
-initial cursor checkout may leave an unused source registration; use the cursor administration APIs
-to release it explicitly.
+Missing history, a wrong database or cursor namespace, a cursor ahead of the derived watermark, and
+an unsupported saved format are errors, not reasons to publish an empty mirror. This example
+deliberately does not implement a snapshot rebuild. It uses one consumer process per index,
+processes bounded batches until it reaches the current source frontier, and can be invoked again to
+consume later records. An interrupted initial cursor checkout may leave an unused source
+registration; use the cursor administration APIs to release it explicitly.
 
-Derived-consumer retry safety is separate from business-request deduplication. A retried `execute`
-still enters the canonical log at a new sequence. To deduplicate a business operation, atomically
-check its request ID, verify that a previously stored payload matches, and store its result
-alongside the business writes. A business abort rolls back that request-ID write too; the engine
-does not automatically cache the aborted request as completed.
+### Deduplicate business requests
+
+Resuming a derived consumer safely does not deduplicate business requests. A retried `execute` still
+enters the canonical log at a new sequence. To deduplicate a business operation, atomically check
+its request ID, verify that a previously stored payload matches, and store its result alongside the
+business writes. A business abort rolls back that request-ID write too; the engine does not
+automatically cache the aborted request as completed.
 
 ## Maintenance
 
-`maintain(&db, MaintenanceOptions::default()).await` collects eligible MVCC versions and outcomes,
-retires eligible whole log segments, compacts all five trees and seals the current log. No canonical
-sequence is consumed. Maintenance pauses assignment, finishes every durably logged record, and
-builds a checkpoint at `C = F = D`. Snapshot, cursor and other controls wait during the synchronous
-handover. Already queued but unassigned transactions resume afterwards. Cancelling the maintenance
-waiter after enqueue does not cancel the operation.
+Call `maintain(&db, MaintenanceOptions::default()).await` to collect eligible MVCC versions and
+outcomes, retire eligible whole log segments, compact all five trees, and seal the current log. No
+canonical sequence is consumed. Maintenance pauses assignment, finishes every durably logged record,
+and builds a checkpoint at `C = F = D`. Snapshot, cursor and other controls wait during the
+synchronous handover. Already queued but unassigned transactions resume afterwards. Cancelling the
+maintenance waiter after enqueue does not cancel the operation.
 
-Read-only replicas intentionally permit local GC and compaction. Read-only means no new canonical
-submissions, not immutable files: G.5 permits a replica to apply its own local retention policy.
-Maintenance can change local roots, file IDs and retained-history floors without advancing the
-canonical sequence or changing its resolved state and hash-chain anchors. The original source
+### Maintain a read-only replica
+
+Read-only replicas permit local garbage collection (GC) and compaction. Read-only means no new
+canonical submissions, not immutable files: G.5 permits a replica to apply its own local retention
+policy. Maintenance can change local roots, file IDs and retained-history floors without advancing
+the canonical sequence or changing its resolved state and hash-chain anchors. The original source
 directory and its cursor registrations are not affected by maintenance or explicit cursor release on
 the replica.
+
+### Choose maintenance work
 
 `MaintenanceOptions` has three independent switches: `collect_history`, `compact` and `rotate_log`.
 Set only `rotate_log` to seal a segment without collecting history. The next canonical record
@@ -516,6 +660,8 @@ not change. Set all switches to false to validate the checkpoint and retry obsol
 without GC or compaction. There is no automatic history policy or background maintenance scheduler
 yet.
 
+### Understand what history remains
+
 GC selects `G = min(F, current unrevoked snapshot floors, durable cursor baselines)`. It retains
 every version above G, including every installed version above F, and the newest version at or below
 G per key, including tombstones. Outcomes above G and all version-1 catalogue and policy history
@@ -524,6 +670,8 @@ pin log coverage from baseline + 1. Only whole segments below the safe log floor
 log retention can be more conservative than the claim floor. Old cursor checkout reports
 `HistoryUnavailable` after the published floors advance.
 
+### Publish compacted storage
+
 The coordinator validates the source and candidate history and checks correspondence with retained
 canonical records before retiring sources. Compaction copies reachable nodes into a fresh page file,
 rewriting child and overflow references without inserting each entry through the COW tree. It
@@ -531,12 +679,16 @@ flushes and publishes the new file, then adopts its roots as the live roots befo
 assignment. Published page and file identities are not recycled. An uncertain publication failure
 stops the coordinator and reclamation until reopen establishes the selected manifest.
 
-File deletion uses a conservative shared directory lease: **any** storage view, snapshot read, idle
-unrevoked snapshot, worker, checkpoint or backup pin prevents deletion of **all** obsolete page, log
-and manifest files, even unrelated ones. Durable cursors constrain logical floors but do not hold
+### Release pins before reclaiming files
+
+File deletion uses a shared directory lease: **any** storage view, snapshot read, idle unrevoked
+snapshot, worker, checkpoint or backup pin prevents deletion of **all** obsolete page, log and
+manifest files, even unrelated ones. Durable cursors constrain logical floors but do not hold
 physical files open. Revoking or dropping snapshots and finishing backups releases physical pins;
 run maintenance again to retry deletion. Current files are never deleted. There is no in-place page
 reuse. GC without compaction can append unreachable COW pages rather than reduce disk usage.
+
+### Inspect the maintenance report
 
 `MaintenanceReport` reports the frontier, selected generation, old and new floors, removed version
 and outcome counts, retired segment count, page file IDs and page counts, rotation state, and
@@ -545,32 +697,42 @@ deleted or deferred file counts and bytes. `status(&db)` exposes `maintenance_pe
 validation uses history indexes, GC appends temporary COW paths, and direct compaction holds a
 traversal stack and at most one decoded overflow value at a time.
 
-## Backup and Attach
+## Backup and attach
 
-**Explicit `attach` always renews the cursor namespace, even on an unmarked or already attached
-path. Use `open` for normal crash recovery.** `ATTACH_REQUIRED` is not a prerequisite for
-attachment: arbitrary explicit filesystem copies and attach retries are supported. The caller must
-choose the actual copied directory, or the intended writable restore path after retiring the source
-primary. Calling `attach` on the wrong closed directory will invalidate that directory's old cursor
-tokens; the implementation cannot determine which copy the caller intended.
+**Use `open` for normal crash recovery. Every explicit `attach` changes the cursor namespace and
+invalidates old tokens.** This also applies to directories that are already attached or lack an
+`ATTACH_REQUIRED` marker.
 
-`backup(&db, new_directory).await` captures and pins a durable physical prefix on the coordinator,
-then copies on a blocking worker while the source continues executing. It returns the exact copied
-`storage::Manifest`, including its potentially earlier C and D. The image contains exact GENESIS
-bytes, exactly `page_count` complete pages, and exactly the captured committed log prefixes. Its
-manifest and CURRENT describe live D at capture with the selected checkpoint roots. They can differ
-from the source's older CURRENT-selected metadata. Destination files and directory entries are
-flushed before a matching CURRENT is selected last. The destination must not exist; a failed copy
-may leave an incomplete directory and is never silently overwritten. At most four backup workers run
-per database; excess requests receive `OperationalLimit` for `backup_jobs`.
+Before calling `attach`, check that the path identifies the copy you intend to use. For a writable
+restore, retire the source primary first. The library supports explicit filesystem copies and attach
+retries, but cannot determine which copy you intended.
+
+### Create a physical backup
+
+Choose a destination directory that does not exist, then call `backup(&db, new_directory).await`.
+Failure may leave an incomplete directory; a later backup will not overwrite it.
+
+The coordinator captures and pins a durable physical prefix. A blocking worker copies it while the
+source continues executing. The result is the exact copied `storage::Manifest`, whose C and D may be
+behind the source by the time copying finishes.
+
+The image contains exact GENESIS bytes, `page_count` complete pages, and the captured committed log
+prefixes. Its manifest and CURRENT describe D at capture and the selected checkpoint roots, so they
+can differ from the source's older CURRENT-selected metadata. Destination files and directory
+entries are flushed before the matching CURRENT is selected last.
+
+At most four backup workers run per database. Excess requests receive `OperationalLimit` for
+`backup_jobs`.
 
 Backup workers own their pins, not the waiting future. Cancellation after enqueue cannot release
 files while I/O continues. Close joins active backup workers before releasing the source directory
 lock. An idle result or cancelled waiter cannot hold the lock indefinitely, although slow or stalled
 filesystem I/O can delay close. Destination I/O failures do not poison the source database.
 
-Produced images contain a flushed implementation-local `ATTACH_REQUIRED` marker before CURRENT is
-written. Ordinary `open` refuses them. Use an explicit attachment mode:
+### Attach the copy
+
+Backup images contain a flushed implementation-local `ATTACH_REQUIRED` marker before `CURRENT` is
+written. Ordinary `open` refuses these images. Choose an explicit attachment mode:
 
 - `attach(path, AttachMode::ReadOnlyReplica).await` preserves the canonical database identity but
   rejects transaction, catalogue and policy submissions. Local cursor operations, snapshots,
@@ -591,6 +753,8 @@ preserves the attached namespace and role. Arbitrary external filesystem copies 
 automatically: attach them explicitly rather than using normal reopen, and do not remove or bypass
 the implementation-local role and attachment markers.
 
+### Rebind a copied cursor
+
 Old tokens are invalid, even when the copied counter later issues the same numeric ID. After the
 consumer has selected the correct copied registration and validated its saved watermark, use
 `rebind_cursor(&db, existing_numeric_id, watermark).await` to obtain a token in the new namespace.
@@ -599,7 +763,14 @@ required retained history. It does not select by label or old token, advance the
 registrations. Labels are nonunique diagnostics, and tokens are not authentication credentials. The
 caller must validate that its derived data actually corresponds to the supplied watermark.
 
-## Transaction Construction
+## Transaction construction
+
+The `tx!` domain-specific language (DSL) describes the work the database will perform. Declare
+external inputs in `captures`, declare table IDs and schemas in `tables`, then write the program
+body.
+
+This example constructs a transfer program. Submit it with `database::execute` to run it against a
+database whose balances table matches the declared schema.
 
 ```rust
 use blop_db::tx;
@@ -635,12 +806,13 @@ assert_eq!(&transaction.argument_bytes()[..4], &3_u32.to_le_bytes());
 # Ok::<(), blop_db::BuildError>(())
 ```
 
-## Inputs and output
+### Inputs and output
 
-The macro returns `Result<Transaction, BuildError>`. `Transaction::program_bytes()` contains the
-complete `BLOPVM01` container. `Transaction::argument_bytes()` contains the separate ISA 1 Arguments
-encoding: a count followed by one length-prefixed value per capture. `into_parts()` returns both
-owned byte vectors, program first.
+The macro returns `Result<Transaction, BuildError>`. Handle a binding error before submitting the
+transaction. `Transaction::program_bytes()` contains the complete `BLOPVM01` container.
+`Transaction::argument_bytes()` contains the separate ISA 1 Arguments encoding: a count followed by
+one length-prefixed value per capture. `into_parts()` returns both owned byte vectors, program
+first.
 
 - `captures { name: type = rust_expression, ... }` declares external values. Initializers are
   ordinary Rust expressions, evaluated once in declaration order and borrowed rather than implicitly
@@ -668,7 +840,7 @@ The macro alone cannot check whether a runtime table ID names a live table. The 
 conservative access manifests, complete log bodies and durable sequencing; the macro alone does not
 perform these steps.
 
-## Types
+### Types
 
 | DSL type        | Rust capture value                      | Meaning                                          |
 | --------------- | --------------------------------------- | ------------------------------------------------ |
@@ -681,10 +853,12 @@ perform these steps.
 | `tuple<>`       | `()`                                    | Empty Tuple, distinct from Unit in the bytecode. |
 | `rows<K, V, N>` | Not allowed as a capture.               | At most N rows; register or result type only.    |
 
-Bounds are integer literals. Types obey the ISA limits: at most 16 nesting levels, 256 tuple fields,
-65,535 rows, 16 MiB maximum encoded value size and 1,024 maximum canonical table-key bytes. Rows
-cannot be nested, used in table schemas or supplied as captures. Runtime capture bounds and the 16
-MiB total Arguments limit produce `BuildError` rather than panicking.
+Write bounds as integer literals. ISA 1 allows at most 16 nesting levels, 256 fields per tuple, and
+65,535 rows. Encoded values must fit 16 MiB, and canonical table keys must fit 1,024 bytes. Rows
+cannot be nested, used in table schemas, or supplied as captures.
+
+If a captured value exceeds its bound, or the complete Arguments encoding exceeds 16 MiB, binding
+returns `BuildError`.
 
 Ordinary integer literals default to I64; a typed context can select U64. Use `i64` or `u64`
 suffixes when needed. Other numeric types, floating point and implicit integer conversions are not
@@ -692,7 +866,7 @@ supported. String and byte-string literals use their actual lengths as bounds. L
 declare larger or smaller bounds, such as `let mut text: string<128> = "";`. The VM checks
 destination bounds when copying or producing a value; equal shapes need not have equal bounds.
 
-## Statements
+### Statements
 
 | Syntax                                                        | Meaning                                                                                      |
 | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
@@ -715,7 +889,7 @@ same shape; ABORT can terminate a path for any result type. Unreachable statemen
 errors. Compound table assignments evaluate the key once and load the prior value before the right
 operand.
 
-## Expressions
+### Expressions
 
 The DSL uses Rust operator precedence and left-to-right operand evaluation. These expressions cover
 every ISA 1 instruction family. ARG and CONST come from captures and literals; structured control
@@ -744,7 +918,7 @@ Arithmetic is not evaluated by Rust. Checked arithmetic failures, invalid shifts
 failed REQUIRE conditions, invalid UTF-8 and other ISA-defined failures remain runtime VM aborts.
 Rows supports neither comparison nor equality.
 
-### Bounded scans
+#### Bounded scans
 
 `scan_bounded(table, lower, upper, flags, row_limit, byte_limit)` emits SCAN_BOUNDED. An endpoint is
 a key expression or `unbounded`. The last three operands are unsigned integer literals:
@@ -770,11 +944,11 @@ let transaction = blop_db::tx! {
 # Ok::<(), blop_db::BuildError>(())
 ```
 
-## Compile-time errors
+### Compile-time errors
 
-Unknown names must be captured explicitly. Loops, arbitrary Rust calls, items, macros, attributes,
-closures, recursion, casts and unsupported expressions are rejected at the source location. `abort`
-and `unbounded` are reserved VM keywords and cannot name captures, tables or locals.
+Declare external names as captures. The compiler reports unsupported syntax at its source location.
+This includes loops, arbitrary Rust calls, items, macros, attributes, closures, recursion, and
+casts. The reserved VM keywords `abort` and `unbounded` cannot name captures, tables, or locals.
 
 ```compile_fail
 let external = 5_i64;
@@ -797,12 +971,16 @@ let value = 1_u64;
 let _ = blop_db::tx! { captures { value: i64 = value } return value; };
 ```
 
-## Reference Execution
+## Reference execution
 
-`blop_db::vm` implements all 48 ISA 1 opcodes as a single-threaded reference interpreter. Its reader
-converts bytecode into typed Rust instruction enums and validates the entire program before
-execution: operand layouts, types, forward control flow, reachability and definite register
-initialization on every branch. The runtime never dispatches on raw opcode bytes.
+Use `blop_db::vm` to compare engine behaviour with a single-threaded interpreter of all 48 ISA 1
+opcodes. Its reader validates the entire program and converts bytecode to typed Rust instructions.
+It checks operand layouts, types, forward branches, reachability, and register initialization on
+every path. The runtime executes those validated instructions.
+
+**Reference execution does not provide a durability receipt.** In a running database, its caller
+must establish log durability before execution and protect the required history. Use an isolated
+reference store for experiments, or the public database API for durable application work.
 
 - `interpret` accepts program and argument bytes, a pinned storage view, a record sequence and
   explicit claims. It returns an `Outcome` without changing storage.
@@ -880,14 +1058,17 @@ manifest. Use the preparation API below for complete C.4 admission. Full logged 
 remain the database record layer's responsibility. The production scheduler uses prepared
 interpretation and serial atomic installation rather than the serial `vm::execute` helper.
 
-### Access Preparation
+### Prepare access declarations
 
-`vm::prepare_transaction(&view, sequence, &transaction, &claims, supplied_manifest)` returns an
-opaque `PreparedTransaction` containing a validated typed program and verified scopes. It reads
-historical catalogue and policy metadata, not database rows. Pass `None` to derive declarations or
-`Some(&manifest)` to verify and retain supplied declarations. A broader supplied manifest can fit a
-scope-count budget that the derived points would exceed. Reprepare if an administrative barrier
-changes the catalogue or policy before sequencing.
+Call `vm::prepare_transaction(&view, sequence, &transaction, &claims, supplied_manifest)` to
+validate a typed program and its access scopes. It returns a `PreparedTransaction` whose fields
+callers cannot change. Preparation reads historical catalogue and policy metadata, but does not read
+database rows.
+
+Pass `None` to derive declarations, or `Some(&manifest)` to verify and retain supplied declarations.
+A broader supplied manifest can use fewer entries than separately derived points and therefore fit a
+smaller scope-count budget. Prepare again if an administrative barrier changes the catalogue or
+policy before sequencing.
 
 - `prepared.manifest()` exposes the verified `AccessManifest`; `tables()`, `sequence()` and
   `instruction_count()` expose preparation metadata.
@@ -925,9 +1106,9 @@ determines the first semantic abort and applies the original runtime resource ch
 
 ## Storage
 
-`blop_db::storage` implements the physical storage formats in design appendices F and G, with
-canonical key and MVCC encodings from appendix B. This is a low-level engine component, not a
-client-side database write API.
+Use `blop_db::storage` when implementing or testing the engine's physical storage. It implements the
+page and metadata formats in design appendices F and G, key and MVCC encodings in appendix B, and
+WAL framing in appendices E and I. Application writes should use `blop_db::database`.
 
 - Append-only, copy-on-write B+ trees use 16 KiB checksummed pages and all five system-tree IDs.
 - Point lookups and lazy ordered scans operate on immutable, pinned roots. Inserts, replacements and
@@ -944,9 +1125,12 @@ client-side database write API.
 - `publish` flushes referenced files, writes an immutable manifest and atomically replaces
   `CURRENT`. It rejects stale metadata, decreasing frontiers, changed history anchors and stale
   cursor roots.
-- `open` restores only the selected checkpoint and validates reachable pages and committed log
-  envelopes. Unpublished tails are discarded; corrupt committed data is an error, not a reason to
-  fall back to an older manifest.
+- `open` restores the selected checkpoint, validates reachable pages and committed log envelopes,
+  and discovers and flushes later complete WAL groups. It discards physically incomplete terminal
+  appends after validation. Corrupt committed data and complete malformed groups are errors;
+  recovery does not fall back to an older manifest.
+
+### Create an isolated store
 
 Creation requires a **new directory**, an explicit initial limit policy, a unique nonzero database
 ID and a unique nonzero cursor namespace. The caller selects the identities outside transaction
@@ -981,6 +1165,8 @@ assert_eq!(reopened.manifest().checkpoint_sequence, 0);
 # fn main() {}
 ```
 
+### Encode keys and publish state
+
 `storage::encoding::Schema` validates non-Rows schema descriptors. `encode_key` and `decode_key`
 convert between schema value bytes and canonical ordered keys. `storage::mvcc` provides validated
 `StateKey` and `StateValue` framing, sequence-bounded point reads and logical range scans. A
@@ -995,13 +1181,15 @@ engine's frontier, log descriptor and next-ID updates. Storage manages page iden
 count and manifest generation. Newly durable log prefixes must extend the previously published
 hash-chain anchor.
 
-When `durable_sequence > checkpoint_sequence`, `storage::open` deliberately leaves the durable
-suffix unexecuted. The higher-level `database::open` reads and validates that suffix and passes
-every record to the reference execution layer before accepting new submissions. The storage layer
-itself provides no scheduler, logical log writer or recovery coordinator. The database layer
-provides cursor lifecycle APIs, resolved and logical feeds, verified replica import, retention-aware
-GC, whole-file compaction, log rotation and pinned backup with explicit attachment. Obsolete files
-stay retained until durable selection and physical pin retirement.
+### Recover the database above the storage layer
+
+When `durable_sequence > checkpoint_sequence`, `storage::open` leaves the durable suffix unexecuted.
+The higher-level `database::open` reads and validates that suffix and passes every record to the
+reference execution layer before accepting new submissions. The storage layer itself provides no
+scheduler, logical log writer or recovery coordinator. The database layer provides cursor lifecycle
+APIs, resolved and logical feeds, verified replica import, retention-aware GC, whole-file
+compaction, log rotation and pinned backup with explicit attachment. Obsolete files stay retained
+until durable selection and physical pin retirement.
 
 Database recovery also validates retained logical checkpoint history before accepting work, even
 when there is no replay suffix. It checks catalogue lifecycles and immutable schemas, historical row
@@ -1010,7 +1198,7 @@ exact retained versions and available canonical records. Optional outcomes below
 may outlive superseded state versions, but cannot contradict versions that remain. Missing required
 history is corruption, not an empty feed or permission to initialize replacement metadata.
 
-### Platforms
+### Platform support
 
 The storage module builds on Unix and Windows. A small internal platform module handles positional
 I/O, file and directory synchronization, and same-directory file replacement. Page formats and the
@@ -1049,64 +1237,36 @@ existing application data.
 
 ## Development
 
-Run `cargo test --workspace`, `cargo +nightly fmt --all -- --check` and
-`cargo clippy --workspace --all-targets -- -D warnings`. Tests compare canonical byte encodings,
-check all 48 ISA 1 opcodes and verify emitted control-flow graphs and definite register
-initialization. VM tests execute compiled programs through actual storage, checking rollback,
-read-your-writes, historical schemas and limits, scan merging, resource-limit precedence and
-repeatable replay from saved bytes. Storage tests also cover binary conformance, malformed and
-truncated objects, model-checked tree edits, retained roots, MVCC filtering and injected
-interruptions at publication boundaries. These filesystem interruption tests do not simulate
-hardware power loss. Async writer tests cover concurrent submissions, queue backpressure,
-cancellation, shutdown, durable receipts, rejected requests, semantic rollback and post-checkpoint
-recovery without applying increments twice. Access-manifest tests cover canonical modes, alias
-merging, per-mode suppression, zero-width points, conservative CFG joins and failures, historical
-schema checks, actual normalized resource-7 counts, point-manifest recovery and rejection before
-sequence allocation.
+Run these checks from the repository root:
 
-Maintenance tests cover snapshots and durable cursors across GC and rotation, tombstone baselines,
-metadata retention, exact feeds and recovery after source logs are deleted, and direct
-reachable-node copying with internal and overflow references. Gated-worker tests drain
-above-frontier installations before compaction and verify writes after live-root handover. Pinned
-backup tests copy an earlier `C < D` image while the source writes and compacts, replay its exact
-suffix, reject old namespace tokens despite numeric-ID reuse, validate administrative rebind,
-preserve read-only roles, and join cancelled backup waiters during close. Publication faults check
-old/new CURRENT selection and forbid reclamation after uncertain handover. A separate native-process
-test checks directory-lock exclusion.
+```sh
+cargo test --workspace
+cargo +nightly fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+mdformat --wrap 100 --check README.md DESIGN.md CONFORMANCE.md BENCHMARKS.md
+```
 
-Logical replication tests compare exact source bytes and outcomes and typed state at each imported
-prefix, including computed scopes, semantic aborts, catalogue changes, policy crossings, different
-segment packaging, retained snapshots and cursor-protected GC. They reject malformed chains with
-recomputed CRCs and digests, wrong anchors and divergent results before publication. Per-replica
-gates cover shared admission and deferred controls. Injected errors and subprocess exits before
-validation, after comparison, during multi-record publication and before live replay verify old/new
-CURRENT selection and recovery of only preverified prefixes. SQLite subprocess tests exit before
-commit, after commit before acknowledgement and after acknowledgement, then reopen both databases
-and verify no missing or duplicate derived records. These tests cover software interruption and lost
-completion, not arbitrary hardware power loss or every SQLite internal commit fault.
+The [conformance guide](CONFORMANCE.md) maps the implementation to its tests, explains the fault
+coverage, and gives Windows cross-check instructions. Run the relevant tests when changing a
+feature, and update its documentation in the same change.
 
-Production scheduler tests hold real workers behind per-database test gates and check independent
-progress, inverted blind-write completion, omitted and aborted point/table predecessors, old
-snapshots, above-frontier dependent reads, window bounds and count/byte backpressure. Other tests
-cover queued catalogue/policy transitions, cursor publication at `C < F < D`, worker panic and
-injected I/O failure, and sequential recovery under smaller process settings. Seeded mixed logs
-compare receipts, complete stored outcomes, catalogue/policy history and final version trees with
-the serial commit helper; public snapshots are compared at sampled visible prefixes. Small
-point/table/scan logs enumerate all legal dependency schedules and compare outcomes and prefix
-states. These bounded tests are not an exhaustive proof for arbitrary programs or a hardware crash
-simulation.
+### Maintain plain language documentation
 
-Gated lifecycle tests verify that close waits for workers and their dependents, dropping all handles
-drains both assigned and queued work, snapshots are revoked before releasing the directory lock, and
-repeated close preserves its success/closed semantics. Shutdown tests also check definite rejection
-of unread controls. A checkpoint failure test obstructs only unpublished temporary output after
-durable append and installation, then verifies F/C/D diagnostics and replay without damaging
-committed history. Deferred-checkpoint tests cover interval thresholds, the interval-1 setting, old
-snapshots across checkpoints, final checkpoint failures and a real process exit after successful
-receipts. Reopening checks exact outcomes, non-duplicated increments and cursor baselines above C,
-including resolved and logical feed continuity.
+Apply ISO 24495-1:2023 when editing documentation, including Rust documentation comments:
 
-To check the Windows code without running it, install the target with
-`rustup target add x86_64-pc-windows-gnu`, then run
-`cargo check --workspace --all-targets --target x86_64-pc-windows-gnu`. A native Windows test run is
-still required before claiming tested Windows support.
+1. Identify the reader and the task. The README helps application developers use the API; the design
+   helps implementers preserve semantics and binary compatibility; the conformance guide helps
+   contributors verify changes; the benchmark report helps readers reproduce and interpret results.
+1. Put the main result, prerequisites, and required actions where readers can find them. Use task
+   headings and present procedures in execution order. Keep reference details near their
+   definitions.
+1. Use consistent terms, explain unfamiliar abbreviations, and write direct sentences. Preserve
+   exact API names, binary values, normative requirements, and measurement conditions.
+1. Check examples, links, and rendered structure during revision. When practical, ask an intended
+   reader to complete a task without extra guidance and record where they get stuck. Revise those
+   passages.
+
+Recheck documentation when APIs, formats, or measured implementations change, and before a release.
+Use reader questions and task failures to identify what needs revision. Formatting and test success
+support this review; they do not establish reader usability on their own.

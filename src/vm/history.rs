@@ -1,5 +1,5 @@
-//! Logical checkpoint validation above the physical store. No pre-checkpoint
-//! effects are replayed.
+//! Validate logical checkpoint history without replaying pre-checkpoint
+//! effects.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -30,9 +30,9 @@ use crate::storage::encoding::Schema;
 use crate::storage::mvcc::StateKey;
 use crate::storage::mvcc::StateValue;
 
-/// Verified per-sequence version counts, used to cross-check retained source
-/// records. This index contains metadata only; values and outcomes remain in
-/// the pinned view.
+/// Verified version counts by sequence for checking retained source records.
+///
+/// This index holds metadata only. Values and outcomes stay in the pinned view.
 #[derive(Debug)]
 pub struct History {
     versions: BTreeMap<u64, (u8, usize)>,
@@ -273,14 +273,15 @@ fn transaction_limits(
     Ok(())
 }
 
-/// Validate all retained logical history before accepting work. The physical
-/// store remains usable for page fixtures that are not complete databases.
-/// Additional older state/outcomes are valid; only (G, C] requires every
-/// outcome.
+/// Validate retained logical history before the database accepts work.
 ///
-/// The caller supplies physically verified roots and their matching manifest
-/// and genesis. Engine recovery separately validates retained log bodies
-/// against this history; no transaction is executed by this check.
+/// Every outcome after history floor G through checkpoint C is required.
+/// Additional older state and outcomes are valid. Physical page fixtures may
+/// use storage independently without representing complete database history.
+///
+/// Supply physically verified roots and their matching manifest and genesis.
+/// Engine recovery separately checks retained log bodies against this history.
+/// This validation does not execute transactions.
 pub fn validate_history(
     view: &View,
     manifest: &Manifest,
@@ -405,8 +406,9 @@ pub(crate) fn validate_limits_record(
     exact_outcome(view, history, sequence, 3, &expected)
 }
 
-/// Check what the source program proves without reading rows or rerunning pre-C
-/// effects.
+/// Check facts established by the source program without executing it.
+///
+/// This reads no rows and does not repeat effects before the checkpoint.
 pub(crate) fn validate_transaction_outcome(
     view: &View,
     sequence: u64,

@@ -1,27 +1,97 @@
-# Deterministic Transaction Program Database
+# Deterministic transaction database: design specification
 
-_Design specification_
+This specification defines how to implement blop-db's transaction semantics and version 1 binary
+formats. It is for engine developers and authors of compatible readers, writers, and recovery tools.
+For application setup and runnable examples, start with the [README](README.md). For current
+implementation and test coverage, use the [conformance guide](CONFORMANCE.md).
 
-_A Rust-native embedded database built around stable transaction bytecode, a total-order log,
-deterministic parallel execution, MVCC, and prefix visibility._
+**The central rule is sequential equivalence:** parallel execution must produce the same state and
+outcomes as execution of the durable log in sequence order.
 
-Version 1 uses self-committing WAL groups. Appendices E and I define log durability and recovery;
-appendix G defines checkpoint and retention-metadata publication. This is one storage protocol,
-shared by creation, opening, reads and writes.
+Version 1 uses one storage protocol for creation, opening, reads, and writes. Appendices E and I
+define write-ahead log (WAL) groups, durability, and recovery. Appendix G defines publication of
+checkpoints and retention metadata.
+
+## Find a topic
+
+### Architecture and behaviour
+
+- [1. Scope](#1-scope) and [2. Design goals](#2-design-goals)
+- [3. Conceptual model](#3-conceptual-model) and [4. Data model](#4-data-model)
+- [5. Transaction DSL](#5-transaction-dsl) and [6. Bytecode](#6-versioned-transaction-bytecode)
+- [7. Log ordering](#7-total-order-transaction-log), [8. Access scopes](#8-static-access-manifest),
+  and [9. Scheduling](#9-dependency-scheduler)
+- [10. Execution and rollback](#10-transaction-execution-and-rollback),
+  [11. Versioned state](#11-mvcc-materialized-state), and [12. Visibility](#12-visibility-frontier)
+- [13. Read and transaction API](#13-external-read-and-transaction-api)
+- [14. Recovery](#14-durability-and-crash-recovery) and
+  [15. Retention](#15-checkpoints-and-retention)
+- [16. Feeds and replicas](#16-changefeeds-derived-indexes-and-replication) and
+  [17. Storage](#17-physical-storage-engine)
+- [18. Errors](#18-error-model) and [19. Resource limits](#19-static-resource-bounds)
+- [20. Required invariants](#20-required-correctness-invariants),
+  [21. Reference execution](#21-reference-execution-model), and
+  [22. Parallel execution](#22-parallel-execution-model)
+- [23. Execution example](#23-end-to-end-example) and
+  [24. Derived index example](#24-derived-index-example)
+- [25. Diagnostics](#25-observability-and-diagnostics),
+  [26. Testing](#26-verification-and-testing-strategy), and
+  [27. Integrity](#27-integrity-and-trust-boundaries)
+- [28. Implementation choices](#28-deliberately-unspecified-implementation-choices) and
+  [29. Summary](#29-design-summary)
+
+### Required binary formats
+
+- [A. Binary conventions and versions](#appendix-a-binary-conventions-and-version-registry)
+- [B. Types, schemas, and keys](#appendix-b-types-schemas-and-canonical-keys)
+- [C. Transaction format and instructions](#appendix-c-transaction-format-and-isa-1)
+- [D. Administrative records, limits, and outcomes](#appendix-d-administrative-records-limits-and-outcomes)
+- [E. Canonical log framing](#appendix-e-canonical-log-framing)
+- [F. B+ tree storage](#appendix-f-binary-b-tree-storage)
+- [G. Directory, checkpoints, and retention metadata](#appendix-g-database-directory-checkpoints-and-retention-metadata)
+- [H. Exchange formats and conformance cases](#appendix-h-exchange-formats-and-conformance-cases)
+- [I. WAL commit groups](#appendix-i-wal-commit-groups)
+
+## Terms and notation
+
+| Term                                     | Meaning in this specification                                                           |
+| ---------------------------------------- | --------------------------------------------------------------------------------------- |
+| Deterministic                            | Producing the same result from the same program, inputs, and historical database state. |
+| Domain-specific language (DSL)           | The restricted application language used to construct a transaction.                    |
+| Virtual machine (VM)                     | The interpreter that executes transaction bytecode.                                     |
+| Instruction set architecture (ISA)       | The versioned instruction encodings and their permanent semantics.                      |
+| Canonical                                | Using the one defined representation or order required by the format.                   |
+| Prefix                                   | A consecutive sequence of records from the start of the log through a given position.   |
+| Log-prior                                | Produced at a sequence strictly earlier than the transaction being executed.            |
+| Catalogue                                | Historical table identities, names, schemas, and live or dropped status.                |
+| Access scope                             | A key or whole table that a transaction may read or write.                              |
+| Overlay                                  | Private writes that a transaction accumulates before its final outcome.                 |
+| Multi-version concurrency control (MVCC) | Keeping sequence-tagged versions so readers can select the required state.              |
+| Materialization                          | Stored versions and metadata computed from the log.                                     |
+| Tombstone                                | A stored deletion that prevents a read from falling back to an older value.             |
+| Retention claim                          | A requirement to keep history or files for a reader, consumer, or recovery operation.   |
+| Pin                                      | A reference that prevents storage needed by an operation from being reclaimed.          |
+| Copy-on-write (COW)                      | Writing new pages and roots instead of modifying published pages.                       |
+
+F is the visible frontier, D is the durable log frontier, and C is the checkpoint sequence. G is a
+retention floor. N identifies a transaction sequence; S identifies a snapshot sequence. W is the
+execution-window size. Square brackets include an interval endpoint; parentheses exclude it. For
+example, `(C, D]` means every sequence after C through D.
 
 ## Executive summary
 
-This database treats a transaction as a small deterministic program instead of a client-side
-read/modify/write sequence. The application passes all external inputs as transaction arguments. The
-transaction program may compute keys from database values, but its target tables and conservative
-access scopes must be known before sequencing. Known keys use point scopes; computed keys and range
-reads use whole-table scopes. The program cannot perform I/O, call functions, loop, recurse, read
-the system clock, generate random values, or perform unbounded work.
+An application submits a transaction as a small deterministic program with explicit arguments. The
+program may compute keys from database values. Before assigning its sequence, the database must know
+its target tables and verify scopes that cover every possible access. Known keys use point scopes;
+keys unknown before execution and range reads use whole-table scopes.
 
-The transaction DSL compiles to a stable, versioned bytecode. The database appends each bytecode
-program and its arguments to a durable log. The same log records schema operations and semantic
-limit changes using stable descriptions. Each record receives one monotonically increasing sequence
-number. Sequence numbers define the canonical serial order. Only durably logged records may execute.
+Programs cannot perform external I/O, call functions, loop, recurse, read the system clock, generate
+random values, or perform unbounded work.
+
+The DSL compiles to stable, versioned bytecode. The durable log stores each program and its
+arguments, as well as schema operations and semantic limit changes. Each record receives the next
+sequence number. These numbers define serial order, and a record may execute only after its log
+prefix is durable.
 
 The database may execute transactions out of log order when it can prove that this does not change
 their results. A scheduler derives data dependencies from each transaction's verified read and write
@@ -33,11 +103,10 @@ values tagged with its sequence number. An aborted transaction discards its over
 versions. Later transactions never consume unresolved tentative state, so an abort does not require
 cascading rollback.
 
-External readers see only a contiguous prefix of the log. A visibility frontier records the greatest
-sequence number through which every record is durable and resolved. MVCC lets the engine execute and
-materialize later independent transactions before they become externally visible. This gives simple
-snapshots, recovery, checkpoints, replication, and changefeed cursors at the cost of possible
-visibility head-of-line blocking behind a slow earlier transaction.
+External readers see only a contiguous resolved prefix of the log, ending at the visible frontier F.
+MVCC lets the engine install later independent results before they become visible. A single sequence
+can therefore identify a snapshot, checkpoint, replica position, or feed position. The cost is that
+a slow earlier transaction can delay visibility of later completed transactions.
 
 Recovery restores a checkpoint and replays every subsequent durable record, including records with
 cached outcomes. Garbage collection retains all versions above the frontier and any older history
@@ -67,15 +136,21 @@ scheduling, MVCC, visibility, rollback, durability, recovery, and physical stora
 through I are normative: they specify the bytes and validation rules needed to implement compatible
 readers, writers, interpreters, and recovery tools without relying on Rust representations.
 
-The design is for a single database instance with one canonical transaction log. It may use many
-worker threads. Replication may copy and replay the canonical log, but distributed consensus and
-multi-primary writes are outside this design.
+The design covers one database instance with one canonical transaction log and any supported number
+of worker threads. Replication may copy and replay that log. Distributed consensus and multi-primary
+writes are outside the scope.
 
 ### 1.1 Normative language
 
-The word "must" states a required property. The word "may" states an optional implementation or API
-choice. The word "should" states a recommendation. A compliant implementation must preserve the
-stated observable semantics even when it uses a different internal representation.
+This specification uses three terms for obligations:
+
+- **must** states a requirement;
+- **should** states a recommendation;
+- **may** permits an implementation or API choice.
+
+A compliant implementation must preserve the observable semantics even if it uses a different
+internal representation. Normative appendices contain requirements; they are not optional
+background.
 
 The logical rules apply to every implementation. A version 1 format implementation must also use the
 layouts in the appendices when persisting or exchanging those formats. In-memory structures, page
@@ -95,8 +170,8 @@ compatibility claim about an existing implementation.
 - Represent every public snapshot with a single sequence number.
 - Use the same sequence numbers for recovery, checkpoints, replication, changefeeds, and derived
   indexes.
-- Keep the persisted transaction format independent of Rust ABI, application code, and compiler
-  versions.
+- Keep the persisted transaction format independent of Rust's application binary interface (ABI),
+  application code, and compiler versions.
 - Preserve schema and semantic limit history independently of application and process configuration.
 - Make correctness testable against a simple sequential reference interpreter.
 
@@ -132,10 +207,9 @@ Dependency scheduler -> transaction VM workers
 MVCC materialized state + catalogue + limits + visibility frontier
 ```
 
-The log defines meaning. Parallel execution is an optimization. The storage engine materializes the
-result. A correct implementation must produce the same externally visible data, catalogue, policy,
-and outcomes as a sequential interpreter that executes every logged record in increasing sequence
-order.
+The log defines what the database does. The scheduler chooses when independent work runs, and
+storage holds the resulting versions. A correct implementation must expose the same data, catalogue,
+policy, and outcomes as an interpreter that executes every record in increasing sequence order.
 
 ### 3.1 Core correctness rule
 
@@ -143,8 +217,8 @@ order.
 > state and outcomes that result from executing that log from left to right with the reference
 > bytecode and administrative semantics.
 
-This rule is the primary correctness oracle. The scheduler, MVCC implementation, caching, batching,
-and physical page writes may change, but they must not change this result.
+Use this rule as the expected result in tests. Changes to scheduling, MVCC, caches, batching, or
+page writes must preserve it.
 
 ## 4. Data model
 
@@ -168,10 +242,11 @@ types may be added by later ISA versions without changing existing semantics.
 
 ### 4.2 Key addresses
 
-Every target table must be resolvable before a transaction is sequenced. A key may be resolved from
-constants and arguments before sequencing, or computed deterministically from database values during
-execution. Computed keys must conform to the target table's key schema and the applicable size
-limits.
+Resolve every target table before sequencing a transaction. Keys may come from constants and
+arguments, or the program may compute them from database values. A computed key must satisfy its
+table's key schema and applicable size limits.
+
+The following pseudocode contrasts known and computed addresses:
 
 ```text
 Point scopes:
@@ -231,9 +306,10 @@ defined by the range opcode rather than by the point-LOAD rule.
 
 ### 4.5 Table catalogue and schema history
 
-The catalogue maps stable table identities to names, key encodings, value schemas, and lifecycle
-state. Table identities must never be reused within a database history. Recreating a dropped table
-with the same name creates a different identity; retained bytecode must not silently address it.
+The catalogue records each table's identity, name, key encoding, value schema, and live or dropped
+status. A table identity must never be reused within a database history. Recreating a dropped table
+with the same name creates a new identity, so retained bytecode cannot silently address the new
+table.
 
 Every schema operation, including table creation, rename, and drop, must enter the canonical log in
 a versioned administrative format with stable schema descriptions. User bytecode cannot modify the
@@ -256,23 +332,28 @@ and semantic limit policy without relying on later process configuration.
 
 ## 5. Transaction DSL
 
-The DSL is an application-facing way to construct transaction programs. The DSL syntax is not part
-of the durable format. Only the compiled bytecode, stable metadata, and transaction arguments define
-persisted behavior.
+Use the DSL to construct transaction programs in application code. Its syntax is not a durable
+format. Persisted behaviour depends only on the compiled bytecode, stable metadata, and transaction
+arguments.
 
 ### 5.1 Example
 
+This construction example assumes that the application has supplied the account IDs, amount, and
+table ID. Submit the result through the database API to execute it.
+
 ```rust
-db.execute(tx! {
-    require(balances[$from] >= $amount);
-    balances[$from] -= $amount;
-    balances[$to] += $amount;
-    return balances[$from];
-}, args! {
-    from: from_id,
-    to: to_id,
-    amount: amount,
-})?;
+let transaction = blop_db::tx! {
+    captures {
+        from: u64 = from_id,
+        to: u64 = to_id,
+        amount: i64 = amount,
+    }
+    tables { balances: u64 => i64 = balances_id }
+    require(balances[from] >= amount);
+    balances[from] -= amount;
+    balances[to] += amount;
+    return balances[from];
+}?;
 ```
 
 The program reads the current log-prior balance for the source account, checks a condition, updates
@@ -322,9 +403,8 @@ allow fallback to a stored value. Range reads merge the overlay before selecting
 
 ## 6. Versioned transaction bytecode
 
-The persisted transaction program is a compact bytecode with a stable instruction set architecture,
-or ISA. Each ISA version is permanent. Once an opcode is published, its type rules, arithmetic
-behavior, error behavior, comparison behavior, and encoding must not change.
+Persisted programs use compact bytecode. Each ISA version is permanent. Once an opcode is published,
+its encoding, type rules, arithmetic, comparisons, and error behaviour must not change.
 
 ### 6.1 Log record envelope
 
@@ -392,12 +472,12 @@ The database must validate a program before it receives a sequence number. Valid
 - Bounds on instructions, logical accesses, ranges, arguments, values, locals, writes, and output
   satisfy the semantic policy applicable at the transaction's log position.
 
-A validation failure is a submission error. It does not enter the transaction log and does not
-consume a sequence number. Validation and sequencing must agree on the applicable catalogue and
-policy. A validated but unsequenced submission must be revalidated if an administrative barrier
-changes either one before it is sequenced. Runtime checks enforce bounds that depend on loaded or
-computed values; they do not replace pre-sequencing validation of the program and its declared
-bounds.
+A validation failure rejects the submission without logging it or consuming a sequence number.
+Validation and sequencing must use the same catalogue and policy. If an administrative barrier
+changes either one, validate any waiting unsequenced submission again.
+
+Runtime checks enforce bounds that depend on loaded or computed values. The database must still
+validate the program and its declared bounds before sequencing.
 
 ### 6.4 ISA compatibility
 
@@ -436,9 +516,8 @@ execution dependencies, not that order.
 | Resolved: abort   | Execution reached a deterministic abort condition and produced no database versions.             |
 | Visible           | The visibility frontier has advanced through this sequence number.                               |
 
-"Resolved" means that execution reached a terminal semantic result. A system failure such as
-unavailable storage is not a semantic abort. It leaves the transaction unresolved until the system
-retries or recovers.
+"Resolved" means that execution finished with success or a semantic abort. A system failure, such as
+unavailable storage, leaves the transaction unresolved until the system retries or recovers.
 
 A record must reach Durably logged before Executing. Neither a transaction nor an administrative
 operation may execute from an unflushed suffix of the log. Administrative operations have their own
@@ -469,10 +548,9 @@ Key(table_id, canonical_key)
 Table(table_id)
 ```
 
-A Table scope covers every possible key in the table, including absent keys. It must not be expanded
-only into currently existing keys. Read and write scopes are separate: a table-wide write does not
-automatically make a point read table-wide. The access modes below describe the required
-declarations.
+A Table scope covers every possible key, including absent keys. Expanding it into only existing keys
+would miss inserts and is prohibited. Read and write scopes are separate: a table-wide write does
+not broaden a point read. Use the following access modes to describe possible work.
 
 | **Access mode** | **Meaning**                                                                 |
 | --------------- | --------------------------------------------------------------------------- |
@@ -549,10 +627,15 @@ writer is insufficient when blind writers can execute independently.
 
 ## 9. Dependency scheduler
 
-The scheduler converts log order and access manifests into executable dependencies. It may dispatch
-a transaction only after its log prefix is durable, its required dependencies have resolved, and its
-execution-window and byte-budget requirements are satisfied. Within those constraints, it does not
-need to wait for unrelated earlier sequence numbers.
+The scheduler derives dependencies from log order and verified access scopes. It may dispatch a
+transaction only when:
+
+- its complete log prefix is durable;
+- its required predecessors have resolved;
+- the execution window permits its sequence; and
+- its byte reservations fit the configured budgets.
+
+It need not wait for unrelated earlier records if these conditions hold.
 
 Dependency discovery and writer registration must process manifests in log order. A later
 transaction must not finish dependency discovery while an earlier manifest is still unregistered.
@@ -584,10 +667,9 @@ versions and the visibility frontier preserve the canonical serial meaning.
 
 ### 9.2 Scheduling granularity
 
-The simplest scheduler treats each transaction as one unit. A more aggressive implementation may
-split one program into independent actions, but only if it preserves the transaction's private
-overlay semantics, atomic result, and sequential-equivalence rule. Transaction-level scheduling is
-sufficient for the logical design.
+Scheduling each transaction as one unit is sufficient. An implementation may split a program into
+independent actions only if it preserves private-overlay semantics, atomic results, and sequential
+equivalence.
 
 ### 9.3 Bounded execution window
 
@@ -671,8 +753,8 @@ Result:
     shared state unchanged
 ```
 
-An aborted transaction still occupies its log position. For state evolution it is equivalent to an
-identity operation. It therefore does not create a gap in the visibility frontier.
+An aborted transaction keeps its log position but leaves business state unchanged. Once its abort is
+resolved, that position does not leave a gap in the visible prefix.
 
 ### 10.4 No cascading rollback
 
@@ -690,9 +772,9 @@ sequencing does not cancel a transaction.
 
 ## 11. MVCC materialized state
 
-The storage layer keeps multiple versions of a key. Each successful transaction version carries the
-transaction sequence number that produced it. An implementation may store the sequence in the key,
-in version metadata, or in another equivalent structure.
+The storage layer keeps multiple versions of each key. Each version identifies the successful
+transaction that produced it. The logical model permits the sequence to be stored in the key, in
+metadata, or in an equivalent structure. Appendix B.3 specifies the version 1 physical encoding.
 
 ```text
 A:
@@ -734,8 +816,8 @@ observe data or catalogue state above F. Administrative records occupy frontier 
 > Prefix visibility invariant: Every externally observable database state is exactly the state
 > produced by one contiguous prefix of the transaction log.
 
-This makes a snapshot identifier a single integer. It also makes the same integer useful as a
-replication position, changefeed cursor, checkpoint boundary, and derived-index watermark.
+A single sequence number therefore identifies a snapshot within a database history. The same number
+can identify a replication position, feed position, checkpoint boundary, or derived-index watermark.
 
 ### 12.2 Frontier advancement
 
@@ -758,10 +840,9 @@ sequence.
 
 ### 12.3 Head-of-line blocking
 
-The main cost of prefix visibility is visibility head-of-line blocking. A slow transaction at
-sequence N can prevent later completed transactions from becoming externally visible even when they
-are independent. Those later transactions may still execute and may serve as inputs to their own
-log-later dependents.
+Prefix visibility can delay later results behind a slow earlier transaction. This is called
+head-of-line blocking. Later independent transactions may finish and supply resolved data to their
+dependents, but external readers must wait for the earlier gap to close.
 
 The transaction language reduces this risk because accepted programs have bounded instructions,
 logical accesses, ranges, writes, and values, with no external I/O, calls, or loops. Table-wide
@@ -778,21 +859,19 @@ is released or explicitly revoked by the engine's retention policy.
 
 ### 13.1 Suggested Rust shape
 
+This API sketch assumes an open `db`, a balances table ID, a typed account key, and a bound
+`transaction` such as the one in section 5.1. The README has complete runnable examples.
+
 ```rust
-let snapshot = db.snapshot()?;
-let value = snapshot.get(BALANCES, account_id)?;
+let snapshot = blop_db::database::snapshot(&db).await?;
+let value = blop_db::database::get(&snapshot, balances_id, &account_key)?;
 println!("snapshot sequence = {}", snapshot.sequence());
 
-let result = db.execute(tx! {
-    require(BALANCES[$from] >= $amount);
-    BALANCES[$from] -= $amount;
-    BALANCES[$to] += $amount;
-    return BALANCES[$from];
-}, args! {
-    from: from_id,
-    to: to_id,
-    amount,
-})?;
+let receipt = blop_db::database::execute(&db, transaction, blop_db::Limits::default()).await?;
+match receipt.outcome {
+    blop_db::vm::Outcome::Success { value, .. } => println!("Result: {value:?}"),
+    blop_db::vm::Outcome::Aborted(abort) => println!("Transaction aborted: {abort:?}"),
+}
 ```
 
 The exact Rust syntax is not normative. The important rule is that state-dependent writes run inside
@@ -846,10 +925,9 @@ partial output as a complete snapshot.
 
 ## 14. Durability and crash recovery
 
-The durable transaction log is the authoritative description of state changes. The MVCC store is a
-materialized representation that can be reconstructed from a durable checkpoint plus every later
-durable record. Recovery includes catalogue operations and limit changes, not just bytecode
-programs.
+Recover database state from a durable checkpoint and every later durable log record. The MVCC store
+holds the computed result; the log defines the changes. Recovery must include catalogue operations
+and limit changes as well as transaction programs.
 
 ### 14.1 Durable sequencing
 
@@ -868,12 +946,13 @@ catalogue and limit policy guarantee the same semantic result.
 
 ### 14.3 Crash during materialization
 
-Physical storage must not expose a partially installed overlay as a successful transaction. A
-copy-on-write root update, append-only version installation with an atomic completion record, or
-another atomic publication method may enforce this rule. Incomplete materialization found after a
-crash is discarded or overwritten by deterministic replay. Recovery must begin from the checkpoint
-view with all later materialization excluded, rather than replay increments against a newer state
-that already includes them.
+Physical storage must expose either a complete successful installation or none of it. An atomic root
+update, an append-only installation with an atomic completion record, or another atomic publication
+method may enforce this rule.
+
+Recovery discards or overwrites incomplete materialization through replay. It must start from the
+checkpoint view and exclude all later materialization. Replaying an increment against a newer state
+that already contains that increment would apply it twice.
 
 ### 14.4 Resolution metadata
 
@@ -916,10 +995,10 @@ must report corruption rather than silently omit feed records.
 
 ## 15. Checkpoints and retention
 
-A checkpoint is a durable materialized database state at a visibility frontier F. It must represent
-exactly the state produced by the log prefix through F. A checkpoint never includes a hole or a
-version from a sequence greater than F in its logical recovery view. Shared physical storage may
-contain later versions, but they must remain excluded until reconstructed by post-checkpoint replay.
+A checkpoint durably stores the state at a selected visible frontier F. Its logical recovery view
+must contain exactly the result of that log prefix, without gaps or later versions. Shared physical
+storage may contain later versions, but the recovery view must exclude them until replay
+reconstructs them.
 
 The checkpoint includes the catalogue and semantic limit policy at F. It also retains or durably
 references historical versions, tombstones, outcomes, and schema descriptions required by active
@@ -954,9 +1033,9 @@ snapshots or converted to semantic aborts because required history was collected
 
 ## 16. Changefeeds, derived indexes, and replication
 
-The total-order log and visibility frontier provide a natural durable change stream. A consumer
-stores one sequence watermark and requests visible records after that sequence. The stream includes
-transaction outcomes and administrative events and never exposes a sequence above the frontier.
+A changefeed lets a consumer request visible records after its saved watermark. It includes
+transaction outcomes and administrative events in sequence order. It must never expose a record
+above the visible frontier.
 
 ```text
 Database frontier:         83_917
@@ -1000,17 +1079,17 @@ through distributed consensus is outside the database core.
 
 ### 16.3 Checked-out retention cursors
 
-A checked-out cursor at C reserves a baseline at C and a feed starting at `C + 1`. An existing
-consumer uses its last durably committed watermark as that baseline. A new snapshot rebuild reserves
-the baseline before its derived state exists; checkout itself is not an acknowledgement that the
-build has completed.
+A checked-out cursor at baseline B protects the state at B and a feed starting at `B + 1`. An
+existing consumer uses its last durably committed watermark as that baseline. A new snapshot rebuild
+reserves the baseline before its derived state exists; checkout itself is not an acknowledgement
+that the build has completed.
 
 Checkout must atomically verify that the required history is available at a position no greater than
 the current visibility frontier and establish a durable retention claim. It fails with an explicit
 history-unavailable error if the requested history is already gone. A numeric position without a
 checked-out cursor does not protect history.
 
-The cursor protects the state at C and the subsequent MVCC versions, tombstones, outcomes, and
+The cursor protects the state at B and the subsequent MVCC versions, tombstones, outcomes, and
 schema history needed by its resolved feed. Logical-feed and log-replica cursors also protect the
 required original log records. Reading a batch does not move the retention position. Only an
 explicit acknowledgement may advance it, monotonically and no further than the visible source
@@ -1036,10 +1115,10 @@ must discard or restart the unpublished build and explicitly manage the cursor i
 
 ## 17. Physical storage engine
 
-The logical transaction model does not require one physical tree design. The version 1 physical
-format selects an uncompressed, copy-on-write B+ tree with 16 KiB pages. Appendix F defines its
-pages and system trees; appendix G defines atomic publication and reclamation. This supports ordered
-reads, snapshots, and direct key access without LSM compaction semantics.
+The logical model permits different physical tree designs. The version 1 format uses an
+uncompressed, copy-on-write B+ tree with 16 KiB pages. Appendix F defines the pages and system
+trees; appendix G defines publication and reclamation. The tree supports ordered reads, snapshots,
+and direct key access. It does not use log-structured merge-tree compaction.
 
 The logical layout is:
 
@@ -1065,10 +1144,13 @@ metadata
 
 ### 17.1 Physical and logical logging
 
-The logical transaction and administrative log defines database history. Version 1 uses immutable
-copy-on-write pages and an atomically replaced manifest pointer, not a physical WAL. An alternative
-physical format must have its own version and must not replace the stable logical history needed for
-replay and changefeeds.
+The transaction and administrative log defines database history. Version 1 wraps those logical
+records in WAL commit groups. It stores materialized state in immutable copy-on-write pages selected
+through an atomically replaced manifest pointer. The WAL does not contain physical page redo
+records.
+
+An alternative physical format must have its own version and preserve the stable logical history
+needed for replay and feeds.
 
 ### 17.2 Storage transactions
 
@@ -1084,6 +1166,10 @@ removed.
 
 ## 18. Error model
 
+Keep input rejection, deterministic aborts, and system failures distinct. The caller needs this
+distinction to decide whether to correct a request, handle a business result, or recover the
+database.
+
 | **Error class**        | **Behavior**                                                                                                                                                                      |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Submission error       | Invalid bytecode or administrative record, unsupported format, bad schema or types, bad access manifest, or admission limits. Reject before sequencing.                           |
@@ -1097,11 +1183,12 @@ removed.
 
 ## 19. Static resource bounds
 
-Every accepted transaction must have a finite, enforceable bound on logical VM work. The database
-must validate declared bounds before sequencing and enforce runtime bounds on loaded values,
-computed keys, range work, intermediate results, and writes. Conflict scope and actual work are
-separate: a Table scope can describe one computed point access or a bounded range, but never grants
-permission for unbounded execution.
+Every accepted transaction must have a finite, enforceable bound on logical VM work. Validate
+declared bounds before sequencing. During execution, enforce bounds on loaded values, computed keys,
+scans, intermediate results, and writes.
+
+An access scope describes possible conflicts, not the amount of work permitted. A Table scope may
+cover one computed point access or a bounded range; it never permits unbounded execution.
 
 | **Resource**          | **Example bound**                                                       |
 | --------------------- | ----------------------------------------------------------------------- |
@@ -1128,10 +1215,10 @@ backpressure in section 9.3 control aggregate resource use without changing reco
 
 ### 19.1 Logged semantic limit policy
 
-Limits governing admission and deterministic execution are database policy stored in the initial
-checkpoint and changed only by versioned SetLimits log records. A transaction uses the policy in
-effect immediately before its sequence, in live execution, recovery, and replication. Resource
-claims must be checked against that historical policy, not current process settings.
+Store semantic admission and execution limits in the initial checkpoint. Change them only through
+versioned SetLimits records. For live execution, recovery, and replication, check a transaction's
+claims against the policy immediately before its sequence. Current process settings cannot replace
+that historical policy.
 
 SetLimits uses the administrative barrier in section 7.3. It cannot retroactively change validation
 or outcomes of earlier records. A successful change becomes effective for subsequent records;
@@ -1195,8 +1282,8 @@ substitute a smaller semantic budget.
 
 ## 21. Reference execution model
 
-A simple single-threaded interpreter defines the expected result. Production parallel execution is
-correct when it matches this reference model.
+Use a single-threaded interpreter to define the expected result. Parallel execution is correct when
+it matches this reference model:
 
 ```text
 state = checkpoint_state
@@ -1228,16 +1315,18 @@ for record in durable_log_after_checkpoint in sequence_order:
     frontier = record.sequence
 ```
 
-This algorithm is intentionally simple. It is useful as a specification, test oracle, recovery
-fallback, and debugging tool. An administrative abort returns unchanged metadata and no effects.
-Effects identify actual written keys and tombstones or resolved administrative changes. System
-errors stop or suspend progress; they are not semantic aborts. The checkpoint view excludes all
-later materialization, and cached later outcomes never cause an iteration to be skipped.
+Use this algorithm for expected test results, sequential recovery, and debugging. An administrative
+abort returns unchanged metadata and no effects. Successful effects identify actual writes,
+deletions, or administrative changes. System errors stop or suspend progress; they are not semantic
+aborts.
+
+The starting checkpoint view must exclude all later materialization. Replay must not skip an
+iteration because a cached outcome exists.
 
 ## 22. Parallel execution model
 
-A production scheduler may follow this procedure for transaction programs. Administrative records
-instead follow the barrier protocol in section 7.3 and share the same durability and publication
+A production scheduler may use the following procedure for transaction programs. Use the barrier
+protocol in section 7.3 for administrative records, with the same durability and publication
 requirements.
 
 1. Apply admission backpressure, validate against the applicable catalogue and policy, and verify
@@ -1287,7 +1376,7 @@ The log durably records:
 103: A *= 2
 ```
 
-The dependency scheduler derives:
+The scheduler derives these dependencies:
 
 ```text
 100 -> 103
@@ -1310,10 +1399,10 @@ state.
 
 ## 24. Derived index example
 
-A derived index must commit its data and source watermark atomically in the same durable index
-commit. The watermark is not a separately written file or an independently updated database row.
-Tantivy supports attaching it to the index commit through `PreparedCommit::set_payload`; the source
-database sequence is distinct from Tantivy's own operation stamp.
+Commit a derived index's data and source watermark atomically in one durable index commit. Do not
+put the watermark in a separately written file or independently updated row. In Tantivy, attach it
+to the index commit with `PreparedCommit::set_payload`. The source sequence and Tantivy's own
+operation stamp identify different things.
 
 Suppose the database frontier is 50,000 and the index's committed watermark is 49,920. The consumer
 holds a durable cursor protecting that position and processes this pipeline:
@@ -1349,8 +1438,9 @@ exhaustion.
 
 ## 25. Observability and diagnostics
 
-The database should expose enough internal state to explain latency and stalled visibility without
-exposing unsafe internals.
+Expose diagnostics that let operators identify why requests are slow or visibility has stopped
+advancing. The following metrics should be available without giving callers unsafe access to
+internal state.
 
 | **Metric or diagnostic**       | **Purpose**                                                                     |
 | ------------------------------ | ------------------------------------------------------------------------------- |
@@ -1373,8 +1463,11 @@ exposing unsafe internals.
 
 ## 26. Verification and testing strategy
 
-The design lends itself to unusually strong differential testing because the sequential interpreter
-is a compact reference model.
+Compare production execution with the sequential interpreter. This tests whether scheduling and
+storage optimizations preserve the defined results. Use the following cases alongside the binary
+checks in appendix H.
+
+### Execution and replay
 
 - Generate random valid logs containing bytecode, catalogue operations, and limit changes. Compare
   data, metadata, returned values, and abort outcomes with the sequential reference interpreter
@@ -1390,6 +1483,9 @@ is a compact reference model.
   transaction results.
 - Recover from checkpoints with cached post-checkpoint success or abort outcomes and partial later
   materialization. Verify that every later record is replayed without duplicate application.
+
+### Snapshots, dependencies, and limits
+
 - Verify that unrevoked snapshots remain stable while newer transactions execute and become visible,
   and that revoked point reads and iterators fail explicitly without unsafe reclamation.
 - Verify collection with a blocked internal reader needing an intermediate above-frontier version
@@ -1406,12 +1502,18 @@ is a compact reference model.
   it. Replay under different startup settings and verify the historical policy and schema are used.
 - Verify execution-window and byte-budget backpressure while the oldest record is delayed, ensuring
   that later work cannot consume its progress resources.
+
+### Retention and consumers
+
 - Verify durable cursor checkout racing reclamation, restart with an outstanding cursor, and
   checkpoint/log truncation while older MVCC feed history and schema descriptions remain pinned.
 - Crash a derived consumer before and after its atomic data/watermark commit and cursor
   acknowledgement. Verify restart from the index watermark without lost or duplicate effects.
 - Test uncertain submissions and caller-managed deduplication, including different payloads using
   the same request ID and retries after semantic aborts.
+
+### Validation and small-state models
+
 - Fuzz bytecode validation so malformed programs can never reach the scheduler or interpreter.
 - Run the binary conformance cases in appendix H, including cross-endian decoding, page invariants,
   unsupported versions, resource accounting, and crash points in the publication protocol.
@@ -1420,9 +1522,8 @@ is a compact reference model.
 
 ## 27. Integrity and trust boundaries
 
-Even in an embedded database, persisted bytes and transaction input must be treated as untrusted at
-format boundaries. Corruption or malformed data must fail safely rather than change transaction
-semantics.
+Validate persisted bytes and submitted transactions at format boundaries. Malformed data or
+corruption must produce an explicit error rather than change transaction semantics.
 
 - Validate bytecode and administrative records before sequencing and verify retained records when
   loading them. Replay validation must use the historical catalogue and semantic limit policy.
@@ -1436,8 +1537,8 @@ semantics.
 
 ## 28. Deliberately unspecified implementation choices
 
-The following choices do not need to be fixed to define the database semantics or version 1 bytes.
-An implementation may choose them independently while preserving this document's invariants.
+Implementations may make the following choices independently. Each choice must preserve the required
+semantics, invariants, and version 1 encodings.
 
 - B+ tree split and merge heuristics, cache policy, and in-memory allocation.
 - Timing of checkpoints, whole-file compaction, log rotation, and group commit.
@@ -1455,46 +1556,38 @@ An implementation may choose them independently while preserving this document's
 
 ## 29. Design summary
 
-The database replaces client-side optimistic read/modify/write loops with deterministic transaction
-programs. The DSL is restricted so every program is bounded and its target tables and conservative
-access scopes are known before sequencing. Individual keys may be computed from database state;
-computed accesses and bounded ranges use whole-table scopes. The DSL lowers to stable bytecode that
-is safe to persist and replay without application callbacks.
+Preserve these relationships when implementing the formats that follow:
 
-A durable log assigns one total order to programs, schema operations, and semantic limit changes.
-Verified scope overlap lets the scheduler execute durably logged transactions concurrently within a
-bounded window when their predecessors have resolved. Administrative barriers preserve historical
-schema and policy interpretation. Each transaction uses a private overlay, so semantic abort is
-implemented by discarding tentative writes rather than undoing shared state. Dependent transactions
-wait for predecessor resolution, which prevents cascading rollback.
+1. Validate a bounded deterministic program and its access scopes before sequencing it.
+1. Make its log prefix durable before dispatching it. Wait for every required earlier writer.
+1. Keep writes private until success, then install all sequence-tagged versions and the outcome
+   together. On abort, discard the writes and retain the abort outcome.
+1. Expose only the contiguous resolved prefix. Internal reads may use resolved earlier versions
+   above F; external snapshots may not.
+1. Recover from C by replaying every later durable record under its historical catalogue and policy.
+1. Retain every above-frontier version and all history protected by snapshots, cursors, and other
+   claims. Snapshot revocation does not release a durable cursor.
+1. Commit derived data and its watermark together before acknowledging the cursor. Manage business
+   request deduplication inside the transaction.
 
-Successful writes become MVCC versions tagged with their transaction sequence. Internal execution
-may use successful log-prior versions above the public frontier. External readers see only the
-contiguous resolved prefix selected by the visibility frontier. This gives every public snapshot,
-checkpoint, replica, changefeed consumer, and derived index one simple sequence-number boundary.
-
-Recovery restores checkpoint data and metadata, then replays every subsequent durable record without
-skipping cached outcomes. Retention preserves all above-frontier versions and the historical
-versions, outcomes, and schemas needed by other claims. Snapshots are revocable, while durable
-checked-out cursors protect unacknowledged history until advanced or explicitly released. A derived
-index commits its data and source watermark atomically before acknowledging the cursor. Callers
-manage request deduplication rather than relying on submission retries being automatically
-idempotent.
-
-The core implementation can therefore optimize aggressively while retaining a simple specification:
-it must behave exactly like a single-threaded interpreter that runs the durable transaction log in
-sequence order.
+These rules allow implementation changes while retaining one correctness test: the externally
+visible result must match sequential execution of the durable log.
 
 ## Appendix A. Binary conventions and version registry
 
 ### A.1 Encoding rules
 
-All offsets and lengths are in bytes. Layouts are packed in the listed order, with no implicit
-alignment or padding. `u8`, `u16`, `u32`, and `u64` are unsigned integers of exactly that many bits.
-They are little-endian unless explicitly marked `be16`, `be32`, or `be64`. I64 values use 64-bit
-two's-complement representation. `bytes[n]` means exactly n bytes, not a pointer. ASCII magic
-strings contain exactly the displayed characters, with no NUL terminator. Hexadecimal examples are
-in wire order. `||` means byte concatenation.
+Read the binary layouts using these conventions:
+
+- Offsets and lengths count bytes. Fields appear in the listed order without implicit alignment or
+  padding.
+- `u8`, `u16`, `u32`, and `u64` are unsigned integers with the stated bit width. They are
+  little-endian unless marked `be16`, `be32`, or `be64`.
+- I64 uses 64-bit two's-complement representation.
+- `bytes[n]` is exactly n bytes, not a pointer.
+- An ASCII magic string contains exactly the displayed characters, without a NUL terminator.
+- Hexadecimal examples show bytes in their stored or transmitted order.
+- `||` joins byte sequences.
 
 The following productions are used throughout the appendices:
 
@@ -1505,34 +1598,43 @@ Vector<T>  = count: u32 || items: T[count]
 TypedValue = type: Blob(TypeDesc) || value: Blob(ValueEncoding(type))
 ```
 
-`Blob(T)` means a Blob whose entire data decodes as T. Every decoder must consume exactly its
-enclosing length. Extra bytes, duplicate fields where uniqueness is required, nonzero reserved
-bytes, unknown flags, unknown tags, and unsupported versions are errors. No variable-length
-integers, native Rust enum encodings, implicit Unicode normalization, optional padding, or implicit
-compression are used. A missing optional reference is encoded only by the sentinel specified for
-that field, never by omitting bytes.
+`Blob(T)` means that the entire Blob payload decodes as T. A decoder must consume exactly the
+enclosing length. Reject trailing bytes, prohibited duplicates, nonzero reserved bytes, unknown
+flags or tags, and unsupported versions.
 
-Before allocation or pointer arithmetic, validate lengths, counts, multiplication, addition,
-nesting, and containing-file bounds using checked arithmetic. A decoder may stream large objects; it
-must not turn physical memory pressure into a different semantic result. Invalid submitted bytes are
-submission errors. Invalid authoritative persisted bytes are corruption. A supported outer format
-containing an unsupported required inner version must report unsupported-format and stop; it must
-not skip the object or interpret it as a semantic abort.
+The formats use no variable-length integers, native Rust enum encodings, implicit Unicode
+normalization, optional padding, or implicit compression. Encode a missing optional reference with
+that field's specified sentinel. Do not omit the field's bytes.
+
+Before allocating or calculating pointers, validate lengths, counts, nesting, and file bounds. Use
+checked addition and multiplication. A decoder may stream large objects, but memory pressure must
+not change the semantic result.
+
+Classify failures by their source:
+
+- Invalid submitted bytes are submission errors.
+- Invalid authoritative stored bytes are corruption.
+- An unsupported required inner version is an unsupported-format error, even if the outer version is
+  supported. Stop processing; do not skip the object or report a semantic abort.
 
 ### A.2 Integrity and identities
 
-`CRC-32C` is the Castagnoli CRC: polynomial `0x1edc6f41`, reflected polynomial `0x82f63b78`,
-reflected input and output, initial register `0xffffffff`, and final XOR `0xffffffff`. The resulting
-u32 is stored little-endian. A checksum exists only where a layout explicitly declares a checksum
-field; nested values and programs have no implicit checksum trailer. For a declared final CRC field,
-the default coverage is all preceding bytes. An explicitly stated coverage span overrides that
-default, including the log record's header-and-body-only CRC. Where a layout specifies a
-whole-object embedded checksum, replace its field with four zero bytes while computing the CRC. CRCs
-detect accidental damage; they do not authenticate an untrusted writer.
+`CRC-32C` is the Castagnoli cyclic redundancy check (CRC). Use polynomial `0x1edc6f41`, reflected
+polynomial `0x82f63b78`, reflected input and output, initial register `0xffffffff`, and final XOR
+`0xffffffff`. Store the resulting u32 little-endian.
+
+Calculate a checksum only where the layout declares one. Nested values and programs have no implicit
+checksum trailer. A final CRC field covers all preceding bytes unless the layout states a different
+span. For example, a log record's CRC covers only its header and body. For a whole-object embedded
+checksum, replace the checksum field with four zero bytes during calculation.
+
+CRCs detect accidental damage. They do not authenticate a writer.
 
 `SHA256(x)` is SHA-256 as defined by FIPS 180-4, stored as the 32 digest bytes in their standard
 order, without integer byte reversal. Hash chains and manifest digests use this function. A backup
 or network transport needing authenticity must provide authentication outside version 1.
+
+#### Identity and sequence allocation
 
 Every database has a nonzero 16-byte `database_id`, selected at creation outside the VM and
 persisted in its genesis file. A sequence or cursor identifier is meaningful only with this
@@ -1563,21 +1665,33 @@ Version 1 has no optional feature bits. A change to an existing layout, opcode, 
 comparator, checksum, or required feature needs a new corresponding version. Readers must not guess
 compatibility from an otherwise familiar magic string.
 
-Hard format ceilings are independent of the logged policy. A program is at most 16 MiB, a log record
-at most 64 MiB, a schema-encoded value at most 16 MiB, a physical leaf value or outcome at most 128
-MiB, and an exchange batch at most 256 MiB. Here `1 MiB = 1,048,576 bytes`. Type descriptions are at
-most 65,536 bytes, have nesting depth at most 16, and have at most 256 fields per tuple. The
-outermost type has depth 1. All nested types count toward the depth limit. A type's declared maximum
-encoding length, computed with checked arithmetic, must fit the relevant value ceiling.
+#### Format ceilings
+
+These ceilings apply independently of the logged resource policy. `1 MiB = 1,048,576 bytes`.
+
+| Object                         | Maximum encoded size |
+| ------------------------------ | -------------------: |
+| Program                        |               16 MiB |
+| Log record                     |               64 MiB |
+| Schema-encoded value           |               16 MiB |
+| Physical leaf value or outcome |              128 MiB |
+| Exchange batch                 |              256 MiB |
+| Type description               |         65,536 bytes |
+
+Type nesting is limited to 16 levels, with the outermost type at depth 1. All nested types count
+toward that limit. A tuple has at most 256 fields. Compute a type's maximum encoded length with
+checked arithmetic; it must fit the applicable value ceiling.
 
 ## Appendix B. Types, schemas, and canonical keys
 
 ### B.1 Type descriptions
 
 A `TypeDesc` starts with `schema_version: u16 = 1`, followed by one recursively encoded `TypeNode`.
-Nested nodes do not repeat the version. The tag is a u8. A type's exact identity is its complete
-canonical descriptor bytes. Its *shape* is the same descriptor with byte-length and row-count bounds
-ignored. There are no names, field offsets, native alignment rules, or optional fields in a schema.
+Each node has a u8 tag; nested nodes do not repeat the version.
+
+A type's complete canonical descriptor bytes define its identity. Its *shape* ignores byte-length
+and row-count bounds but preserves the rest of the descriptor. Schemas contain no names, field
+offsets, native alignment rules, or optional fields.
 
 | Tag    | TypeNode operands after the tag                            | Value encoding                                             |
 | ------ | ---------------------------------------------------------- | ---------------------------------------------------------- |
@@ -1596,11 +1710,14 @@ points above U+10FFFF. There is no normalization; byte-distinct Unicode spelling
 NUL is allowed in user strings. Unit and an empty tuple have different types despite both having
 empty value encodings.
 
-Rows is allowed only as a top-level register or result type. Its key and value nodes must be
-ordinary non-Rows schema types, its maximum count is 65,535, and its maximum encoded size must fit
-16 MiB. Rows cannot be nested in another type, used in table schemas, supplied as an argument, or
-used as a constant. A row set contains strictly increasing, nonduplicate canonical keys. Its key and
-value shapes identify how each row is decoded; it does not encode a table ID.
+#### Rows and table schemas
+
+Rows is allowed only as a top-level register or result type. Its key and value nodes must exclude
+Rows. Its maximum count is 65,535, and its maximum encoded size must fit 16 MiB. Rows cannot be
+nested, used in table schemas, supplied as an argument, or used as a constant.
+
+A row set contains unique canonical keys in strictly increasing order. Its key and value shapes
+define how to decode each row. It does not encode a table ID.
 
 A table schema is `key: Blob(TypeDesc) || value: Blob(TypeDesc)`. Both descriptions exclude Rows.
 The maximum key encoding in B.2 must be at most 1,024 bytes; the maximum value encoding must be at
@@ -1622,12 +1739,13 @@ a key. The table schema supplies the types.
 | Bytes or String | Escape every `00` byte as `00 ff`, leave other bytes unchanged, and append `00 00`. |
 | Tuple           | Concatenate the canonical key encodings of its fields, without a tuple header.      |
 
-The byte-string encoding is called `Escape(x)` below. Its terminator makes variable-width fields
-self-delimiting and preserves prefix ordering. A schema fixes tuple arity and all zero-width fields,
-so key decoding is unambiguous. Maximum encoded sizes are 0, 1, or 8 for fixed-width types,
-`2 * max_bytes + 2` for Bytes and String, and the sum of field maxima for Tuple. Decoding must
-reject an invalid escape, missing terminator, invalid UTF-8, schema-bound violation, or trailing
-bytes.
+The Bytes and String encoding is called `Escape(x)`. Its terminator identifies the end of each
+variable-width field and preserves prefix ordering. The schema supplies tuple field counts and
+zero-width fields, so decoding remains unambiguous.
+
+Maximum encoded sizes are 0, 1, or 8 bytes for fixed-width types, `2 * max_bytes + 2` for Bytes and
+String, and the sum of field maxima for Tuple. Reject invalid escapes, missing terminators, invalid
+UTF-8, schema-bound violations, and trailing bytes.
 
 Logical comparison in the VM uses this same type order: ordinary signed or unsigned numeric order,
 false before true, byte order for Bytes and String, and lexicographic field order for Tuple. Unit
@@ -1648,11 +1766,12 @@ including fixed-width integer and tuple encodings. A state key is at most 2,066 
 version sequences must be nonzero. A row version's sequence must be greater than its table ID,
 because table creation itself installs no rows and only later transactions can address that table.
 
-For snapshot S, seek to `table_id || Escape(key) || be64(~S)` and use the first entry with that
-exact table/key prefix. For transaction N, use S = N - 1. An entry with another prefix is absence. A
-tombstone is terminal absence, not permission to continue to an older version. Range iteration
-groups physical entries by table/key before applying the same sequence bound and merging the
-overlay. Physical version counts never consume logical range budgets.
+To read at snapshot S, seek to `table_id || Escape(key) || be64(~S)`. Use the first entry only if
+its table/key prefix matches exactly. A different prefix or a tombstone means absence; do not
+continue to an older version. For transaction N, use S = N - 1.
+
+For ranges, group physical entries by table/key, apply the sequence bound, and merge the overlay.
+Physical version counts do not consume logical range budgets.
 
 ## Appendix C. Transaction format and ISA 1
 
@@ -1682,13 +1801,14 @@ constants:      TypedValue[constant_count]
 instructions:   Instruction[instruction_count]
 ```
 
-Table IDs are strictly increasing and must name live tables in the pre-sequence catalogue.
-Registers, arguments, tables, and constants are zero-indexed. A register operand is a u16 from 0
-through `register_count - 1`; `0xffff` is never a register and is reserved for absent range
-endpoints. There are no implicit registers, stack, flags register, or host pointers. Each register
-has one declared type for the entire program. All registers initially are uninitialized; ARG and
-CONST explicitly initialize them. Sources are read before writing a destination, so a destination
-may alias a source of compatible shape.
+Table IDs must be strictly increasing and name live tables in the pre-sequence catalogue. Registers,
+arguments, tables, and constants use zero-based indices. A register operand is a u16 from 0 through
+`register_count - 1`. The value `0xffff` means an absent range endpoint and is never a register.
+
+There are no implicit registers, stack, flags register, or host pointers. Each register keeps one
+declared type throughout the program and starts uninitialized. ARG and CONST explicitly initialize
+registers. Read source values before writing the destination; the destination may therefore alias a
+source of compatible shape.
 
 ### C.2 Transaction body and arguments
 
@@ -1705,10 +1825,12 @@ claims:              Budget
 Arguments = count: u32 || values: Blob(ValueEncoding(argument_type))[count]
 ```
 
-The argument count must equal the program's count. Each argument and constant must satisfy its
-declared type and the applicable admission policy. `Budget` is the fixed vector in D.2. There are no
-external program references: every record is independently decodable with its historical catalogue
-and policy. The enclosing log record supplies identity and integrity.
+The supplied argument count must equal the program's count. Each argument and constant must satisfy
+its declared type and admission policy. `Budget` is the fixed vector in D.2.
+
+Each record contains the complete program, so it can be decoded using its historical catalogue and
+policy without an external program reference. The enclosing log record supplies identity and
+integrity.
 
 ### C.3 Instruction encoding and control flow
 
@@ -1774,6 +1896,8 @@ explicit. All operands appear in the displayed order. Every unlisted opcode byte
 | `0x63` | ABORT                 | `user_code: u32`                    | Unconditionally abort.                                                  |
 | `0x64` | RETURN                | `s`                                 | Successfully return s and install the final overlay.                    |
 
+#### Arithmetic rules
+
 ADD, SUB, MUL, DIV, REM, BIT_AND, BIT_OR, and BIT_XOR require the same integer type in both sources
 and destination. BIT_NOT preserves its source integer type. SHL_WRAP and SHR require the destination
 to have a's integer type and b to be U64. DIV truncates toward zero for I64; REM satisfies
@@ -1782,24 +1906,30 @@ abort on division by zero, and both abort for `I64_MIN / -1` or `I64_MIN % -1`. 
 count of 64 or more, including counts that a host instruction would mask. Shift count zero is valid.
 No other arithmetic wraps.
 
-SLICE_BYTES requires `start <= byte_length` and `length <= byte_length - start`; it never clamps or
-wraps indices. Empty slices at the end are valid. Strings have no direct slicing opcode; callers can
-convert to bytes, slice, and explicitly validate UTF-8. TUPLE arity and FIELD indices are checked
-statically. All value movement and construction requires equal source/destination shapes, or the
-specific conversion described by the opcode. Destination bounds are enforced on the result. Table
-keys and values must statically match the table's shapes. Key bounds are checked before target
-access; new value bounds are checked before overlay mutation, after any INSERT presence check, as
-specified in C.6.
+#### Slices, tuples, and value bounds
+
+SLICE_BYTES requires `start <= byte_length` and `length <= byte_length - start`. It never clamps or
+wraps indices. An empty slice at the end is valid. To slice a String, convert it to Bytes, slice
+those bytes, and explicitly validate UTF-8. There is no direct String slicing opcode.
+
+Check TUPLE field counts and FIELD indices statically. Value movement and construction require equal
+source and destination shapes, except for the conversions specified by an opcode. Enforce
+destination bounds on the result.
+
+Table keys and values must statically match the table's shapes. Check key bounds before access.
+Check new value bounds before overlay mutation, after any INSERT presence check. C.6 defines the
+full order.
 
 ### C.4 Verification and access derivation
 
 Build the forward control-flow graph, including both edges of every conditional branch. Every
-instruction must be reachable from instruction zero, and every path must terminate with RETURN or
-ABORT, never fall off the array. Verify all instructions even when an argument makes a branch
-predictable. At a join, a register is definitely initialized only if it is initialized on every
-incoming path. Every source must be definitely initialized. RETURN must have the declared result
-shape; ABORT may terminate a path for any result type. Program-local shape mismatches are submission
-errors, not runtime type errors.
+instruction must be reachable from instruction zero. Every path must end with RETURN or ABORT; it
+must not fall off the instruction array. Validate all instructions even when arguments make a branch
+predictable.
+
+At a join, a register is definitely initialized only if every incoming path initializes it. Every
+source register must meet this condition. RETURN must match the declared result shape; ABORT may end
+a path for any result type. Reject program-local shape mismatches before sequencing.
 
 The verifier also propagates abstract register values in instruction order. ARG and CONST are known
 values; a pure instruction with all known inputs produces a known result if it completes within its
@@ -1815,6 +1945,8 @@ requires both. SCAN_BOUNDED always requires a table-wide read scope. Reads used 
 included separately. The database may accept a broader supplied scope but must independently prove
 that every derived read and write scope is covered. This analysis is deliberately conservative;
 compilers can keep independent known addresses in separate registers to retain point scopes.
+
+#### Manifest encoding and normalization
 
 ```text
 AccessManifest = Vector<Scope>
@@ -1846,12 +1978,13 @@ bit makes that endpoint exclusive. An absent endpoint requires its inclusion bit
 other bits are zero. Present endpoints have the table key shape and obey its bounds. The result
 register is Rows with the table's key and value shapes.
 
-The immediate row and byte limits must not exceed the transaction's corresponding claims. Select the
-first at most row_limit present logical rows in ascending key order from the sequence-bounded view
-merged with the overlay. Version filtering and overlay tombstones happen before row selection. There
-is no predicate filter, reverse scan, implicit continuation, or extra lookahead row in ISA 1. An
-inverted interval, an equal-endpoint interval with either side exclusive, or row_limit zero returns
-zero rows. Equal inclusive endpoints can return one row.
+The immediate row and byte limits must not exceed the transaction's corresponding claims. Merge the
+sequence-bounded view with the overlay, filter versions and tombstones, then select up to row_limit
+present rows in ascending key order. ISA 1 has no predicate filter, reverse scan, implicit
+continuation, or extra lookahead row.
+
+Return zero rows for an inverted interval, equal endpoints with either side exclusive, or row_limit
+zero. Equal inclusive endpoints can return one row.
 
 For each selected row, charge one logical examined/returned row and the sum of canonical user-key
 bytes and schema-encoded value bytes. Reaching row_limit stops successfully without probing whether
@@ -1863,11 +1996,17 @@ u32 zero count, not a missing-key abort.
 
 ### C.6 Runtime check order
 
-Each instruction first charges its instruction visit. A point operation then canonicalizes and
-checks the key, and charges its point access and distinct address before inspecting presence. Range
-endpoints are checked before scanning; each selected row is checked and charged in key order. These
-checks also apply to overlay hits. EXISTS and INSERT inspect only presence and do not load or charge
-the old value. DELETE does not inspect the old value at all.
+The first failed check determines the abort outcome. Apply the following order, including for
+overlay hits. Physical failures stop or suspend execution; they do not compete with semantic checks
+for an abort code.
+
+#### Instruction and address checks
+
+Charge the instruction visit first. For a point operation, check and encode the key, then charge the
+point access and distinct address before inspecting presence. EXISTS and INSERT check only presence;
+they do not load or charge the old value. DELETE does not inspect the old value.
+
+For a scan, check endpoints before scanning. Check and charge selected rows in key order.
 
 For each key, first enforce its table descriptor, then canonicalize it and enforce key_bytes. For a
 scan, complete these checks on the lower endpoint before checking the upper endpoint, even when
@@ -1875,6 +2014,8 @@ row_limit is zero or the interval will be empty. Absent endpoints require no che
 not count as distinct accessed addresses or point operations. Point access and distinct-address
 charges follow the key check. For a selected row, check the key first, then its loaded value, then
 the prospective distinct-address and range charges in resource-ID order.
+
+#### Computation and destination checks
 
 Next perform the opcode's intrinsic computation or presence check, validate the produced value
 against its destination or table descriptor, and check prospective resource usage before changing
@@ -1885,9 +2026,8 @@ byte limit is checked with aggregate range bytes and reports resource 14. A sele
 checked as a loaded key/value, then charged to the range budgets; the completed Rows value is then
 checked against its destination bounds and register budgets.
 
-The first failure in this execution order is the outcome. No later instruction runs. Arithmetic,
-UTF-8, index, missing-key, and explicit failure codes are in D.3. Physical errors suspend execution
-or require recovery; they never compete with semantic errors to choose an abort code.
+After a failure, no later instruction runs. D.3 defines arithmetic, UTF-8, index, missing-key, and
+explicit failure codes.
 
 ## Appendix D. Administrative records, limits, and outcomes
 
@@ -1902,13 +2042,20 @@ the operation operands:
 | `0x02`    | RENAME_TABLE | `table_id: u64, name: Text`                              | Change the live table's name; return Unit.                                     |
 | `0x03`    | DROP_TABLE   | `table_id: u64`                                          | Mark the live table dropped; return Unit.                                      |
 
-Names contain 1 through 255 UTF-8 bytes, excluding NUL. They use exact byte equality without
-normalization or case folding. No two live tables may share a name. CREATE with an occupied name
-aborts NAME_IN_USE. RENAME first checks that the table is live, then checks name availability;
-renaming a table to its current name succeeds. RENAME or DROP of an unknown or dropped identity
-aborts TABLE_NOT_LIVE. DROP releases the name immediately at its visible sequence but does not reuse
-the identity or discard retained versions. Malformed names or schemas are submission errors.
-Well-formed operations with state-dependent failures are sequenced and abort deterministically.
+Names contain 1 through 255 UTF-8 bytes, excluding NUL. Compare names by exact bytes, without
+normalization or case folding. No two live tables may share a name.
+
+Apply these outcome rules:
+
+- CREATE with an occupied name aborts with NAME_IN_USE.
+- RENAME first checks that the table is live, then checks name availability. Renaming a table to its
+  current name succeeds.
+- RENAME or DROP of an unknown or dropped identity aborts with TABLE_NOT_LIVE.
+- A successful DROP releases the name at its visible sequence. It does not reuse the table identity
+  or discard retained versions.
+
+Reject malformed names or schemas before sequencing. Well-formed operations whose failure depends on
+database state enter the log and abort deterministically.
 
 The full catalogue version value stored after a successful operation is:
 
@@ -1928,12 +2075,13 @@ future metadata-GC policy may be added without changing these encodings.
 
 ### D.2 Semantic limits and claims
 
-`Budget` is exactly 17 u64 fields, in ascending resource-ID order below. A `LimitPolicy` is
-`policy_version: u16 = 1 || reserved: u16 = 0 || limits: Budget`. Log kind 3 contains exactly one
-LimitPolicy and replaces the entire policy, not a partial patch. The initial policy is stored in the
-genesis file and policy tree. Creation must receive an explicit valid policy; no process default is
-consulted during replay. A well-formed SetLimits succeeds and returns Unit. It uses the barrier in
-section 7.3 and does not validate old rows against the new limits.
+`Budget` contains exactly 17 u64 fields in ascending resource-ID order. A `LimitPolicy` is
+`policy_version: u16 = 1 || reserved: u16 = 0 || limits: Budget`. Log kind 3 contains one
+LimitPolicy and replaces the entire policy.
+
+Store the initial policy in GENESIS and the policy tree. Creation must receive an explicit valid
+policy; replay must not consult process defaults. A well-formed SetLimits succeeds and returns Unit.
+It uses the barrier in section 7.3 and does not validate old rows against the new limits.
 
 Budget fields govern transaction programs, not administrative records. Catalogue operations and
 SetLimits use their fixed format and schema ceilings instead of transaction claims. In particular, a
@@ -1965,12 +2113,15 @@ effective limit; a looser current process setting or historical policy must not 
 | 16  | overlay_bytes   | 64 MiB       | Sum over overlay entries of `8 + key_length + 1 + value_length`; tombstones have value_length zero.        |
 | 17  | result_bytes    | 16 MiB       | Returned value encoding only, without its TypeDesc or Blob wrapper.                                        |
 
-Registers are charged by logical encoded length even when the implementation shares their backing
-memory. Overwriting a register replaces its old charge. Overwriting an overlay address replaces its
-old charge; a tombstone remains an entry. Range keys join the same distinct-address set as point
-keys. A Rows register includes its count and schema-encoded keys and values in value/register bytes;
-range_bytes instead uses canonical key bytes, as stated above. No physical page framing, allocation
-overhead, hashing implementation cost, or obsolete MVCC entries enter these quantities.
+#### Logical accounting
+
+Charge registers by encoded length, even when they share backing memory. Replacing a register or
+overlay entry replaces its old charge. A tombstone remains an overlay entry. Range keys join the
+same distinct-address set as point keys.
+
+A Rows register includes its count and schema-encoded keys and values in value and register byte
+charges. In contrast, range_bytes uses canonical key bytes. These quantities exclude physical page
+framing, allocation overhead, hashing implementation costs, and obsolete MVCC entries.
 
 The maximum encoding implied by each program-declared type must satisfy appendix A, but it need not
 fit a smaller transaction value_bytes claim: an actual loaded value can fail that claim. Supplied
@@ -2001,12 +2152,15 @@ effects:         Vector<Effect>
 ```
 
 `record_digest` is SHA256 of the complete canonical log record, including framing and CRC. The
-outcome tree key must equal sequence. For success, reason, user_code, and detail are zero and
-instruction is `0xffffffff`. A transaction returns its declared result type, re-encoded with those
-exact descriptor bounds. Administrative results use the descriptors specified in D.1 and D.2. An
-abort has no return bytes and zero effects. Transaction aborts identify the failing instruction;
-administrative aborts use instruction `0xffffffff`. User code is nonzero or zero as supplied only
-for REQUIRE_FAILED and EXPLICIT_ABORT, and is zero for every other reason.
+outcome tree key must equal sequence.
+
+For success, reason, user_code, and detail are zero; instruction is `0xffffffff`. Re-encode a
+transaction's returned value with its declared result type and exact descriptor bounds.
+Administrative results use the descriptors in D.1 and D.2.
+
+An abort has no return bytes and no effects. Transaction aborts identify the failing instruction;
+administrative aborts use `0xffffffff`. REQUIRE_FAILED and EXPLICIT_ABORT preserve the supplied user
+code, including zero. Every other reason uses user_code zero.
 
 | Reason   | Name                | Detail                                                        |
 | -------- | ------------------- | ------------------------------------------------------------- |
@@ -2029,6 +2183,8 @@ All other reason numbers are invalid in outcome version 1. Reasons `0x0010` and 
 only for catalogue records; the other nonzero reasons are legal only for transaction records.
 SetLimits has only success outcomes. There is no generic host-error string, I/O abort, timeout
 abort, or allocator-error abort in the durable outcome.
+
+#### Effects
 
 An Effect starts with a u8 tag and has the following operands, with no padding:
 
@@ -2075,10 +2231,9 @@ boundaries.
 | 80     | 12    | Reserved = 0.                                          |
 | 92     | 4     | CRC-32C of the complete header with this field zeroed. |
 
-The first record in the database uses the genesis-file digest as its predecessor. Every subsequent
-record uses the preceding record's digest, including across a segment boundary. A segment retained
-after older log truncation keeps its original predecessor digest; it is not rewritten with a new
-genesis anchor.
+The first record uses the GENESIS digest as its predecessor. Each later record uses the previous
+record's digest, including across segment boundaries. Removing older segments must not change a
+retained segment's original predecessor digest.
 
 ### E.2 Record envelope
 
@@ -2099,11 +2254,12 @@ genesis anchor.
 | 64 + body_length | 4           | CRC-32C of header and body only.                             |
 | 68 + body_length | 4           | Repeated total record length.                                |
 
-This canonical envelope is contained in a WAL group. Its own checksum validates a record, not a
-commit boundary. A complete group is the local durability unit; its framing does not enter the
-canonical record digest. A manifest records guaranteed complete-group prefixes, and recovery may
-discover later complete groups using E.3 and I.4. Accepted recovered groups must be flushed before
-execution.
+Each canonical record envelope sits inside a WAL group. The record's checksum validates that record;
+the complete group establishes the local durability boundary. Group framing is excluded from the
+canonical record digest.
+
+A manifest records guaranteed complete-group prefixes. Recovery may discover later complete groups
+under E.3 and I.4, but must flush accepted recovered groups before execution.
 
 Record CRC validation precedes interpretation. Validate both length copies, sequence continuity,
 kind/body compatibility, and the hash chain. Do not search forward for the next magic string after
@@ -2112,13 +2268,13 @@ last record. Missing bytes inside that prefix are also corruption, not a recover
 
 ### E.3 Durability boundary and tail handling
 
-The selected manifest establishes a lower bound on D, the durable frontier, and exact guaranteed
-prefixes for its listed segments. The active segment can contain later complete groups; new linked
-segments can also extend the durable chain without a manifest update. Existing durable prefixes are
-immutable. Recovery discovers complete groups from the selected bounds, validates their framing and
-canonical chain, trims only physically incomplete terminal appends, and establishes durability
-before replay as specified in I.4. It never skips an invalid complete group to search for later
-records.
+The selected manifest records a guaranteed lower bound on D and exact guaranteed prefixes for listed
+segments. Later complete groups may extend the active segment or continue in new linked segments
+without updating that manifest. Existing durable prefixes remain immutable.
+
+Recovery validates complete groups and their canonical chain beyond the selected bounds. It trims
+only physically incomplete terminal appends and makes the recovered suffix durable before replay, as
+specified in I.4. It must not skip an invalid complete group to search for later records.
 
 Advance live D only after flushing a complete WAL group and, for a newly created segment, its
 directory entry. No manifest-pointer update is needed for this append. Dispatch waits for that
@@ -2135,12 +2291,14 @@ inferred from an append record's presence or from a materialized page.
 
 ### F.1 Page file and addressing
 
-Version 1 stores all five system trees in one append-only page file named `pages-<file_id>.bin`,
-with a 20-digit zero-padded decimal ID. Every page is exactly 16,384 bytes. Page P starts at byte
-offset `P * 16384`; page IDs are file-local u64 integers. Page 0 is the file header and is never a
-tree node. A zero root ID means an empty tree; a zero child ID is invalid. A manifest's page_count
-includes page 0 and is at least 1 and at most `2^48`. References must be below that count, and
-offset calculations must not overflow or exceed the actual file length.
+Version 1 stores all five system trees in one append-only file, `pages-<file_id>.bin`. The ID is 20
+zero-padded decimal digits. Pages are exactly 16,384 bytes, and page P starts at offset `P * 16384`.
+Page IDs are u64 integers local to the file.
+
+Page 0 is the file header, never a tree node. A zero root ID denotes an empty tree; a zero child ID
+is invalid. The manifest's page_count includes page 0 and ranges from 1 through `2^48`. All
+references must be below page_count. Offset calculations must neither overflow nor exceed the actual
+file length.
 
 Published pages are immutable. New nodes and overflow pages are appended, and old paths are replaced
 by new paths through copy-on-write. There is no persisted free list, in-place page reuse, physical
@@ -2175,10 +2333,12 @@ are `magic: bytes[8] = BLOPST01 || database_id: bytes[16] || file_id: u64`; the 
 bytes are zero. Only page 0 may have kind 0. Its identities must agree with the manifest and
 filename.
 
-Every other page has a tree ID from F.5. A child or overflow reference must remain within that tree
-and file. Validate the CRC and header before following any offsets. Node depth is limited to 255,
-and child levels must decrease by exactly one. Cycles, repeated ownership of a child in one tree
-root, and child references to file-header or overflow pages are corruption.
+Validate each page's CRC and header before following offsets. Every page other than page 0 must have
+a tree ID from F.5. Child and overflow references must stay within that tree and file.
+
+Node depth is limited to 255, and each child's level must be exactly one below its parent's. Reject
+cycles, repeated child ownership within one root, and child references to file-header or overflow
+pages as corruption.
 
 ### F.3 Slotted leaf and internal nodes
 
@@ -2204,10 +2364,12 @@ key:           bytes[key_length]
 inline_value:  bytes[value_length] only when storage = 0
 ```
 
-Values of at most 1,024 bytes must be inline with overflow_head zero. Larger values, up to 128 MiB,
-must be entirely in an overflow chain with nonzero overflow_head and no inline bytes. Zero-length
-values are structurally legal, though each system tree still validates its own value format. The
-storage byte is not an MVCC tombstone flag; tombstones are logical values in the state tree.
+Store values of at most 1,024 bytes inline, with overflow_head zero. Store larger values, up to 128
+MiB, entirely in an overflow chain with nonzero overflow_head and no inline bytes. Zero-length
+values are structurally valid, subject to each system tree's value rules.
+
+The storage byte selects inline or overflow storage. Tombstones use the state tree's logical value
+encoding, not this byte.
 
 Internal cells have this encoding:
 
@@ -2242,12 +2404,14 @@ An overflow page has no slots: cell_count = 0, lower = 64, upper = 16384, level 
 at byte 64 and has payload byte count from 1 through 16,320. Bytes after the payload are zero. The
 header link points to the next overflow page, or zero at the end.
 
-Concatenate payloads in link order to obtain the complete leaf value. Every nonfinal page has 16,320
-payload bytes; the final page has exactly the remaining byte count. Chain length must equal
-`ceil(value_length / 16320)`. A short chain, excess data, a nonzero link after the final byte, wrong
-page kind/tree ID, repeated page, or checksum failure is corruption. A chain belongs to one leaf
-cell within a root and cannot be shared by different cells. Different immutable generations may
-share the same unchanged cell and chain. No key or separator is stored in overflow pages.
+Concatenate payloads in link order to recover the leaf value. Each nonfinal page has 16,320 payload
+bytes; the final page has exactly the remaining bytes. The chain must contain
+`ceil(value_length / 16320)` pages.
+
+Reject short chains, excess data, nonzero links after the final byte, wrong page kinds or tree IDs,
+repeated pages, and checksum failures as corruption. Within one root, a chain belongs to exactly one
+leaf cell. Different immutable generations may share an unchanged cell and its chain. Overflow pages
+contain no keys or separators.
 
 ### F.5 System tree registry
 
@@ -2261,6 +2425,8 @@ The manifest publishes roots for these trees in this order. Unknown tree IDs are
 | 4   | Outcomes  | `sequence: be64`.                                         | Outcome from D.3.                                                                                                |
 | 5   | Cursors   | `cursor_id: be64`.                                        | CursorValue from G.4.                                                                                            |
 
+#### State and metadata versions
+
 The state tree has at most one entry for `(table_id, key, sequence)`. An installed version is the
 final Put or Delete from a successful transaction, never an intermediate overlay state. Stored
 values must decode exactly under the table's immutable schema. Catalogue entries use the sequence of
@@ -2273,12 +2439,18 @@ seek as state lookup; a dropped catalogue version stops lookup as not-live. Name
 live catalogue versions at the requested sequence; an in-memory name index is derived, not a
 separately persisted authority.
 
-A checkpoint at C with history floor G stores every state version with `G < sequence <= C` and the
-newest version at or below G for each address if one exists, including tombstones. It stores every
-outcome with `G < sequence <= C`, including aborts and no-write outcomes, and all catalogue/policy
-versions through C. Additional older state versions and outcomes may be kept. None of these four
-checkpoint roots may expose entries above C. The cursor root is current local metadata and is not
-bounded by C; its positions may be above C when the durable log supplies recovery through them.
+#### Checkpoint contents
+
+A checkpoint at C with history floor G stores:
+
+- every state version with `G < sequence <= C`;
+- the newest version at or below G for each address, if one exists, including tombstones;
+- every outcome with `G < sequence <= C`, including aborts and no-write outcomes; and
+- all catalogue and policy versions through C.
+
+It may retain additional older state versions and outcomes. These four roots must not expose entries
+above C. The cursor root holds current local metadata and is not bounded by C. Its positions may
+exceed C when the durable log permits recovery through them.
 
 ### F.6 Atomic installation and allocation
 
@@ -2294,14 +2466,20 @@ pages and required history. New page IDs append after the file's allocated tail;
 written completely before a manifest can reference it. Intermediate private pages are not committed
 merely because they are present in the file.
 
-Version 1 compaction uses a quiescent writer handover. Pause sequencing, finish all durably logged
-work so F = D, and stop page installation and concurrent checkpoint writers. Build a checkpoint at C
-= F = D using all current retention claims. Copy its four logical roots and the current cursor root
-to a new file ID, rewriting every child and overflow reference, then flush and publish the new file
-and roots through G.3. Adopt these roots as the live roots before resuming sequencing and
-installation. Cursor metadata changes must serialize with the handover or wait until it finishes.
-This drain ensures that neither visible post-checkpoint state nor installed above-frontier state is
-lost when the live roots move to the new file.
+#### Compaction handover
+
+Version 1 compaction changes files while the writer is idle:
+
+1. Pause sequencing and finish all durably logged work so F = D.
+1. Stop page installation and concurrent checkpoint writers.
+1. Build a checkpoint at C = F = D using all current retention claims.
+1. Copy its four logical roots and current cursor root to a new file ID. Rewrite every child and
+   overflow reference.
+1. Flush and publish the file and roots through G.3.
+1. Adopt the new roots as live roots, then resume sequencing and installation.
+
+Cursor metadata changes must serialize with this handover or wait. Finishing durable work first
+prevents the handover from losing visible post-checkpoint state or installed above-frontier state.
 
 Keep the old file pinned until every root that can reference it has retired, including idle snapshot
 handles, in-flight readers, pending writers, checkpoint work, and backups. Absence from CURRENT
@@ -2313,9 +2491,9 @@ version therefore needs no persistent allocator bitmap or per-page free-generati
 
 ### G.1 Directory and genesis
 
-An open version 1 database has one exclusive process owner. The implementation must hold an
-operating-system lock preventing another process from opening it for reads or writes that could race
-publication or reclamation. The lock mechanism has no portable persisted payload.
+Only one process may own an open version 1 database directory. Hold an operating-system lock that
+prevents another process from opening it for reads or writes that could race publication or
+reclamation. The lock has no portable stored payload.
 
 The directory contains `GENESIS`, `CURRENT`, the selected `manifest-<generation>.bin`, its selected
 `pages-<file_id>.bin`, and its retained `log-<segment_id>.bin` files. Numeric filename components
@@ -2340,11 +2518,16 @@ digest is SHA256 of this complete file. For checkpoint or durable frontier 0, th
 last-record digest is this genesis digest. Genesis must be preserved even after original log
 segments are removed. Replacing it creates a different history, not a configuration change.
 
-Creation writes and flushes GENESIS, page 0, and the policy tree's initial entry in page file 1,
-then publishes manifest generation 1 with C = D = G = 0, log_floor = 1, no segments, and an empty
-cursor root. Initial next_cursor_id and next_segment_id are 1; next_page_file_id is 2. Select the
-cursor namespace as described in G.4. Until a valid CURRENT is published, the directory is an
-incomplete creation, not an empty database that may be silently initialized over existing files.
+#### Create the initial state
+
+1. Select the cursor namespace as described in G.4.
+1. Write and flush GENESIS, page 0, and the policy tree's initial entry in page file 1.
+1. Publish manifest generation 1 with C = D = G = 0, log_floor = 1, no segments, and an empty cursor
+   root. Set next_cursor_id and next_segment_id to 1, and next_page_file_id to 2.
+1. Select that manifest by publishing a valid CURRENT under G.3.
+
+Until CURRENT is valid, the directory is an incomplete creation. Do not initialize over its existing
+files as though it were an empty database.
 
 ### G.2 Manifest and publication pointer
 
@@ -2387,6 +2570,8 @@ SegmentDescriptor =
     last_digest:        bytes[32]
 ```
 
+#### Validate manifest bounds and anchors
+
 A manifest is at most 16 MiB. It must satisfy
 `0 <= history_floor <= checkpoint_sequence <= durable_sequence` and
 `1 <= log_floor <= checkpoint_sequence + 1`. Segments are ordered by sequence, nonempty, and
@@ -2396,8 +2581,8 @@ header and ends at the complete group containing last_sequence, which must be th
 record. Segment headers, filenames, predecessor digests, and final digests must agree with the
 descriptors. Adjacent descriptors must chain to each other. Segment IDs are strictly increasing.
 
-The manifest's durable_sequence is a guaranteed lower bound on live D. Later complete groups are
-discovered according to I.4. For N records, a descriptor needs at least
+The manifest's durable_sequence is a guaranteed lower bound on live D. Discover later complete
+groups according to I.4. For N records, a descriptor needs at least
 `96 + 72 * N + 168 * ceil(N / 64)` bytes and at most `96 + N * (64 MiB + 168)` bytes.
 
 The chain at C must equal checkpoint_digest when C is in retained log coverage; when C is just
@@ -2407,12 +2592,16 @@ checkpoint_digest. Published C, D, and the history/log floors never decrease. Th
 tree entry must exactly equal GENESIS. The roots, page_count, and logical tree contents must meet
 F.5; policy_root is always nonzero.
 
+#### Allocate identities
+
 Each published manifest advances its next-ID fields past every durable ID known at that publication,
 even after objects are released or files are deleted. Recovery also advances the live segment
 counter past discovered complete WAL segments. `2^64 - 1` in a next-ID field means exhausted; it is
 not allocatable. Incomplete orphan output does not allocate durable identities; allocation skips its
 filenames rather than overwriting them. Manifest generations strictly increase after each metadata
 publication; an implementation may skip generations to avoid an orphan filename collision.
+
+#### Select a manifest with CURRENT
 
 `CURRENT` is exactly 64 bytes:
 
@@ -2433,12 +2622,14 @@ manifest left by an interrupted publication is not committed just because its fi
 
 ### G.3 Flush and atomic publication protocol
 
-Version 1 assumes a filesystem that provides atomic same-directory rename-over-existing, durable
-file flushing, and durable directory flushing. After a crash, a flushed rename must select the new
-file; a rename not yet flushed may select the complete old or complete new file, not torn mixed
-contents. Hardware and filesystem failures that violate these guarantees are outside the crash
-model. An implementation without these primitives must refuse durable mode or use a separately
-versioned publication protocol, not assume that a sector-sized write is atomic.
+Version 1 requires three filesystem operations: atomic replacement by rename within one directory,
+durable file flushing, and durable directory flushing. After a crash, a flushed rename must select
+the new file. An unflushed rename may select the complete old or complete new file, but not mixed
+contents.
+
+Hardware or filesystem failures that violate these guarantees are outside the crash model. If these
+operations are unavailable, refuse durable mode or use a separately versioned protocol. Do not
+assume that a sector-sized write is atomic.
 
 Serialize all publication operations, including log group commits, checkpoints, cursor changes, and
 compaction. Build each new manifest from the latest live durable metadata, preserving unrelated
@@ -2460,14 +2651,19 @@ WAL procedure in I.3 and can advance D without this metadata publication.
    all in-flight users have released the old objects. Flush the directory after deletions when their
    durable removal matters to space accounting.
 
-On an uncertain failure during publication, stop new dispatch and reclamation until recovery
-establishes which CURRENT is selected. Never publish another manifest from a guessed base. A crash
-before pointer replacement uses the old checkpoint and discovers its WAL suffix; a crash after
-replacement may use the complete new checkpoint even before its caller saw success. Unselected
-materialized pages are not recovery authority. New referenced data was flushed first in either case.
-There is no fallback to an older checkpoint if a valid CURRENT points to missing or corrupt
-authoritative data: that could lose acknowledged transactions or cursor registrations. Explicit
-offline repair is distinct from normal recovery.
+#### Handle an uncertain publication
+
+Stop dispatch and reclamation until recovery establishes which CURRENT is selected. Do not publish
+another manifest from a guessed base.
+
+A crash before pointer replacement uses the old checkpoint and discovers its WAL suffix. A crash
+after replacement may select the complete new checkpoint even if the caller received no success
+response. New referenced data was flushed before replacement. Unselected materialized pages never
+define the recovery starting point.
+
+If valid CURRENT points to missing or corrupt authoritative data, report an error. Falling back to
+an older checkpoint could lose acknowledged transactions or cursor registrations. Explicit offline
+repair is a separate operation.
 
 ### G.4 Durable cursor metadata
 
@@ -2476,16 +2672,21 @@ registrations, independently of the canonical database_id. Select a fresh unique
 the VM at creation. Ordinary crash recovery preserves it. Every cursor token carries both
 identities, and cursor APIs reject a namespace mismatch before looking up a numeric cursor ID.
 
-Restoring an older backup or attaching a copied directory as a replica is an explicit operation, not
-ordinary crash reopening. Before enabling cursor APIs, it must durably publish a fresh cursor
-namespace through G.3. Copied registrations, baselines, and next_cursor_id are preserved, but their
-old tokens are invalid. An explicit administrative rebind issues new tokens for those retained
-registrations after the consumer selects the correct copied cursor ID and validates its watermark.
-There is no automatic rebind by an untrusted old token or by a possibly nonunique label. This
-prevents tokens issued after the backup, or in a different replica, from naming a new registration
-that happens to reuse the same local counter value. A crashed restore retries the explicit attach
-operation before allowing normal access; an extra namespace change is safe and does not release any
-claim. Merely copying files does not complete attachment as an independently open directory.
+#### Attach a copy and rebind its cursors
+
+Restore and replica attachment are explicit operations. Before enabling cursor APIs on a copy,
+durably publish a fresh cursor namespace through G.3. Preserve copied registrations, baselines, and
+next_cursor_id, but reject old tokens.
+
+An administrative rebind may issue a new token after the consumer selects the correct copied cursor
+ID and validates its watermark. Do not rebind automatically by old token or nonunique label.
+Otherwise, a token issued after the backup or by another replica could address an unrelated
+registration with the same numeric ID.
+
+After an interrupted restore, retry explicit attachment before normal access. An extra namespace
+change is safe and releases no claim. Copying files alone does not complete attachment.
+
+#### Cursor value
 
 The cursor tree value is:
 
@@ -2501,6 +2702,8 @@ The label is 0 through 255 UTF-8 bytes excluding NUL, for diagnostics, and need 
 tree key is a nonzero local cursor ID. Baseline is the checkout or last acknowledged sequence,
 always at most D in the published manifest. It may exceed checkpoint C because recovery replays
 through D before serving the cursor. A registration remains present until explicit release.
+
+#### Checkout, acknowledgement, and release
 
 Checkout serializes with retention decisions, verifies `G <= baseline <= F` and availability of all
 required state/outcomes, and, for kinds 2 and 3, verifies original log availability from baseline +
@@ -2518,6 +2721,8 @@ another database or cursor namespace are rejected. An ID at or above next_cursor
 issued and is an invalid token. Cursor operations are local retention metadata, not canonical log
 records, and consume no transaction sequence numbers.
 
+#### Retention floors
+
 Every checkpoint history_floor must be no greater than the minimum baseline of current cursors and
 all other protected floors in section 15.2. Every logical/replica cursor additionally requires
 log_floor no greater than baseline + 1. Checkout cannot resurrect history below the published
@@ -2527,14 +2732,15 @@ invalidates their handles, but live readers still block unsafe reclamation.
 
 ### G.5 Recovery and backup rules
 
-Recovery validates CURRENT, the selected manifest's digest and CRC, GENESIS and its digest, page 0,
-the reachable checkpoint/cursor trees, and each selected log prefix, then discovers and flushes the
-complete WAL suffix under I.4. Corruption of unreachable orphan pages does not invalidate a
-checkpoint; corruption of a referenced page does. Restore cursor registrations before reclamation,
-restore the four logical trees at C, and replay every record in `(C, D]` using the historical policy
-and catalogue. A record that fails replay validation indicates corruption or an unsupported
-implementation, not a newly invented abort. Set the recovered frontier to C initially and advance it
-only as replay resolves the contiguous prefix.
+Validate CURRENT, the selected manifest's digest and CRC, GENESIS and its digest, page 0, reachable
+checkpoint and cursor trees, and every selected log prefix. Then discover and flush the complete WAL
+suffix under I.4. A corrupt referenced page invalidates the checkpoint; an unreachable orphan page
+does not.
+
+Restore cursor registrations before reclamation. Restore the four logical trees at C, set the
+recovered frontier to C, and replay every record in `(C, D]` under its historical catalogue and
+policy. Advance the frontier only through the contiguous resolved prefix. A replay validation
+failure means corruption or an unsupported implementation; it must not create a new abort outcome.
 
 The manifest does not store a later live visibility frontier or a completion bitmap. Recovery
 reconstructs those from C and the durable log. Bytes beyond page_count pages are excluded; log bytes
@@ -2542,17 +2748,23 @@ beyond selected prefixes are classified by I.4. After validating the recovered v
 active readers, incomplete tails and unused files may be removed. Retained outcomes at or below C
 cannot be discarded as disposable caches. Post-C materialization is never a recovery starting point.
 
-A physical backup is a database directory image, not an unspecified archive format. Capture live D
-and its complete-group log bounds with the selected checkpoint roots, page count and retention
-metadata. Synthesize a manifest for that pinned prefix, copy GENESIS, exactly page_count complete
-pages and exactly those log prefixes, then write a matching CURRENT last using G.3 ordering in the
-destination. Source files must remain pinned until copying finishes. Copying the live CURRENT and
-then independently copying whatever filenames happen to exist is not a consistent backup. Restore
-retains the backed-up cursor registrations; a restored consumer must resume from a watermark
-protected by that backup, not assume it contains later source history. A read replica may explicitly
-clear copied source-local cursor registrations by a new local manifest publication before applying
-its own retention policy. Source and replica retain the same genesis identity, but must not become
-independent writable primaries under it.
+#### Copy a consistent backup
+
+A physical backup is a database directory image. Create it in this order:
+
+1. Capture live D, complete-group log bounds, selected checkpoint roots, page count, and retention
+   metadata together. Pin the source files.
+1. Construct a manifest for that captured prefix.
+1. Copy GENESIS, exactly page_count complete pages, and exactly the captured log prefixes.
+1. Publish the destination using G.3 ordering, with a matching CURRENT written last.
+1. Release source pins after copying finishes.
+
+Copying live CURRENT and then copying files independently is not a consistent backup.
+
+Restore retains the copied cursor registrations. A consumer must resume from a watermark protected
+by that backup; later source history may be absent. A read replica may explicitly remove copied
+source-local registrations through a new local manifest before applying its own retention policy.
+Source and replica share the genesis identity, but must not become independent writable primaries.
 
 ## Appendix H. Exchange formats and conformance cases
 
@@ -2579,10 +2791,10 @@ Resolved FeedRecord = outcome: Blob(Outcome)
 Logical FeedRecord  = log_record: Blob(LogRecord) || outcome: Blob(Outcome)
 ```
 
-The fixed header is 56 bytes. The total length includes the header and final CRC and is at most 256
-MiB. A batch never splits an outcome, a log record, or a transaction's effects. Select a smaller
-record count when the next complete record would exceed the byte ceiling. A single maximum-sized
-version 1 record and outcome fit in one batch.
+The fixed header is 56 bytes. Total length includes the header and final CRC and must fit 256 MiB.
+Never split an outcome, log record, or transaction's effects. If the next complete record would
+exceed the byte ceiling, return fewer records. A single maximum-sized version 1 record and outcome
+fit in one batch.
 
 Require `record_count = end_inclusive - start_exclusive`, using checked subtraction, and strictly
 consecutive sequence numbers from start_exclusive + 1 through end_inclusive. Empty polling batches
@@ -2591,22 +2803,27 @@ visibility frontier captured for the batch. Aborts, no-write transactions, and a
 records remain present; table-filtered feeds that silently omit sequence positions are not this
 format. Consumers may filter only after accounting for complete source records.
 
-Logical records must match their outcomes in sequence, kind, and SHA256 record digest, and chain to
-each other. Import has two separate interpretation stages. First, pause local append and finish any
-outstanding replay so local F = D. Pin that prefix and check the incoming first predecessor digest
-against its last-record or checkpoint anchor. Validate the batch and run the sequential reference
-interpreter in an isolated disposable copy of the prefix, comparing every generated outcome
-byte-for-byte with the supplied outcome. This is import validation, not transaction dispatch: it
-cannot install live versions, notify callers, advance a frontier, or produce a feed. A mismatch is
-divergence, not permission to accept source effects instead of executing the VM.
+#### Validate and import logical records
 
-Only after all comparisons succeed may import append those exact canonical record bytes and publish
-their durable prefix through G.3. Then replay them through the normal live installation path and
-advance visibility. Keep local append serialized from anchor validation through durable publication
-so the validated base cannot change. A crash before publication discards validation work; a crash
-after publication replays a prefix whose expected outcomes were already verified. The source
-outcomes need no separate pending-verification journal. System errors during either stage stop
-progress rather than becoming semantic aborts.
+Logical records must match their outcomes in sequence, kind, and SHA256 record digest. They must
+also chain to each other. Import uses two stages.
+
+1. **Validate in isolation.** Pause local append and finish outstanding replay so local F = D. Pin
+   that prefix and check the first incoming predecessor digest against its last-record or checkpoint
+   anchor. Validate the batch, then execute it sequentially in an isolated disposable copy. Compare
+   every generated outcome byte-for-byte with the supplied outcome. This stage cannot install live
+   versions, notify transaction callers, advance a frontier, or produce a feed. A mismatch is
+   divergence; do not substitute supplied effects for VM execution.
+1. **Publish and replay.** After every comparison succeeds, append the exact validated canonical
+   bytes and make them durable using I.3. Replay them through the normal live installation path and
+   advance visibility. Publish checkpoints and storage metadata using G.3.
+
+Serialize local append from anchor validation through durable publication so the validated base
+cannot change. A crash before publication discards validation work. A crash after publication
+replays an already verified prefix. No separate pending-verification journal is required for source
+outcomes. System errors stop progress; they do not become semantic aborts.
+
+#### Consume resolved records or raw logs
 
 Resolved feeds use their complete effects without a VM and require the baseline catalogue plus
 subsequent catalogue events to decode values. A resolved-only feed is not enough to reconstruct the
@@ -2632,11 +2849,13 @@ cursor_id:        u64
 crc32c:           u32
 ```
 
-The token is an identity reference, not proof of registration, an authorization secret, or a
-retention claim on its own. Reopen checks the current cursor tree. An absent released registration
-reports cursor-released; it must not create a replacement at the same number or silently choose a
-new baseline. Both identities are checked even when an integer cursor ID happens to exist locally.
-Restored copies and replicas require explicit token rebinding under G.4.
+The token identifies a registration. It is not an authorization secret and does not establish a
+retention claim by itself. Reopen must check both identities and the current cursor tree, even if
+the numeric cursor ID exists locally. A released registration reports cursor-released; it must not
+create a replacement or select a newer baseline. Rebind tokens explicitly after restore or
+attachment under G.4.
+
+#### Watermark payload
 
 A consumer's source watermark is exactly 40 bytes:
 
@@ -2674,8 +2893,8 @@ Compatible implementations must produce the following primitive encodings:
 | Escape of bytes `41 00 42`                         | `41 00 ff 42 00 00`                                                |
 | Canonical key for Tuple(U64 7, String `a`)         | `00 00 00 00 00 00 00 07 61 00 00`                                 |
 
-This complete 79-byte program returns U64 42, has one U64 register, no arguments or tables, and one
-constant. Whitespace below is for presentation only:
+The following complete 79-byte program returns U64 42. It has one U64 register, one constant, and no
+arguments or tables. Whitespace separates bytes for reading; it is not encoded.
 
 ```text
 42 4c 4f 50 56 4d 30 31 01 00 00 00 4f 00 00 00
@@ -2716,7 +2935,9 @@ reserved/free bytes with zero and computing its CRC. It represents a tombstone a
 empty Bytes value. The same address's version 10 sorts before version 9. A snapshot at 8 must not
 observe either; a snapshot at 9 observes absence without falling through to an older Put.
 
-In addition to section 26, an implementation must test these binary behaviours:
+Implementations must test the following binary behaviours as well as the cases in section 26.
+
+#### Values and instructions
 
 - Round-trip every supported type, bound-zero value, tuple, key escape, and integer extreme. Check
   that key-byte order agrees with the comparator and that physical version order is descending.
@@ -2732,6 +2953,9 @@ In addition to section 26, an implementation must test these binary behaviours:
 - Verify identical scan results and resource failures for the same logical view with different page
   shapes, obsolete versions, overlay histories, and later invisible writes. Check empty and
   equal-endpoint intervals and exact row/byte limits without an extra charged lookahead row.
+
+#### Pages and framing
+
 - Verify leaf inline values of 1,024 bytes and overflow values of 1,025 bytes. Verify chains of
   exactly 16,320 and 16,321 bytes, key-size boundaries, separator equality routing, root collapse,
   split propagation, and range iteration across copy-on-write generations.
@@ -2741,6 +2965,9 @@ In addition to section 26, an implementation must test these binary behaviours:
 - Truncate each fixed header and variable-length object at every byte boundary. Reject oversized
   counts before allocation, checked-arithmetic overflow, unknown flags/versions, extra trailing
   data, changed checksums, and broken record hash chains.
+
+#### Recovery, retention, and copies
+
 - Crash before and after every file flush, rename, and directory flush in G.3. Recovery must use
   exactly the old or new CURRENT-selected checkpoint, then validate and flush complete WAL groups
   beyond its log bounds. An unselected higher-generation manifest or partially installed overlay is
@@ -2771,8 +2998,8 @@ compatible outcomes, historical snapshots, resource accounting, or retention beh
 
 ### I.1 Checkpoint selection and live durability
 
-CURRENT uses the version-1 layout in G.2. WAL group and segment headers also use version 1; unknown
-versions are rejected. There is one publication protocol and one log reader/writer format.
+Use the version 1 CURRENT layout in G.2 and version 1 WAL group and segment headers. Reject unknown
+versions. Creation, live publication, and recovery share the same protocol and log format.
 
 The selected manifest is authoritative for C, materialized roots, page-file prefix, cursor metadata,
 retention floors and allocation counters. Its D and log descriptors are a durable lower bound, not
@@ -2786,11 +3013,13 @@ hashes or logical replication bytes.
 
 ### I.2 Group framing
 
-All integer fields below are little-endian. A group is a 112-byte header, consecutive complete E.2
-records, and a 56-byte trailer. It contains 1 through 64 records. Total group length is
-`168 + sum(canonical_record_lengths)`, from `168 + 72 * count` through `168 + 64 MiB * count`.
-Arithmetic is checked before allocation or traversal. The first sequence is nonzero, and
-`first + count` must fit u64, so no record uses the reserved u64 maximum.
+All integer fields below are little-endian. A group contains a 112-byte header, 1 through 64
+consecutive complete E.2 records, and a 56-byte trailer.
+
+Total group length is `168 + sum(canonical_record_lengths)`. It ranges from `168 + 72 * count`
+through `168 + 64 MiB * count`. Check arithmetic before allocating or traversing bytes. The first
+sequence must be nonzero, and `first + count` must fit u64. No record may use the reserved u64
+maximum.
 
 | Header offset | Bytes | Field                                             |
 | ------------: | ----: | ------------------------------------------------- |
@@ -2868,13 +3097,16 @@ Under the exclusive directory lease:
    aborts and records whose receipts may already have succeeded. Publish the resulting checkpoint
    before serving public requests.
 
-A complete valid group may be recovered although its writer never observed a successful flush or
-sent a receipt. That is an uncertain submission. These rules do not claim that checksums prove a
-past flush occurred. In particular, loss or physical truncation of an uncheckpointed suffix caused
-by later damage is indistinguishable from an interrupted append. The selected manifest's existing
-byte bounds remain strict; complete malformed suffix groups are never silently rolled back. A
-full-length torn append that fails those checks is an explicit recovery error, not an automatically
-discarded tail. This conservative distinction is part of the version-1 recovery contract.
+#### Interpret recovery results
+
+A complete valid group can survive even if the writer never observed a successful flush or sent a
+receipt. Its submission result is uncertain. Checksums alone do not prove that a past flush
+occurred.
+
+Later loss or physical truncation of an uncheckpointed suffix cannot be distinguished from an
+interrupted append. The selected manifest's byte bounds remain strict. Recovery must reject complete
+malformed suffix groups, including full-length torn appends that fail validation, rather than
+silently roll them back. This distinction is part of the version 1 recovery contract.
 
 ### I.5 Backup and logical consumers
 
@@ -2893,10 +3125,15 @@ segments and reclaims whole segments only after replacement metadata is durable.
 
 ### I.6 Verification obligations
 
-Test one-flush append counts, immutable CURRENT across WAL-only commits, exact group boundaries,
-checksummed malformed frames, every physically short group prefix, segment forks and missing
-predecessors, process exit and partial writes at append boundaries, recovery flushing before replay,
-checkpoint sequences inside groups, unsupported versions, orphan filenames, and backups captured
-while live D exceeds the selected manifest. Existing sequential-equivalence, retention, revocation
-and replica outcome checks remain required. Fault injection and process exit are not simulations of
-hardware power loss or arbitrary filesystem write reordering.
+Test each of these WAL behaviours:
+
+- one-flush appends and unchanged CURRENT across WAL-only commits;
+- exact group boundaries, malformed checksummed frames, and every physically short group prefix;
+- segment forks, missing predecessors, unsupported versions, and orphan filenames;
+- process exit and partial writes at append boundaries;
+- recovery flushing before replay and checkpoints inside groups; and
+- backups captured while live D exceeds the selected manifest's D.
+
+Sequential-equivalence, retention, revocation, and replica outcome checks also remain required.
+Fault injection and process exit do not simulate hardware power loss or arbitrary filesystem write
+reordering.

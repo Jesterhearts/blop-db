@@ -1,4 +1,4 @@
-//! Sequential instruction evaluation and logical resource accounting.
+//! Evaluate instructions in order and charge their logical resource use.
 
 use std::collections::BTreeSet;
 use std::ops::Bound;

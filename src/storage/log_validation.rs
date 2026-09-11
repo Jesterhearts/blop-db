@@ -1,8 +1,8 @@
-//! Incremental log-envelope proofs for a live engine's exclusive storage owner.
+//! Reuse log-envelope validation results within one live storage owner.
 //!
-//! Recovery and public low-level storage validation must still read full log
-//! prefixes. Only this owner may trust bytes it has already validated;
-//! modifying or replacing those bytes outside the owner invalidates the proof.
+//! Recovery and public low-level validation still read complete log prefixes.
+//! Only the exclusive owner may reuse its earlier validation. External changes
+//! to those bytes invalidate the proof.
 
 use std::fs::File;
 use std::io::Read;
@@ -21,9 +21,10 @@ use super::metadata::SEGMENT_HEADER_LENGTH;
 
 const MAX_PENDING_ANCHORS: u64 = 4096;
 
-/// Extend a live-owner proof with canonical records checked before its own WAL
-/// append and flushed as one complete group. No file or generation was
-/// replaced.
+/// Extend a live-owner proof after publishing a complete WAL group.
+///
+/// The owner must have checked the canonical records before append and flushed
+/// the complete group without replacing a file or generation.
 pub(super) fn committed(
     proof: &LogValidation,
     previous: &Manifest,
@@ -54,10 +55,9 @@ impl LogValidation {
     /// Seed a live-owner proof after full recovery or full publication
     /// validation.
     ///
-    /// The caller must already have validated the manifest's logs and
-    /// checkpoint, including any previous publication's anchors. This only
-    /// checks metadata; it cannot establish that the directory contains the
-    /// claimed bytes.
+    /// First validate the manifest's logs, checkpoint, and previous publication
+    /// anchors. This method checks metadata only; it cannot prove that the
+    /// directory contains the claimed bytes.
     pub(super) fn at_checkpoint(manifest: &Manifest) -> Option<Self> {
         if manifest.checkpoint_sequence != manifest.durable_sequence
             || metadata::validate_manifest(manifest).is_err()
@@ -77,9 +77,9 @@ impl LogValidation {
 /// `proof`. `next` must have its final, incremented generation. Store-level
 /// transition and checkpoint validation remain the caller's responsibility.
 ///
-/// `Ok(None)` is not validation success: the caller must run full log and
-/// anchor validation. After that it may seed a fresh proof only when C == D. A
-/// returned proof must replace the old proof only after publication succeeds.
+/// On `Ok(None)`, run full log and anchor validation. Then a fresh proof may be
+/// created only when checkpoint C equals durable frontier D. Replace the old
+/// proof with a returned proof only after publication succeeds.
 pub(super) fn validate_extension(
     directory: &Path,
     previous: &Manifest,

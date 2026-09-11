@@ -1,4 +1,5 @@
-//! Pinned physical directory images and explicit local-identity attachment.
+//! Copy pinned database images and attach them with new local cursor
+//! identities.
 
 use std::fs;
 use std::fs::File;
@@ -28,7 +29,9 @@ pub(crate) struct Image {
     _lease: Arc<store::DirectoryLease>,
 }
 
-/// Called on the sequencer, never by a worker independently reading CURRENT.
+/// Capture backup metadata on the sequencer so it agrees with live state.
+///
+/// A worker must not capture it by independently reading CURRENT.
 pub(crate) fn capture(store: &Store) -> Result<Image> {
     store::writable(store)?;
     let manifest = store.manifest().clone();
@@ -69,8 +72,10 @@ pub(crate) fn capture(store: &Store) -> Result<Image> {
     })
 }
 
-/// Consumes the pin on a blocking worker. A dropped reply cannot cancel I/O or
-/// release the source lease. Failed output remains an incomplete directory.
+/// Copy the pinned image on a blocking worker that owns the pin.
+///
+/// Dropping the reply does not cancel I/O or release the source lease. Failure
+/// may leave an incomplete destination directory.
 pub(crate) fn copy(
     image: Image,
     destination: &Path,
@@ -129,8 +134,10 @@ pub(crate) fn copy(
     Ok(image.manifest)
 }
 
-/// The caller selects a new random namespace outside the VM. Marker removal is
-/// last: an interrupted attach is either complete or still requires attachment.
+/// Publish attachment using a random namespace selected outside the VM.
+///
+/// Remove the marker last so an interrupted attach is either complete or still
+/// requires explicit attachment.
 pub(crate) fn attach(
     path: &Path,
     namespace: [u8; 16],

@@ -1,4 +1,6 @@
-//! Revocable public views. No public handle owns an unregistered storage lease.
+//! Read fixed-sequence public views that can be explicitly revoked.
+//!
+//! Every public view holds a registered retention claim.
 
 use std::ops::Bound;
 use std::sync::Arc;
@@ -51,9 +53,10 @@ impl TableRead<'_> {
     }
 }
 
-/// Clones share one revocable claim at the original sequence. Reads perform
-/// synchronous local I/O. Dropping the last clone releases this ephemeral
-/// claim.
+/// A fixed-sequence view whose clones share one revocable retention claim.
+///
+/// Reads perform synchronous local I/O. Dropping the last clone releases the
+/// claim, which is not persisted across restart.
 #[derive(Clone)]
 pub struct Snapshot {
     claim: Arc<Claim>,
@@ -90,9 +93,10 @@ impl std::fmt::Debug for Snapshot {
     }
 }
 
-/// Weak registrations for phase-5 retention. All allocation and floor selection
-/// occurs on the writer. A read guard protects both its view and retention
-/// claim.
+/// Weak snapshot registrations used to select retention floors.
+///
+/// The writer allocates registrations and selects floors. A read guard protects
+/// both the physical view and its retention claim.
 #[derive(Default)]
 pub(crate) struct Registry {
     claims: Vec<Weak<Claim>>,
@@ -158,9 +162,10 @@ pub async fn snapshot(database: &Database) -> Result<Snapshot> {
     result.await.map_err(|_| Error::Closed)?
 }
 
-/// Revoke all clones and iterators of this snapshot. Waits for in-flight reads,
-/// not for idle handles. Returns true only when this call released the view.
-/// Durable tail cursors are independent and remain registered.
+/// Revoke every clone and iterator of this snapshot.
+///
+/// Wait for active reads, but not idle handles. Return true only if this call
+/// released the view. Durable tail cursors remain registered independently.
 pub fn revoke(snapshot: &Snapshot) -> bool {
     revoke_claim(&snapshot.claim)
 }
@@ -224,9 +229,10 @@ fn key_bytes(
     .map_err(Error::Storage)
 }
 
-/// Read a typed key and return a typed value under the actual schema at the
-/// captured sequence. This is not a current-table or caller-declared schema
-/// read.
+/// Look up a typed key using the table schema at the snapshot's sequence.
+///
+/// Return a typed value if the key exists. The captured catalogue, rather than
+/// the current table or a caller-supplied schema, determines interpretation.
 pub fn get(
     snapshot: &Snapshot,
     table: u64,
@@ -274,9 +280,11 @@ pub fn catalogue(snapshot: &Snapshot) -> Result<Vec<CatalogueVersion>> {
     Ok(result)
 }
 
-/// An ordered typed scan. It holds no extra permanent storage view. Every call
-/// checks revocation, even after ordinary exhaustion, and returns
-/// `Some(Err(SnapshotRevoked))` if revoked. It is deliberately not fused.
+/// An ordered typed iterator that checks revocation on every call.
+///
+/// It holds no additional permanent storage view. After revocation, it returns
+/// `Some(Err(SnapshotRevoked))`, even if it previously returned `None`. It is
+/// therefore not a fused iterator.
 pub struct SnapshotScan {
     snapshot: Snapshot,
     table: Arc<ReadTable>,
@@ -285,9 +293,11 @@ pub struct SnapshotScan {
     done: bool,
 }
 
-/// Scan using typed inclusive/exclusive endpoints; `Unbounded` selects a table
-/// edge. Endpoints must match the table's captured key schema. Equal endpoints
-/// select one key only if both are inclusive. Reversed endpoints are rejected.
+/// Scan keys between typed endpoints at the snapshot's sequence.
+///
+/// Endpoints may be inclusive, exclusive, or `Unbounded` at a table edge. They
+/// must match the captured key schema. Equal endpoints select a key only when
+/// both are inclusive. Reversed endpoints are rejected.
 pub fn scan(
     snapshot: &Snapshot,
     table: u64,

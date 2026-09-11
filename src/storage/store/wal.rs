@@ -1,4 +1,4 @@
-//! WAL publication and recovery under the directory owner's exclusive lease.
+//! Publish and recover WAL groups while holding the exclusive directory lease.
 
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -140,9 +140,11 @@ fn append_group<'a>(
     Ok(digest)
 }
 
-/// Discover only linked WAL segments beyond the selected publication.
-/// Complete malformed groups are corruption; only physically short terminal
-/// headers/bodies/trailers are discarded. Never search forward after damage.
+/// Discover linked WAL segments after the selected publication's log bounds.
+///
+/// Reject complete malformed groups as corruption. Discard only physically
+/// short terminal headers, bodies, or trailers. Do not search past damaged data
+/// for a later valid group.
 pub(super) fn recover_tail(
     directory: &Path,
     selected: &Manifest,

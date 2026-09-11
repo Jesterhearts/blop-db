@@ -1,10 +1,13 @@
-//! A persisted resolved-feed mirror with a deterministic value-hash index.
+//! Build and resume a SQLite mirror from the source database's resolved feed.
 //!
-//! Run with SOURCE_DIRECTORY INDEX_SQLITE. Initial creation requires retained
-//! history from zero; this example refuses a partial baseline rather than
-//! pretending an empty mirror is a snapshot rebuild. Keep the SQLite file and
-//! its journals together. Its committed H.2 watermark, not the source cursor,
-//! decides restart progress. This example uses one consumer process per index.
+//! Run `cargo run --example derived_sqlite -- SOURCE_DIRECTORY INDEX_SQLITE`.
+//! Initial creation requires source history from sequence zero. The example
+//! rejects missing baseline history and does not rebuild from a snapshot.
+//!
+//! Keep the SQLite file and its journals together, and use one consumer process
+//! per index. On restart, resume from SQLite's committed source watermark in
+//! design format H.2. The source cursor may lag behind that committed progress.
+//! The mirror also maintains a deterministic index of encoded-value hashes.
 
 use std::path::Path;
 

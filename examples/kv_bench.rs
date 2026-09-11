@@ -1,4 +1,8 @@
-//! KV comparison with independent clients. See BENCHMARKS.md for the contract.
+//! Compare one-key writes and cached reads across blop-db, redb, and SQLite.
+//!
+//! Run `cargo run --release --example kv_bench -- --help` for options. Read
+//! BENCHMARKS.md before comparing results; it defines workloads, timing, and
+//! the different guarantees of durable and buffered runs.
 
 #[cfg(any(unix, windows))]
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

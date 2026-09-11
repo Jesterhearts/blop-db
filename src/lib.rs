@@ -43,8 +43,9 @@ pub mod __private {
 
 /// Compile a transaction program and bind its runtime inputs.
 ///
-/// Returns a [`Result<Transaction, BuildError>`]. This constructs a
-/// transaction; it does not execute the program.
+/// Return a [`Result<Transaction, BuildError>`]. On success, submit the bound
+/// transaction with [`database::execute`] to run it. Constructing it does not
+/// execute the program.
 ///
 /// ```
 /// let transaction = blop_db::tx! { -> i64 { return 42; } }?;

@@ -1,5 +1,7 @@
-//! Version-1 segment readers and self-committing WAL group framing.
-//! Canonical records and their digests are independent of local group layout.
+//! Read version 1 segments and frame complete WAL commit groups.
+//!
+//! Group layout is local; it does not change canonical records or their
+//! digests.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -138,9 +140,11 @@ struct Group {
     hash: Sha256,
 }
 
-/// Reads only the specified physical prefix. A returned record's containing
-/// group must already be known durable by the caller; full-prefix validation
-/// consumes the iterator completely before publishing or replaying that prefix.
+/// Read records only within the specified physical prefix.
+///
+/// Before execution, the caller must establish durability for each record's
+/// group. Full-prefix validation consumes the entire iterator before publishing
+/// or replaying the prefix.
 pub(crate) struct Records<R> {
     reader: BufReader<Take<R>>,
     remaining: u64,

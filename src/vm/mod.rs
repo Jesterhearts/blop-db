@@ -1,17 +1,20 @@
-//! Single-threaded ISA 1 reference execution over the storage layer.
+//! Validate and execute ISA 1 programs with a single-threaded reference VM.
 //!
-//! The pipeline is bytes -> validated typed instructions -> private overlay ->
-//! outcome -> atomic storage batch. The database scheduler can run prepared
-//! interpreters concurrently; the executing reference APIs remain serial.
+//! Input bytes become validated typed instructions, private writes, an outcome,
+//! and an atomic storage batch. The database scheduler may interpret prepared
+//! programs concurrently; the reference installation APIs run serially.
 //!
-//! This is an engine-facing reference implementation, not a durable submission
-//! API. Callers must protect history and either use an isolated reference store
-//! or establish log durability before execution. These functions do not append
-//! logs, publish checkpoints, advance public visibility, or perform recovery.
-//! Recovery must restore checkpoint roots before replaying every later record.
-//! `prepare_transaction` additionally derives or validates C.4 access
-//! manifests. Complete logged transaction bodies belong to the database record
-//! layer.
+//! # Caller requirements
+//!
+//! Use an isolated reference store, or establish log durability before
+//! execution and protect the required history. These engine-facing functions do
+//! not append logs, publish checkpoints, advance public visibility, or run
+//! recovery. Use [`crate::database`] for durable application submissions.
+//!
+//! Recovery must restore checkpoint roots and replay every later durable
+//! record. [`prepare_transaction`] derives or validates access manifests under
+//! design section C.4. The database record layer supplies complete logged
+//! bodies.
 
 mod access;
 mod access_analysis;
@@ -129,8 +132,10 @@ pub struct Abort {
     pub detail: u64,
 }
 
-/// Final logical effects. A deletion is an MVCC tombstone, not physical
-/// removal.
+/// A final logical change produced by a successful record.
+///
+/// A deletion installs a sequence-tagged tombstone rather than removing
+/// history.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect {
     Put {
@@ -191,8 +196,9 @@ pub fn interpret(
     runtime::run(view, prior, &program, claims)
 }
 
-/// A typed program and its verified scheduling declarations. Fields are private
-/// so callers cannot replace instructions or claims after validation.
+/// A validated typed program with verified access declarations.
+///
+/// Private fields prevent changes to instructions or claims after validation.
 #[derive(Debug)]
 pub struct PreparedTransaction {
     prior: u64,
@@ -224,10 +230,11 @@ impl PreparedTransaction {
     }
 }
 
-/// Validate bytecode, historical schemas/policy and C.4 access coverage without
-/// reading rows or installing outcomes. With no supplied manifest, use the
-/// derived normalized scopes. With one, retain its exact declarations and
-/// charge its actual normalized count, even if a narrower set could be derived.
+/// Prepare a transaction by checking bytecode, historical metadata, and scopes.
+///
+/// This reads no rows and installs no outcomes. Without a supplied manifest,
+/// derive normalized C.4 scopes. With one, retain its exact declarations and
+/// charge their normalized entry count, even if narrower scopes are possible.
 ///
 /// The view must protect the catalogue and policy strictly below `sequence`.
 /// Reprepare if an administrative barrier changes them before sequencing.
@@ -345,14 +352,16 @@ fn prepare_program(
     Ok((prior, program))
 }
 
-/// Interpret one transaction and atomically install its final versions and
-/// canonical outcome. Aborts install only an outcome.
+/// Interpret a transaction and install its final versions and outcome
+/// atomically.
 ///
-/// Records must be supplied in consecutive order after the checkpoint. The
-/// digest must identify the complete canonical log record, including framing
-/// and CRC. In an isolated reference store it may instead be a fixture
-/// identity. This call is not a durability receipt and does not write or verify
-/// that log.
+/// An abort installs only its outcome.
+///
+/// Supply records consecutively after the checkpoint. The digest must identify
+/// the complete canonical log record, including framing and checksum. An
+/// isolated reference store may use a fixture identity instead. This function
+/// neither writes nor verifies that log and does not provide a durability
+/// receipt.
 pub fn execute(
     store: &mut Store,
     sequence: u64,
@@ -370,8 +379,8 @@ pub fn execute(
     )
 }
 
-/// The byte-oriented form of [`execute`], for saved programs and reference
-/// replay without reconstructing a Rust macro invocation.
+/// Execute saved program and argument bytes using the same rules as
+/// [`execute`].
 ///
 /// Input validation errors remain `Error::Invalid`. A log reader must classify
 /// invalid authoritative records as corruption, verify their enclosing record

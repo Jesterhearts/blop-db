@@ -1,5 +1,7 @@
-//! H.1 transport -> isolated reference comparison -> durable bytes -> live
-//! replay.
+//! Verify logical feed batches before making them durable on a replica.
+//!
+//! Decode H.1 bytes, compare isolated reference execution, publish the verified
+//! bytes, then replay them into live state.
 
 use std::fs::File;
 
@@ -27,9 +29,11 @@ use super::record;
 use crate::storage;
 use crate::vm;
 
-/// Read exact canonical log bytes and resolved outcomes through the captured F.
-/// Kinds 2 and 3 both protect this transport. Reading never acknowledges a
-/// cursor. Limits include framing; no record or outcome is split.
+/// Read canonical log bytes and outcomes through the captured visible frontier.
+///
+/// Use a logical-feed or log-replica cursor, kinds 2 and 3. Reading does not
+/// acknowledge that cursor. Batch limits include framing and preserve complete
+/// records and outcomes.
 pub async fn read_logical_feed(
     database: &Database,
     token: &CursorToken,
@@ -156,8 +160,11 @@ struct ParsedRecord {
     outcome: Vec<u8>,
 }
 
-/// No public fields or mutation after parse: publication cannot re-encode a
-/// command, replace an outcome, or change the bytes validated by the importer.
+/// Parsed import data whose bytes and outcomes cannot be replaced by
+/// publication.
+///
+/// Private immutable fields preserve the exact data that the importer
+/// validated.
 pub(super) struct ParsedBatch {
     start: u64,
     watermark: Watermark,
@@ -207,9 +214,11 @@ fn parse(encoded: &[u8]) -> Result<ParsedBatch> {
     })
 }
 
-/// Import only into an attached read-only replica. The entire bounded batch is
-/// parsed before enqueueing, and every outcome is independently reproduced in
-/// a disposable prefix copy before any incoming bytes are published locally.
+/// Import a logical batch into an attached read-only replica.
+///
+/// Parse the complete bounded batch before enqueueing. Before publishing any
+/// incoming bytes locally, reproduce every outcome in a disposable copy of the
+/// replica's selected prefix and compare it with the supplied outcome.
 ///
 /// One import may be parsing, queued or running per database. It reserves the
 /// aggregate record count and bytes from the shared submission budgets until

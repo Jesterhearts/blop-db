@@ -54,7 +54,7 @@ impl Drop for DirectoryLease {
     }
 }
 
-/// The exclusive directory owner and its latest installed physical roots.
+/// Exclusive directory ownership and the latest installed physical roots.
 ///
 /// Mutating functions require exclusive access. Views and scans can be read
 /// concurrently.
@@ -79,8 +79,11 @@ impl Store {
         &self.selected
     }
 
-    /// Latest durable log bounds with the selected checkpoint and retention
-    /// metadata. Under WAL publication, D can exceed the on-disk manifest's D.
+    /// Return live durable log bounds and selected checkpoint and retention
+    /// metadata.
+    ///
+    /// The live durable frontier can exceed the frontier in the on-disk
+    /// manifest.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
@@ -98,8 +101,9 @@ impl Store {
     }
 }
 
-/// An immutable, pinned physical root set. It may contain versions above the
-/// public frontier.
+/// Immutable physical roots pinned against reclamation.
+///
+/// The roots may contain versions above the public visible frontier.
 #[derive(Clone)]
 pub struct View {
     pub(super) reader: PageReader,
@@ -108,11 +112,10 @@ pub struct View {
     pub(super) validation: checkpoint::Proofs,
 }
 
-/// One physical edit. `None` removes an entry, rather than installing an MVCC
-/// tombstone.
+/// One physical edit; `None` removes the entry and its version from the tree.
 ///
-/// The engine must validate system values, schemas and complete outcomes before
-/// installation. For an MVCC deletion, put an encoded
+/// Validate system values, schemas, and complete outcomes before installation.
+/// To record a transaction deletion without removing history, put an encoded
 /// [`StateValue::Delete`](super::mvcc::StateValue::Delete) at its versioned
 /// key.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,7 +125,7 @@ pub struct Mutation {
     pub value: Option<Vec<u8>>,
 }
 
-/// A lazy ordered physical scan which also pins exclusive directory ownership.
+/// A lazy ordered physical scan that retains the directory lease.
 pub struct Scan {
     inner: tree::Scan,
     _lease: Arc<DirectoryLease>,
@@ -138,12 +141,11 @@ impl Iterator for Scan {
 
 impl std::iter::FusedIterator for Scan {}
 
-/// Create a new directory, without initializing over any existing directory or
-/// crash output.
+/// Create storage in a new directory.
 ///
-/// Both identities must be nonzero and selected uniquely by the caller outside
-/// transaction code. On failure, an incomplete directory may remain and must
-/// not be opened as an empty database.
+/// Select unique nonzero identities outside transaction code. The destination
+/// must not exist. Failure may leave an incomplete directory; do not open it as
+/// an empty database or initialize over it.
 pub fn create(
     path: impl AsRef<Path>,
     genesis: Genesis,
@@ -217,15 +219,16 @@ pub fn create(
     Ok(store)
 }
 
-/// Restore exactly the CURRENT-selected checkpoint and validate its reachable
-/// physical storage.
+/// Restore the CURRENT-selected checkpoint and validate reachable physical
+/// storage.
 ///
-/// Discovers and flushes complete, linked WAL groups beyond the selected log
-/// bounds before returning the recovered durable frontier.
-/// Physically short terminal appends are trimmed after validation; complete
-/// malformed groups are errors. This does not replay `(checkpoint_sequence,
-/// durable_sequence]`; the engine must do that before serving public reads or
-/// resuming transaction execution.
+/// Discover and flush complete linked WAL groups beyond the selected log
+/// bounds. Trim physically short terminal appends after validation, but reject
+/// complete malformed groups.
+///
+/// The returned durable frontier may exceed the checkpoint. This function does
+/// not replay those later records. The engine must replay them before serving
+/// public reads or resuming transactions.
 pub fn open(path: impl AsRef<Path>) -> Result<Store> {
     open_directory(path.as_ref(), false)
 }
@@ -355,12 +358,12 @@ pub fn scan(
     })
 }
 
-/// Install an entire physical batch against the latest roots, or leave those
-/// roots unchanged.
+/// Install a complete physical batch against the latest roots.
 ///
-/// This is not a database write transaction and does not publish durability or
-/// visibility. The caller includes all final versions and their complete
-/// outcome in the same batch.
+/// On failure, leave the roots unchanged. Include all final transaction
+/// versions and their complete outcome in the same batch. This operation does
+/// not publish durability or visibility and is not an application write
+/// transaction.
 pub fn apply(
     store: &mut Store,
     changes: &[Mutation],
@@ -406,9 +409,9 @@ pub fn apply(
 /// Build a separate checkpoint root set, excluding all logical entries above
 /// `sequence`.
 ///
-/// Live roots are not changed. Older history is retained conservatively,
-/// without GC. The caller must establish that the selected sequence is a
-/// contiguous resolved prefix.
+/// Preserve live roots and all older history. The caller must establish that
+/// every record through the selected sequence is resolved. This operation does
+/// not collect history.
 pub fn prepare_checkpoint(
     store: &mut Store,
     sequence: u64,
@@ -472,22 +475,23 @@ pub fn prepare_checkpoint(
     })
 }
 
-/// Durably publish a complete checkpoint root set and engine-supplied metadata.
+/// Publish a complete checkpoint and engine-supplied metadata durably.
 ///
 /// Start `manifest` from the latest [`Store::manifest`], then update only
 /// frontiers, log descriptors and next cursor/segment IDs. Page identity,
 /// roots, page count and the next generation are managed here. Stale manifests
 /// and views from another owner are rejected.
 ///
-/// This validates physical storage, system framing, log envelopes and monotonic
-/// metadata. It cannot prove that the engine executed a log prefix correctly or
-/// protected every active retention claim. Log bodies, schemas, outcomes and
-/// catalogue semantics remain engine inputs. No logical log is written here:
-/// supplied segment prefixes must already exist in the directory.
-/// The live database owner can reuse bounded proofs of immutable prefixes;
-/// ordinary low-level owners and full recovery validate from files instead.
-/// Any publication I/O failure requires dropping handles and reopening, not
-/// retrying blindly.
+/// Check physical storage, system framing, log envelopes, and nondecreasing
+/// metadata. The engine remains responsible for log bodies, schemas, outcomes,
+/// catalogue semantics, correct execution, and active retention claims.
+/// Supplied log segment prefixes must already exist; this function does not
+/// write them.
+///
+/// A live database owner may reuse bounded validation results for immutable
+/// prefixes. Low-level owners and full recovery validate the files instead.
+/// After a publication I/O failure, drop handles and reopen before further
+/// work.
 pub fn publish(
     store: &mut Store,
     checkpoint: &View,
@@ -841,8 +845,11 @@ fn publication_step(_store: &mut Store) -> Result<()> {
     Ok(())
 }
 
-/// The caller has drained installations and validated logical correspondence.
-/// Ordinary publication deliberately cannot change file identity or live roots.
+/// Adopt new storage after the caller drains installations and validates
+/// history.
+///
+/// Ordinary publication cannot change file identity or live roots; handover
+/// requires this separate path.
 pub(super) fn adopt(
     store: &mut Store,
     checkpoint: View,

@@ -1,4 +1,7 @@
-//! Forward abstract interpretation for C.4. No rows or application callbacks.
+//! Derive C.4 access scopes by propagating known values through forward
+//! branches.
+//!
+//! Analysis does not read rows or call application code.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -87,9 +90,11 @@ fn evaluate<'a>(
     Some(Rc::new(Cow::Owned(value)))
 }
 
-/// Input has already passed type, reachability and definite-initialization
-/// verification. Derivation does not charge resource 7: a supplied broader
-/// manifest may normalize to fewer entries than this independently derived set.
+/// Derive scopes from a program already checked for types and control flow.
+///
+/// Reachability and register initialization must also be verified first.
+/// Derivation does not charge resource 7 because a broader supplied manifest
+/// may need fewer normalized entries.
 pub(super) fn derive(program: &Program) -> Result<AccessManifest> {
     let schemas = program
         .tables

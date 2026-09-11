@@ -1,13 +1,43 @@
-# KV Benchmarks
+# Key-value benchmarks
 
-`examples/kv_bench.rs` compares blop with redb and SQLite used as a key-value store. The durable
-comparison exercises independent transactions through the public async API and cached reads through
-public snapshots. A separate, single-client buffered mode measures the reference VM. This is a
-small, reproducible workload comparison, not a general database ranking. The optimized results below
-include engine scaling changes; the comparison libraries remain development dependencies. The latest
-write optimisation results are in [Version-1 WAL Publication](#version-1-wal-publication).
+Use `examples/kv_bench.rs` to compare blop-db, redb, and SQLite on independent one-key writes and
+cached reads. This report explains how to run the workload and interpret its results. It is for
+developers evaluating performance changes, not for selecting a database from a general ranking.
 
-## Run
+The latest recorded change, version 1 write-ahead log (WAL) publication, increased blop-db's median
+single-client insert rate from 184.0 to 807.2 operations/s on the test workstation. Cached-read
+rates were approximately unchanged. See the [WAL results](#version-1-wal-publication) for
+conditions, individual trials, and limits on this comparison.
+
+The durable workload uses the public asynchronous write API and public snapshots. A separate
+buffered mode measures the single-threaded reference virtual machine (VM). redb and SQLite are
+development dependencies used for comparison.
+
+## Find a measurement
+
+- [Run the benchmark](#run-the-benchmark) and [read its output](#read-the-output).
+- [Understand the workload](#measurement-contract), [durable mode](#durable-mode), and
+  [buffered mode](#buffered-mode).
+- [Version 1 WAL publication](#version-1-wal-publication): latest write results.
+- [Single-client follow-up](#single-client-follow-up): reduced point-read copying.
+- [Point reads and worker dispatch](#point-reads-and-worker-dispatch-2026-09-09).
+- [Deferred checkpoints](#deferred-checkpoints-2026-09-08).
+- [Initial optimization results](#optimized-results-2026-09-08).
+- [Baseline and environment](#baseline-results-2026-09-08).
+- [Earlier single-client results](#historical-results-2026-09-07) and [checks](#checks).
+
+Each result section describes the implementation measured at that time. Earlier flush counts and
+performance limits are historical. Do not apply them to the current WAL implementation.
+
+## Run the benchmark
+
+Run commands from the repository root with a Rust toolchain and Cargo. First choose an existing
+parent directory on the filesystem you want to measure. The operating system's temporary directory
+may be a RAM filesystem and therefore measure different storage behaviour.
+
+The harness creates unique temporary databases and removes them on success. It does not overwrite
+existing databases. Forced termination may leave a `blop-kv-bench-*` directory. Allow several
+minutes and sufficient disk space for durable trials.
 
 ```sh
 cargo build --release --example kv_bench
@@ -15,10 +45,12 @@ target/release/examples/kv_bench --help
 target/release/examples/kv_bench --dir /path/to/existing/directory --mode durable --clients 4 --workers 4
 ```
 
-Defaults are 1,000 keys, 100,000 reads, three measured trials, one client and both modes.
-`--workers` defaults to `EngineOptions::default().workers`. `--clients` and `--workers` accept 1
-through 256; keys and reads must each be at least the client count. Multiple clients require
-`--mode durable`: the isolated buffered blop store has no parallel scheduler.
+The default run uses 1,000 keys, 100,000 reads, three measured trials, one client, and both modes.
+`--workers` uses `EngineOptions::default().workers` unless specified.
+
+Both `--clients` and `--workers` accept 1 through 256. Key and read counts must each be at least the
+client count. For multiple clients, select `--mode durable`; the buffered reference store has no
+parallel scheduler.
 
 On Linux, give every configuration the same CPU set, including single-client controls. Do not pin a
 parallel scaling test to one logical CPU. For example, after checking the machine's CPU topology:
@@ -27,27 +59,42 @@ parallel scaling test to one logical CPU. For example, after checking the machin
 taskset -c 0-3 target/release/examples/kv_bench --dir /path/to/existing/directory --mode durable --clients 4 --workers 4
 ```
 
-Allow several minutes for durable trials. Choose a directory on the filesystem you want to measure:
-an OS temporary directory can be a RAM filesystem. The harness creates unique temporary
-subdirectories and removes them on successful completion. It does not overwrite existing databases.
-Forced termination can leave a `blop-kv-bench-*` directory.
+Run configurations one at a time, separately from builds and tests. Use the same CPU set,
+filesystem, toolchain, profile, and options for both revisions in a comparison. If you redirect
+output to `benchmarks/`, create that directory first with `mkdir -p benchmarks`.
 
-Output is CSV with comment lines beginning with `#`. Each row measures the whole operation phase.
-`ops_per_second` is aggregate completed operations divided by elapsed wall time; `amortized_us` is
-its inverse in microseconds, **not mean request latency or a latency percentile**. The timer runs
-from release of the client start barrier through the last completed client loop. Thread creation,
-joining and connection/runtime destruction are outside timing. Barrier release overhead is included.
+## Read the output
 
-The `clients` column records concurrency. `blop_workers` records the configured interpreter count
-for durable blop and is zero, meaning not applicable, for the other paths. For cross-engine durable
-read analysis, compare blop's `get_snapshot` rows with redb and SQLite `get` rows. The names
-distinguish the public snapshot path from the buffered `get_vm` and `get_mvcc` diagnostics.
+Output uses comma-separated values (CSV), with comment lines beginning with `#`. Each data row
+measures one complete operation phase.
 
-Use the median of the three trial rates for a ballpark figure. Increase counts for more stable
-measurements, but note that blop retains historical versions, pages, outcomes, logs and manifests.
-Larger durable trials can take substantially longer and use substantial disk space.
+| Column           | Meaning                                                                              |
+| ---------------- | ------------------------------------------------------------------------------------ |
+| `ops_per_second` | Total completed operations divided by elapsed wall time.                             |
+| `amortized_us`   | The inverse aggregate throughput, expressed in microseconds per operation.           |
+| `clients`        | Number of concurrent clients, each with one outstanding operation.                   |
+| `blop_workers`   | Interpreter count for durable blop-db; zero means not applicable to the other paths. |
 
-## Measurement Contract
+**`amortized_us` is not mean request latency or a latency percentile.** Timing starts when the
+client start barrier is released and ends when the last client loop completes. It includes
+barrier-release overhead, but excludes thread creation, joining, and destruction of connections and
+runtimes.
+
+For durable read comparisons, use blop-db's `get_snapshot` rows and redb's and SQLite's `get` rows.
+The buffered `get_vm` and `get_mvcc` rows measure different, lower-level paths. Multi-version
+concurrency control (MVCC) means retaining sequence-tagged values; the
+[README glossary](README.md#terms-used-in-this-guide) defines this and other engine terms.
+
+Use the median of the three trial rates for an initial estimate, and inspect their range. Larger
+counts can improve stability, but blop-db retains versions, pages, outcomes, logs, and manifests.
+Larger durable trials can take much longer and use much more disk space.
+
+## Measurement contract
+
+The tables below are comparable only under these workload and timing conditions. In result tables,
+"blop" means blop-db and "SQLite KV" means SQLite used as a key-value store.
+
+### Writes and client ordering
 
 - Each client has one outstanding operation. Every write is an independently committed, one-key
   transaction against one shared database. There is no client-side batching or sharding into
@@ -55,19 +102,22 @@ Larger durable trials can take substantially longer and use substantial disk spa
 - Keys are 8-byte unsigned integers. Values are 128 bytes and contain the key plus a phase marker.
   redb and SQLite store big-endian key bytes; blop uses its typed `u64` schema and canonical storage
   encoding. blop values include their normal schema framing on disk.
-- Each fresh database receives all keys in a deterministic shuffled order, followed by one overwrite
-  of every key in a different shuffled order. Each client takes every Nth element of that phase's
-  order, where N is the client count. Every key is written exactly once per phase, including when
-  the count is not divisible by N. Phase boundaries wait for every client. Global interleaving is
-  nondeterministic; per-client input order and values are identical across engines and trials.
-- All writes use unconditional upsert semantics. Keys are disjoint within each phase, so the blop
-  scheduler can treat the transactions as independent. This is not a conflicting read-modify-write,
-  hot-key, CPU-heavy transaction or mixed read/write workload.
+- Insert every key into a fresh database in a reproducible shuffled order. Then overwrite every key
+  in a different shuffled order. With N clients, each client takes every Nth element of that phase's
+  order. Each key is written once per phase, even when the key count is not divisible by N. Wait for
+  all clients before the next phase. Global interleaving may differ, but each client's input order
+  and values are identical across engines and trials.
+- All writes insert or replace a value unconditionally. Keys are disjoint within each phase, so the
+  blop scheduler can treat the transactions as independent. This is not a conflicting
+  read-modify-write, hot-key, CPU-heavy transaction or mixed read/write workload.
 - Durable blop clients each run a current-thread Tokio executor on a native client thread and await
   every receipt, checking for semantic aborts. The database has a separate coordinator and the
   selected persistent worker count. Other `EngineOptions` and transaction `Limits` retain their
   defaults: in particular, the execution window, assigned backlog and checkpoint interval are 64.
   More clients can encounter ordinary admission backpressure rather than increase active execution.
+
+### Read paths and timing
+
 - Cached reads sample existing keys uniformly with replacement after updates and verification. All
   read paths produce owned values, including copying redb's borrowed value. Durable blop uses
   `database::get` on one shared pinned snapshot; redb uses a shared pinned read transaction/table.
@@ -84,6 +134,9 @@ Larger durable trials can take substantially longer and use substantial disk spa
   the harness and persisted data, not power-loss behaviour. SQLite closes its client connections
   between phases; close-time WAL checkpoints are outside timing, while automatic checkpoints during
   writes remain inside timing.
+
+### Warm-up and memory settings
+
 - A separate trial with `max(64, clients)` keys and `max(128, clients)` reads warms each engine and
   mode and is discarded. Engine order rotates between measured trials. Full-value verification
   before reads warms the working set, including each SQLite connection. No OS cache eviction is
@@ -99,7 +152,7 @@ Larger durable trials can take substantially longer and use substantial disk spa
   revalidating retained history on ordinary live publications. Recovery, handover and unsupported
   transitions retain full validation. These settings do not establish equal total memory use.
 
-### Durable Mode
+### Durable mode
 
 | Engine | Commit Setting                                                                                                                          | Cached Read Path                                         |
 | ------ | --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
@@ -107,14 +160,16 @@ Larger durable trials can take substantially longer and use substantial disk spa
 | redb   | One write transaction per key, `Durability::Immediate`.                                                                                 | One pinned read transaction.                             |
 | SQLite | WAL, `synchronous=FULL`, one autocommit UPSERT per key; automatic WAL checkpointing remains enabled.                                    | One read transaction and prepared SELECT per connection. |
 
-Durable commits have comparable intent but different work. blop also retains transaction programs,
-outcomes and historical versions. Local transaction log groups contain up to 64 already queued
-requests, within existing budgets, with no artificial wait to fill a group. Checkpoints now run
-after 64 newly visible records, rather than every visible-prefix advance. The original baseline had
-no log group commit. The engines do not have identical storage or retention policies, and no
-maintenance is requested here.
+All durable paths wait for a durable commit, but they perform different work. blop-db also retains
+programs, outcomes, and historical versions. Current local log groups hold up to 64 already queued
+requests within the configured budgets, without waiting to fill a group. Checkpoints run after 64
+newly visible records.
 
-### Buffered Mode
+Earlier result sections identify their checkpoint and grouping behaviour; the original baseline did
+not group log commits. The engines have different storage and retention policies. This workload does
+not request maintenance.
+
+### Buffered mode
 
 | Engine | Write Path                                                                                                                | Cached Read Path                                                                          |
 | ------ | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
@@ -122,19 +177,21 @@ maintenance is requested here.
 | redb   | One write transaction per key, `Durability::None`.                                                                        | One pinned read transaction.                                                              |
 | SQLite | WAL, `synchronous=OFF`, one autocommit UPSERT per key.                                                                    | One read transaction, prepared SELECT.                                                    |
 
-**Buffered blop is not a recoverable database mode.** It has weaker guarantees than disabling sync
-in a complete engine. These figures isolate execution/storage cost and must not be presented as
-durable or parallel-engine throughput. Unsynchronized writes can still perform file I/O and
-encounter OS writeback. The VM and MVCC read diagnostics are not measurements of the public snapshot
-API; the MVCC diagnostic returns encoded bytes, verified against the expected encoding.
+**Buffered blop is not recoverable.** It omits more work than merely disabling synchronization in a
+complete engine. Use its figures only to study reference execution and storage costs, not durable or
+parallel-engine throughput.
 
-## Version-1 WAL Publication
+Unsynchronized writes can still perform file I/O and trigger operating-system writeback. Neither the
+VM nor the MVCC diagnostic measures public snapshot reads. The MVCC path returns encoded bytes,
+which the harness checks against the expected encoding.
 
-This compares optimisation commit `243b001` with the version-1 WAL publication protocol. The
-baseline already includes all point-read and dispatch improvements documented below. Both revisions
-use the unchanged harness, standard release profile, CPU set 0 through 3, filesystem and comparison
-libraries. Each fresh database has 1,000 inserts, 1,000 updates and five million cached reads, with
-three measured trials and discarded warm-up. Builds, tests and measured workloads ran separately.
+## Version-1 WAL publication
+
+This compares baseline `243b001` with WAL publication commit `87afb51`. The baseline already
+includes all point-read and dispatch improvements documented below. Both revisions use the unchanged
+harness, standard release profile, CPU set 0 through 3, filesystem and comparison libraries. Each
+fresh database has 1,000 inserts, 1,000 updates and five million cached reads, with three measured
+trials and discarded warm-up. Builds, tests and measured workloads ran separately.
 
 The storage format uses version-1 headers and self-committing WAL groups. An ordinary append to an
 existing log segment requests **one file flush instead of five file/directory flushes**. New segment
@@ -143,13 +200,17 @@ creation adds a directory flush. Checkpoints retain the existing publication ord
 durable logging. The final partial checkpoint remains in close, outside timing. Group framing adds
 168 bytes per group, without changing canonical transaction or outcome bytes.
 
-Run these commands on `243b001`, then rebuild and repeat on the WAL sources:
+Run these commands on `243b001`, then rebuild and repeat on `87afb51`. The commands use the existing
+`/tmp/opencode` parent directory from the recorded environment; substitute your measurement
+directory when reproducing them elsewhere.
 
 ```sh
 cargo build --release --example kv_bench
 taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 5000000 --repeats 3 --mode durable --clients 1 --workers 1
 taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 5000000 --repeats 3 --mode durable --clients 16 --workers 4
 ```
+
+### Median and individual trials
 
 Median blop operations/s, with read rates rounded:
 
@@ -171,9 +232,11 @@ Per-trial write rates, in trial order:
 | 16 / 4            | Insert    | 1046.3, 1072.4, 1070.8 | 3114.6, 3000.7, 3063.3 |
 | 16 / 4            | Update    | 930.6, 1017.1, 1020.0  | 2928.9, 2680.6, 2789.1 |
 
-Cached reads were effectively flat. Single-client reads ranged from 4.706 to 4.765 million/s before
-and 4.636 to 4.744 million/s after; 16-client reads ranged from 7.846 to 8.030 million/s before and
-7.721 to 8.016 million/s after. These results are workstation throughput measurements for
+### Interpretation and verification
+
+Cached-read throughput changed little. Single-client reads ranged from 4.706 to 4.765 million/s
+before and 4.636 to 4.744 million/s after; 16-client reads ranged from 7.846 to 8.030 million/s
+before and 7.721 to 8.016 million/s after. These results are workstation throughput measurements for
 independent one-key transactions, not latency percentiles or a general database ranking.
 
 Every measured trial completed full-value and checkpoint verification after reopen. Separate tests
@@ -191,14 +254,14 @@ larger-dataset speedup comparison:
 taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 10000 --reads 5000000 --repeats 1 --mode durable --clients 16 --workers 4
 ```
 
-## Single-Client Follow-Up
+## Single-client follow-up
 
-This compares the point-read/worker-dispatch implementation documented below with a further
-single-client read optimisation. The baseline **already includes** those uncommitted changes; it is
-not revision `9676f05`. A separate baseline binary was built before this follow-up, so both binaries
-could run against fresh databases with the same harness and options.
+This historical comparison measured an additional single-client read optimization after the
+point-read and worker-dispatch changes below. Those changes were not yet committed when the baseline
+binary was saved. Both stages were later included in `243b001`; the saved baseline is not `9676f05`.
+The two binaries used fresh databases with the same harness and options.
 
-Changes in `src/database/snapshot.rs` and `src/storage/mvcc.rs`:
+The follow-up changed `src/database/snapshot.rs` and `src/storage/mvcc.rs` as follows:
 
 - Cache the decoded key schema alongside the last resolved historical table.
 - Borrow cached table metadata during a point read instead of cloning its `Arc` on each hit.
@@ -231,9 +294,9 @@ Median blop operations/s, with read rates rounded:
 | Update       |     155.1 |     173.4 |
 | Snapshot get | 3,374,776 | 4,499,538 |
 
-The read improvement is **1.33x**, or approximately 296 to 222 ns per completed read. These are
-inverse aggregate throughput figures, including the harness loop, not request-latency percentiles.
-Per-trial rates in trial order preserve the variation:
+Read throughput increased **1.33x**. Its inverse changed from about 296 to 222 ns per completed
+read, including the harness loop. These are not request-latency percentiles. The individual trial
+rates show the variation:
 
 | Operation       | Before                          | After                           |
 | --------------- | ------------------------------- | ------------------------------- |
@@ -241,14 +304,14 @@ Per-trial rates in trial order preserve the variation:
 | Updates/s       | 180.0, 155.1, 111.1             | 173.4, 177.5, 164.8             |
 | Snapshot gets/s | 3,643,162, 3,008,995, 3,374,776 | 4,543,521, 4,499,538, 4,371,044 |
 
-Write variability remains substantial, particularly in the baseline's last trial. No single-client
+Write rates varied substantially, particularly in the baseline's last trial. No single-client
 durable write speedup is attributed to this change. An instrumented investigation of the five
 ordinary log-publication sync calls found roughly 1.0 to 1.3 ms per log/metadata file or database
 directory flush on this filesystem. The instrumentation included warm-up and lifecycle operations
 and was separate from the reported measurements. Early staging, data-only file sync and paired
 private-metadata flush experiments did not establish a useful, repeatable improvement; none of those
-experiments is included in the production changes. Larger write gains require investigating a
-publication protocol with fewer serial durability steps.
+experiments is included in the production changes. At that stage, fewer sequential durability steps
+were the next write-optimization target. The later WAL results above measure that change.
 
 A separate one-trial, four-client/one-worker check with the same key/read counts reached 7,096,978
 snapshot gets/s before and 7,685,552 after, about 1.08x. Inserts were 316.0/s before and 303.9/s
@@ -261,13 +324,14 @@ page-tail truncation without pinning directory ownership. The complete workspace
 Clippy check and nightly formatting check passed. Cold data, mixed reads/writes and large-value
 performance remain outside these measurements.
 
-## Point Reads and Worker Dispatch: 2026-09-09
+## Point reads and worker dispatch: 2026-09-09
 
-This follow-up compares `9676f05` with direct MVCC point seeks, in-place key framing and earlier
-dispatch of already durable work. The harness, release profile, CPU set 0 through 3, filesystem,
-comparison libraries and default engine settings are unchanged. The main runs use 1,000 inserts,
-1,000 updates and **five million cached reads** per fresh database, with three measured trials and
-discarded warm-up. Builds, tests and measured workloads ran separately.
+This historical comparison starts from `9676f05`. The changed build adds direct MVCC point seeks,
+in-place key framing, and earlier dispatch of already durable work. The harness, release profile,
+CPU set 0 through 3, filesystem, comparison libraries and default engine settings are unchanged. The
+main runs use 1,000 inserts, 1,000 updates and **five million cached reads** per fresh database,
+with three measured trials and discarded warm-up. Builds, tests and measured workloads ran
+separately.
 
 A separate `perf record` run of the baseline, with four clients and four workers, identified point
 read costs in tree scan construction/destruction, key escaping, allocation, shared-node lookup and
@@ -275,7 +339,7 @@ snapshot/table locking. That profile includes all three engines and setup/recove
 blop-only percentage breakdown. Source inspection also found the coordinator registering a prepared
 submission before dispatching existing durable work to idle workers.
 
-The changes are:
+### Changes measured
 
 - `src/storage/tree.rs`: a point seek retains just the selected leaf and the nearest right-subtree
   reference. It avoids the range iterator, ancestor allocation and copied scan bounds/keys.
@@ -289,10 +353,12 @@ The changes are:
   leaving available workers idle. Dependencies, execution windows, admission budgets and observed
   worker-failure priority still apply.
 
-There are no new cache budgets, dependencies, public APIs or file-format changes. Receipts still
-require durable logging and contiguous visibility; checkpoint and file/directory flush rules remain
-the same. Point reads still check pinned page prefixes, tree identity, child levels, state framing,
-historical table schemas and revocation.
+This change preserved cache budgets, dependencies, public APIs, and file formats. Receipts still
+required durable logging and contiguous visibility. Checkpoint and file-flush rules stayed the same.
+Point reads continued to check pinned page prefixes, tree identity, child levels, state framing,
+historical table schemas, and revocation.
+
+### Reproduction and results
 
 Run each configuration on the baseline and changed sources:
 
@@ -331,6 +397,8 @@ Per-trial blop rates in trial order, with reads expressed in millions/s:
 | 16 / 4            | Update    | 879.9, 814.7, 912.4  | 841.3, 895.2, 834.6  |
 | 16 / 4            | Get       | 5.150, 5.146, 5.245  | 7.018, 7.508, 7.178  |
 
+### Interpret variation
+
 The four-client/one-worker write gain and cached-read gains repeat across these trials. The
 16-client write results overlap the baseline range and do not establish a throughput improvement.
 Read scaling still encounters shared snapshot/table locks and the decoded-node cache; these changes
@@ -349,10 +417,11 @@ changed/baseline:
 |         3 | Changed  |     177.6 |     176.6 |       3,367,589 |
 |         4 | Baseline |     168.2 |     169.4 |       2,000,878 |
 
-Those checks do not reproduce a consistent single-client write regression or gain. All original
-trials are retained above; workstation I/O variation limits attribution. One outstanding request
-cannot benefit from dispatch/publication overlap with other requests, and its five ordinary log
-publication sync calls remain. No single-client write speedup is claimed.
+The alternating checks did not show a consistent single-client write gain or regression. The tables
+retain all original trials. Variation in workstation I/O prevents a clear attribution. With only one
+outstanding request, dispatch cannot overlap another request's publication. This version also still
+required five ordinary log-publication synchronization calls. These results do not establish a
+single-client write improvement.
 
 A separate, one-trial comparison with 10,000 keys and five million reads used 16 clients and four
 workers. It completed full-value reopen checks in both revisions:
@@ -375,26 +444,25 @@ unrelated invalid values, wrong tree identities, out-of-prefix roots and incorre
 also covered. The complete workspace tests, nightly formatting check and all-target Clippy check
 passed, including the existing scheduler, crash/replay, revocation and publication-fault tests.
 
-## Deferred Checkpoints: 2026-09-08
+## Deferred checkpoints: 2026-09-08
 
-This follow-up compares production revision `838a303` with the deferred-checkpoint changes. It uses
-the same, unchanged harness, release profile, CPU set 0 through 3 and filesystem as the earlier
-runs. Each configuration has 1,000 independent inserts, 1,000 independent updates and 100,000 cached
-reads per fresh database, with three measured trials and discarded warm-up. Configurations and
-builds/tests ran separately, not concurrently with measured workloads.
+This historical comparison starts from `838a303` and measures the deferred-checkpoint changes in
+`9676f05`. It uses the same, unchanged harness, release profile, CPU set 0 through 3 and filesystem
+as the earlier runs. Each configuration has 1,000 independent inserts, 1,000 independent updates and
+100,000 cached reads per fresh database, with three measured trials and discarded warm-up.
+Configurations and builds/tests ran separately, not concurrently with measured workloads.
 
-The default checkpoint interval is now 64 visible records. Every receipt still follows durable
-canonical logging, complete installation and contiguous visibility, but no longer promises that
-materialized pages have been checkpointed. Set `EngineOptions::checkpoint_interval` to 1 for the
-former checkpoint-before-receipt behaviour. The on-disk format, durability-before-execution rule and
-manifest/CURRENT ordering are unchanged.
+This change set the default checkpoint interval to 64 visible records. Receipts still required
+durable logging, complete installation, and contiguous visibility. Materialized pages could be
+checkpointed later. Interval 1 preserved checkpoint-before-receipt behaviour. The change preserved
+the on-disk format, durability-before-execution rule, and manifest/CURRENT ordering.
 
 The benchmark still verifies full values and the final checkpoint after close/reopen. Periodic
 checkpoints are inside the write timers. As before, close is outside timing; it now publishes the
 remaining partial interval. The measurements are durable receipt throughput, not throughput for
 checkpointing every transaction, and not request-latency percentiles.
 
-Run each command on `838a303`, then rebuild and run on the changed sources:
+Run each command on `838a303`, then rebuild and run on `9676f05`:
 
 ```sh
 cargo build --release --example kv_bench
@@ -428,12 +496,14 @@ clients, the after-run comparison-engine medians were 1,231.2 inserts/s and 1,26
 redb, and 626.4 inserts/s and 626.2 updates/s for SQLite. The result narrows the gap to redb on this
 workload; it is not a general database ranking.
 
-An ordinary single-client transaction on an existing log now requests five file/directory sync calls
-for its log publication, instead of ten across log and checkpoint publications. A periodic
-checkpoint adds another five calls. Runtime log-only publication keeps the selected roots' existing
-page count, so reconstructible appended pages do not trigger a page flush. These are call counts,
-not necessarily device-flush counts. New files and administrative operations add work. Removing the
-completion publication also lets concurrent clients proceed without that coordinator I/O pause.
+In this version, an ordinary single-client transaction on an existing log requested five file or
+directory synchronization calls. The previous version requested ten across log and checkpoint
+publication. A periodic checkpoint added five calls. Log-only publication kept the selected roots'
+page count, so later reconstructible pages did not trigger a page flush.
+
+These counts describe calls, not necessarily physical device flushes. New files and administrative
+operations added work. Removing per-completion publication also allowed clients to proceed without
+that coordinator I/O pause.
 
 The trade-off is more replay work after interruption and a more conservative log-retention floor
 until C advances. The interval bounds record count, not bytes, execution time or elapsed checkpoint
@@ -448,12 +518,13 @@ comparison:
 taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 10000 --reads 1000000 --repeats 1 --mode durable --clients 16 --workers 4
 ```
 
-## Optimized Results: 2026-09-08
+## Optimized results: 2026-09-08
 
-The benchmark baseline was committed as `5807d73` before engine changes. The following runs use that
-unchanged harness with live caching, incremental validation, bounded checkpoint filtering,
-opportunistic group commit, completion coalescing and omission of already-satisfied data flushes.
-The on-disk format, durability receipt semantics and retained-history policy are unchanged.
+The benchmark baseline was committed as `5807d73` before the engine changes in `838a303`. These runs
+used the same harness with live caches, reusable validation results, bounded checkpoint filtering,
+grouped commits, and grouped completion handling. The engine also omitted data flushes already
+satisfied by a previous publication. The change preserved file formats, receipt semantics, and
+retained-history policy.
 
 The CPU set, filesystem, release profile and library versions are the same as the baseline
 environment below. Configurations ran sequentially in the listed order, without concurrent builds or
@@ -469,7 +540,7 @@ taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 
 taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 10000 --reads 1000000 --repeats 3 --mode durable --clients 16 --workers 4 > benchmarks/2026-09-08-optimized-10k-c16-w4.csv
 ```
 
-### Durable Writes
+### Durable writes
 
 Median transactions per second over three fresh databases, with 1,000 transactions per phase:
 
@@ -503,7 +574,7 @@ Observed blop trial ranges:
 |       4 |       1 |   86.3 to 90.2 |   85.7 to 90.9 |
 |      16 |       4 | 310.8 to 315.4 | 315.2 to 328.3 |
 
-### Cached Snapshot Reads
+### Cached snapshot reads
 
 Median aggregate gets/s, rounded, with 100,000 operations per trial:
 
@@ -523,7 +594,7 @@ The four-client blop trials ranged from 4.12 to 4.82 million gets/s; 16-client t
 redb. The comparison engines' read rates also changed between baseline and rerun, so the gains are
 not an isolated attribution to individual optimizations. The larger read run below lasts longer.
 
-### Larger History
+### Larger history
 
 At 10,000 keys, with 10,000 inserts, 10,000 updates and one million cached reads per trial, using 16
 clients and four blop workers:
@@ -539,32 +610,43 @@ the number of keys and writes tenfold took about ten times as long for inserts a
 updates, rather than multiplying per-transaction validation cost by retained history. This supports
 the intended improvement over this tested size range; it is not an asymptotic proof.
 
-### Remaining Costs
+### Costs remaining in this version
 
-blop still trails redb on this workload. At 16 clients and 1,000 keys, durable writes are about 3.8
-times slower and cached reads about 4.3 times slower. SQLite durable writes remain faster, while
-blop cached reads are faster in this configuration.
+This version still trailed redb on the measured workload. At 16 clients and 1,000 keys, redb's
+durable write rate was about 3.8 times blop's rate, and its cached-read rate was about 4.3 times
+blop's rate. SQLite's durable writes were faster than blop's, while its cached reads were slower in
+this configuration.
 
-The synchronous manifest/CURRENT protocol remains substantial: the ordinary single-client path on an
-existing log requests ten file/directory synchronization calls across its two publications, instead
-of fourteen. New files require additional directory synchronization. These counts describe calls,
-not necessarily physical device flushes. Grouping amortizes publication but does not remove its
-ordering requirements or the single coordinator. COW page writing, retained outcomes/history, VM
-preparation, cache locking and typed value handling also remain.
+Publication still required substantial sequential work in this version. An ordinary single-client
+transaction on an existing log requested ten file or directory synchronization calls across two
+publications, down from fourteen. New files required extra directory synchronization. These are call
+counts, not necessarily physical device flushes.
+
+Grouping shared publication cost across transactions but retained its ordering requirements and
+single coordinator. Copy-on-write (COW) pages, retained history and outcomes, VM preparation, cache
+locking, and typed values also added work.
 
 Caches and proofs are bounded. Exceeding the edit or digest cache bounds can reinstate full scans,
 and many retained segments still require descriptor processing. Full recovery and maintenance can
 still scale with retained history. Cold reads, larger-than-cache data, large transactions, tail
 latency and per-optimization CPU/I/O attribution remain unmeasured.
 
-## Baseline Results: 2026-09-08
+## Baseline results: 2026-09-08
 
-Environment: AMD Ryzen AI 9 HX 370, all configurations restricted to logical CPUs 0 through 3, which
-are four distinct high-frequency physical cores on this machine. Linux 7.2.3-arch1-2, ext4 on
-`/dev/nvme0n1p3`, NVMe model `MTFDKBA1T0QFM-1BD1AABGB`. Rust 1.98.0, standard Cargo release profile,
-no added target-CPU flags. blop production sources at `4040dce4fd776e5423e1ca0f24982056a8a5297e`,
-with the concurrent harness in this change; redb 4.2.0; rusqlite 0.40.2 with bundled SQLite 3.53.2.
-This was a local workstation run, not an isolated performance lab.
+### Recorded environment
+
+| Component               | Setting                                                                                         |
+| ----------------------- | ----------------------------------------------------------------------------------------------- |
+| Processor               | AMD Ryzen AI 9 HX 370.                                                                          |
+| CPU affinity            | Logical CPUs 0 through 3, four distinct high-frequency physical cores on this machine.          |
+| Operating system        | Linux 7.2.3-arch1-2.                                                                            |
+| Filesystem              | ext4 on `/dev/nvme0n1p3`.                                                                       |
+| NVMe drive              | `MTFDKBA1T0QFM-1BD1AABGB`.                                                                      |
+| Rust build              | Rust 1.98.0; standard Cargo release profile; no added target-CPU flags.                         |
+| blop production sources | `4040dce4fd776e5423e1ca0f24982056a8a5297e`, with the concurrent harness committed in `5807d73`. |
+| Comparison libraries    | redb 4.2.0; rusqlite 0.40.2 with bundled SQLite 3.53.2.                                         |
+
+The runs used a local workstation rather than an isolated performance lab.
 
 These commands completed in the listed order, including verification and cleanup. Do not run them in
 parallel with one another or with builds/tests when reproducing measurements. On a fresh checkout,
@@ -578,7 +660,7 @@ taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 
 taskset -c 0-3 target/release/examples/kv_bench --dir /tmp/opencode --keys 1000 --reads 100000 --repeats 3 --mode durable --clients 16 --workers 4 > benchmarks/2026-09-08-durable-c16-w4.csv
 ```
 
-### Durable Writes
+### Durable writes
 
 Median transactions per second over three fresh-database trials, with 1,000 transactions per phase.
 Worker count applies only to blop; redb and SQLite were rerun in the one-worker control for
@@ -614,7 +696,7 @@ The single-client blop medians correspond to about 15.1 ms per insert and 19.7 m
 apply those numbers to concurrent request latency. The update phase has accumulated more history and
 is not a steady-state update-only workload.
 
-### Cached Snapshot Reads
+### Cached snapshot reads
 
 Median aggregate gets per second, rounded, using 100,000 reads per trial after durable writes,
 reopen and full-value verification:
@@ -643,11 +725,11 @@ Per-trial CSV output is kept locally rather than checked in. Files matching `ben
 ignored by Git; the summary results above are retained in the repository. Only durable mode was
 remeasured for this update. The historical buffered figures below describe older production sources.
 
-## What To Investigate
+### Historical profiling targets
 
-The flat write result is consistent with substantial serialized publication work, not evidence that
-independent transaction execution is incorrect or never overlaps. Source inspection identifies these
-profiling targets in the measured production revision:
+The baseline's flat write rate was consistent with substantial sequential publication work. It did
+not show whether independent execution overlapped. Source inspection identified these profiling
+targets in the measured revision:
 
 - `src/database/scheduler.rs`, `register`, calls `src/database/engine.rs`, `append`, which publishes
   each log record before dispatch. The coordinator serializes this work even when worker execution
@@ -666,14 +748,14 @@ profiling targets in the measured production revision:
   validates the page even for OS-cached data. Public snapshot reads also resolve historical
   catalogue information and decode typed values.
 
-These are source-level observations, not profiler attribution. Profile them before estimating a
-speedup or changing validation/durability guarantees. No engine optimizations were made for this
-run. Deletes, scans, mixed workloads, conflicting transactions, CPU-heavy independent programs,
-multi-key transactions, large values, cold reads, large datasets, reclamation and tail latency
-remain unmeasured. This small KV test cannot establish the worker pool's scaling on compute-heavy
-programs.
+These were source-level observations, not measured cost percentages. The baseline run included no
+engine optimizations. The later result sections describe the changes subsequently measured.
 
-## Historical Results: 2026-09-07
+This workload does not measure deletes, scans, mixed reads and writes, conflicts, compute-heavy
+programs, multi-key transactions, large values, cold reads, large datasets, reclamation, or tail
+latency. It cannot establish worker-pool scaling for compute-heavy programs.
+
+## Historical results: 2026-09-07
 
 The earlier single-client harness used production revision
 `02fcd43c4f341a83898dfb9bec9fb23afa51c506`, with the same machine, toolchain and comparison-library
@@ -706,10 +788,10 @@ maximum trial rates in brackets:
 
 ## Checks
 
-The example's tests run under `cargo test --workspace` through its `test = true` manifest entry.
-They check deterministic workload generation, option rejection, uneven client partitioning, error
-propagation, value preservation across serial and concurrent engines, public snapshot sequences,
-persisted blop checkpoints and successful temporary-directory cleanup. Project checks passed:
+Run the commands below to check the harness. Its `test = true` manifest entry includes example tests
+in `cargo test --workspace`. They check reproducible workload generation, invalid options, uneven
+client partitions, error propagation, values across serial and concurrent engines, public snapshot
+sequences, persisted checkpoints, and temporary-directory cleanup.
 
 Engine regression tests also cover grouped durability before dispatch, checkpoint coalescing,
 admission limits and barriers, interrupted group replay, cache bounds and pinned-prefix rejection,
@@ -722,4 +804,8 @@ warmed.
 cargo test --workspace
 cargo +nightly fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+mdformat --wrap 100 --check BENCHMARKS.md
 ```
+
+These checks passed for the recorded implementations. They validate the harness and selected engine
+behaviours; rerun measurements to assess performance on a different system or revision.

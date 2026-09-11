@@ -1,5 +1,6 @@
-//! Count and byte admission permits, held until rejection or durable
-//! assignment.
+//! Reserve count and byte capacity before accepting a submission.
+//!
+//! Permits remain held until rejection or durable assignment.
 
 use std::sync::Arc;
 
@@ -11,11 +12,13 @@ use super::Result;
 use super::record::Command;
 use crate::vm;
 
-/// Process settings, not persisted semantic policy. Reservations are
-/// conservative accounting units, not an RSS or disk-space limit. Retained
-/// visible history, storage page traversal and OS/allocator overhead are
-/// separate. Preparation has its own reservation and can coexist with assigned
-/// execution reservations.
+/// Local admission and scheduling settings, separate from stored semantic
+/// policy.
+///
+/// Reservations bound accounted capacity, not total resident memory or disk
+/// space. They exclude retained visible history, page traversal, and operating
+/// system and allocator overhead. Preparation has a separate reservation and
+/// can run while assigned transactions hold execution reservations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineOptions {
     pub workers: usize,
@@ -28,9 +31,10 @@ pub struct EngineOptions {
     pub submission_queue_bytes: usize,
     pub assigned_backlog_count: usize,
     pub assigned_backlog_bytes: u64,
-    /// Full lifetime reservations, retained through visible receipts.
+    /// Capacity reserved for assigned transactions until their visible
+    /// receipts.
     pub execution_bytes: u64,
-    /// Bounds decoding, access analysis and the retained prepared queue head.
+    /// Capacity for decoding, access analysis, and the prepared queue head.
     pub preparation_bytes: u64,
 }
 

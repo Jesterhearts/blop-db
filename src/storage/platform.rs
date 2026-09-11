@@ -1,10 +1,9 @@
-//! Filesystem operations whose platform semantics matter to storage
-//! correctness.
+//! Provide the platform-specific file operations required for durable storage.
 //!
-//! Offset I/O must not be mixed with cursor-based I/O on the same handle:
-//! Windows offset operations also change the cursor. Handles must be
-//! synchronous and opened without append. Publication callers serialize
-//! namespace changes and supply paths in one directory.
+//! Do not mix offset and cursor-based I/O on one handle: Windows offset I/O
+//! also changes the cursor. Open synchronous handles without append mode.
+//! Publication callers must serialize filename changes and use paths in the
+//! same directory.
 
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -19,8 +18,9 @@ use std::os::windows::fs::FileExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 
-/// Complete an offset read, retrying interruptions and reporting short files
-/// explicitly.
+/// Read the requested bytes at an offset, retrying interrupted operations.
+///
+/// Return an error if the file is too short.
 pub(super) fn read_exact_at(
     file: &File,
     mut bytes: &mut [u8],
@@ -145,11 +145,11 @@ pub(super) fn sync_directory(directory: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// Replace a name without a delete-first gap or cross-volume copy fallback.
+/// Replace a filename atomically without first deleting the destination.
 ///
-/// The caller flushes the source first and the directory afterwards. Windows
-/// write-through is additional protection, not a substitute for the directory
-/// flush or crash testing.
+/// Flush the source file before replacement and the directory afterwards.
+/// Cross-volume copying is not a fallback. Windows write-through adds
+/// protection but does not replace directory flushing or crash tests.
 pub(super) fn rename(
     source: &Path,
     destination: &Path,
@@ -211,8 +211,9 @@ fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
     Ok(encoded)
 }
 
-/// Scoped errors on real I/O, not a simulation of power loss or write
-/// reordering.
+/// Inject scoped errors into real I/O operations.
+///
+/// This does not simulate power loss or write reordering.
 #[cfg(test)]
 pub(crate) mod faults {
     use std::cell::RefCell;

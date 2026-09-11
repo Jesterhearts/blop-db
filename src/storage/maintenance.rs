@@ -1,5 +1,6 @@
-//! Private candidate construction and whole-file reclamation. Logical history
-//! validation belongs to the database coordinator before `install`.
+//! Build candidate storage and reclaim obsolete whole files.
+//!
+//! The coordinator must validate logical history before calling `install`.
 
 use std::fs;
 use std::fs::OpenOptions;
@@ -29,8 +30,10 @@ pub(crate) struct Candidate {
     source_roots: [u64; 5],
 }
 
-/// Descending physical versions make the first version at/below G the baseline.
-/// F bounds G, never the versions selected for preservation.
+/// Keep the first version at or below retention floor G as the baseline.
+///
+/// Versions are ordered newest first. The visible frontier F bounds G; it must
+/// not exclude above-frontier versions from preservation.
 fn keep_state(
     key: &StateKey,
     floor: u64,
@@ -49,8 +52,10 @@ fn keep_state(
     true
 }
 
-/// Build pruned roots without replacing live roots. This also works with holes
-/// and installed versions above F; those versions must all survive.
+/// Build roots with eligible history removed while preserving live roots.
+///
+/// Preserve every installed version above visible frontier F, including when
+/// earlier records remain unresolved.
 pub(crate) fn collect_view(
     store: &mut Store,
     floor: u64,
@@ -159,8 +164,10 @@ pub(crate) fn prepare(
     })
 }
 
-/// Copy each reachable node once, rather than inserting entries through COW.
-/// Only a traversal stack and one decoded overflow value are resident at once.
+/// Copy reachable nodes directly, once per node, into compacted storage.
+///
+/// This avoids reinserting entries through copy-on-write operations. Traversal
+/// retains a stack and at most one decoded overflow value at a time.
 fn copy_tree(
     reader: &PageReader,
     pages: &mut PageFile,
@@ -230,8 +237,10 @@ pub struct Reclaimed {
     pub deferred_bytes: u64,
 }
 
-/// One shared directory lease conservatively pins ALL obsolete files. Only the
-/// coordinator calls this, after durable selection, with no private candidates.
+/// Delete obsolete files only after all shared directory leases are released.
+///
+/// Any lease pins every obsolete file. Only the coordinator calls this
+/// function, after durable selection and with no private candidates remaining.
 pub(crate) fn reclaim(store: &Store) -> Result<Reclaimed> {
     store::writable(store)?;
     let pinned = Arc::strong_count(&store.lease) != 1;

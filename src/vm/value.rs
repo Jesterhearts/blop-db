@@ -1,4 +1,4 @@
-//! ISA 1 type descriptors and schema-encoded values.
+//! Describe ISA 1 types and validate their schema-encoded values.
 
 use super::Error;
 use super::Result;
@@ -23,7 +23,9 @@ pub enum Type {
     },
 }
 
-/// Compare values only after validating that they have the same non-Rows shape.
+/// Compare values with the same validated non-Rows shape.
+///
+/// The caller must check both shapes before comparison.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Value {
     Unit,
@@ -88,8 +90,7 @@ impl Type {
         }
     }
 
-    /// Check actual values, including row order, against a validated
-    /// descriptor.
+    /// Check a value and its row ordering against a validated type descriptor.
     pub fn accepts(
         &self,
         value: &Value,
@@ -125,7 +126,7 @@ impl Type {
         }
     }
 
-    /// Maximum encoded size for a type validated by `Type::decode`.
+    /// Return the maximum encoded size of a type validated by `Type::decode`.
     pub fn max_value_bytes(&self) -> usize {
         match self {
             Self::Unit => 0,
@@ -339,7 +340,7 @@ fn min_value_bytes(ty: &Type) -> usize {
     }
 }
 
-/// Decode exactly one value under a type validated by `Type::decode`.
+/// Decode one complete value using a type already validated by `Type::decode`.
 pub(crate) fn decode_value(
     ty: &Type,
     bytes: &[u8],

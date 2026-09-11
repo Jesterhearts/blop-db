@@ -1,5 +1,6 @@
-//! Resolved feed reads from exact sequence-tagged versions, never latest
-//! values.
+//! Read resolved feed effects from their exact sequence-tagged versions.
+//!
+//! A lookup of the latest value cannot substitute for a historical effect.
 
 use super::BatchLimits;
 use super::CursorToken;
@@ -25,10 +26,12 @@ use crate::vm::{
     self,
 };
 
-/// Read complete resolved records after a source watermark, without advancing
-/// the cursor. `after` must be within its protected interval and no later than
-/// F. A zero record limit returns an empty poll. If the first complete record
-/// does not fit, returns `BatchTooSmall`, not false end-of-stream.
+/// Read complete resolved records after a watermark without advancing the
+/// cursor.
+///
+/// `after` must lie within the protected interval and at or below the visible
+/// frontier. A zero record limit returns an empty poll. If the first complete
+/// record cannot fit, return `BatchTooSmall` so the caller can raise its limit.
 pub async fn read_feed(
     database: &Database,
     token: &CursorToken,

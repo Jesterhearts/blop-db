@@ -1,4 +1,4 @@
-//! Operational allocation estimates. These never change logged VM budgets.
+//! Estimate memory reservations without changing logged VM resource limits.
 
 use super::AccessManifest;
 use super::Type;
@@ -6,9 +6,10 @@ use super::program::Instruction;
 use super::program::Program;
 use crate::storage::LimitPolicy;
 
-/// Bound decoding and definite-initialization scratch before decoding starts.
-/// Table descriptors live in storage rather than the submitted program, so
-/// reserve their format maxima. Invalid/truncated headers still go to the VM.
+/// Estimate decoding and register-analysis scratch space before decoding.
+///
+/// Table descriptors come from storage, so reserve their maximum format sizes.
+/// Leave invalid or truncated header rejection to the VM validator.
 pub(super) fn decoding(transaction: &crate::Transaction) -> u64 {
     let bytes = transaction.program_bytes();
     let base = (bytes.len() as u64 + transaction.argument_bytes().len() as u64)

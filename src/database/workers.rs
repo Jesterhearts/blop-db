@@ -1,4 +1,6 @@
-//! Persistent interpreters. Only the coordinator owns mutable storage.
+//! Interpret prepared transactions on persistent worker threads.
+//!
+//! Only the coordinator may mutate storage.
 
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;

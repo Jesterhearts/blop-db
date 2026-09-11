@@ -1,5 +1,6 @@
-//! Serial, crash-safe G.4 retention metadata. These operations never enter the
-//! log.
+//! Publish durable cursor registrations using design section G.4.
+//!
+//! Cursor operations run serially and do not consume log sequences.
 
 use std::fs::File;
 use std::ops::Bound;
@@ -32,8 +33,9 @@ pub struct CursorInfo {
     pub label: String,
 }
 
-/// Conservative current retention claims, not a promise that older history
-/// exists.
+/// Current history and log retention floors derived from active claims.
+///
+/// History below these conservative floors is not guaranteed to exist.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetentionFloors {
     pub history: u64,
@@ -107,9 +109,11 @@ pub(super) async fn request(
     })?
 }
 
-/// Durably reserve a baseline and its subsequent feed. Cancellation after
-/// enqueue may leave a registration; list diagnostics to find abandoned claims.
-/// Labels may repeat. Dropping the returned token does not release history.
+/// Register a durable claim for a baseline and the feed after it.
+///
+/// Cancellation after enqueueing may leave a registration. Use `list_cursors`
+/// to find abandoned claims. Labels need not be unique. Dropping the token does
+/// not release the claim.
 pub async fn checkout_cursor(
     database: &Database,
     baseline: Watermark,
@@ -131,9 +135,11 @@ pub async fn checkout_cursor(
     }
 }
 
-/// Atomically capture F and durably reserve a cursor at F. Revoking the
-/// snapshot does not release the cursor. A revoked build must not be published
-/// as complete.
+/// Capture a snapshot and register its tail cursor at the same visible
+/// sequence.
+///
+/// Revoking the snapshot does not release the cursor. If revocation interrupts
+/// a derived-data build, discard or restart that build before publishing it.
 pub async fn snapshot_and_cursor(
     database: &Database,
     kind: CursorKind,
@@ -153,8 +159,9 @@ pub async fn snapshot_and_cursor(
     }
 }
 
-/// Validate both identities, issuance, presence and kind against durable
-/// metadata.
+/// Check that the saved token still identifies a registered cursor.
+///
+/// Validate its database identity, namespace, issued ID, and cursor kind.
 pub async fn reopen_cursor(
     database: &Database,
     token: &CursorToken,
@@ -165,10 +172,12 @@ pub async fn reopen_cursor(
     }
 }
 
-/// Administratively select an existing numeric registration after validating
-/// the consumer's saved watermark. Labels and old tokens are never selectors.
-/// The watermark must belong to this database and lie in [baseline, F]. Rebind
-/// does not advance or release the copied claim.
+/// Issue a new token for a copied registration selected by numeric ID.
+///
+/// First validate the consumer's saved watermark. It must identify this
+/// database and lie between the cursor baseline and visible frontier,
+/// inclusive. Labels and old tokens cannot select registrations. Rebinding
+/// neither advances nor releases the claim.
 pub async fn rebind_cursor(
     database: &Database,
     id: u64,
@@ -180,8 +189,10 @@ pub async fn rebind_cursor(
     }
 }
 
-/// Advance only after committing derived data and this watermark atomically.
-/// Equal acknowledgement is successful; backwards or future positions fail.
+/// Advance a cursor after committing derived data and its watermark atomically.
+///
+/// Repeating the current acknowledgement succeeds. A position below the current
+/// baseline or above the visible frontier fails.
 pub async fn acknowledge_cursor(
     database: &Database,
     token: &CursorToken,
@@ -198,7 +209,9 @@ pub async fn acknowledge_cursor(
     .map(|_| ())
 }
 
-/// Explicit consumer or administrative release by token, never by label.
+/// Release the registration identified by a token.
+///
+/// Labels cannot select a registration for release.
 /// Repeated release of an absent, previously issued ID succeeds. Reopening or
 /// acknowledging that released ID reports `CursorReleased`.
 pub async fn release_cursor(
@@ -467,8 +480,11 @@ fn log_available(
     Ok(())
 }
 
-/// Floors for later reclamation. Logical/replica baselines pin log from N + 1;
-/// checkpoint recovery independently requires log from C + 1. Does not collect.
+/// Calculate floors for later reclamation without collecting history.
+///
+/// Logical and replica cursors at N protect log records from N + 1. Checkpoint
+/// recovery independently requires records from C + 1, where C is the
+/// checkpoint.
 pub(crate) fn retention_floors(
     store: &Store,
     registry: &mut snapshot::Registry,

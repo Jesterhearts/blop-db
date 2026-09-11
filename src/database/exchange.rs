@@ -1,4 +1,7 @@
-//! Canonical H.1/H.2 exchange framing, independent of transport and VM replay.
+//! Encode and decode feed batches, cursor tokens, and consumer watermarks.
+//!
+//! Design sections H.1 and H.2 define these bytes. Transport and VM replay are
+//! separate responsibilities.
 
 use sha2::Digest;
 use sha2::Sha256;
@@ -32,9 +35,11 @@ impl CursorKind {
     }
 }
 
-/// An identity reference, not an authorization secret or proof of registration.
-/// Dropping it does not release the durable claim. Decode then use
-/// `reopen_cursor` to check the current registration.
+/// A portable reference to a local cursor registration.
+///
+/// After decoding, call `reopen_cursor` to check that the registration exists.
+/// A token is not an authorization secret. Dropping it does not release
+/// history.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CursorToken {
     pub(super) database_id: [u8; 16],
@@ -102,8 +107,10 @@ impl CursorToken {
     }
 }
 
-/// Store this payload in the same atomic durable commit as derived data, then
-/// acknowledge it. Sequence zero denotes the empty database state.
+/// A database identity and sequence identifying processed source state.
+///
+/// Commit this payload atomically with derived data before acknowledging it to
+/// the source cursor. Sequence zero identifies the initial database state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Watermark {
     database_id: [u8; 16],
@@ -199,10 +206,11 @@ pub enum FeedRecords {
     Logical(Vec<LogicalRecord>),
 }
 
-/// Complete, consecutive source records. Public construction is checked by
-/// `encode`; `decode` validates framing, CRCs, counts, sequences and hash
-/// chains. Logical bodies still require historical VM validation before any
-/// import.
+/// A batch of complete, consecutive source records.
+///
+/// `encode` checks publicly constructed values. `decode` checks framing,
+/// checksums, counts, sequences, and hash chains. Before import, logical record
+/// bodies also need VM validation under their historical catalogue and policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeedBatch {
     pub database_id: [u8; 16],

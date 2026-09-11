@@ -1,22 +1,31 @@
-//! Async, durable transaction submission with bounded parallel interpretation.
+//! Submit durable transactions and read fixed-sequence snapshots.
 //!
-//! [`create`] and [`open`] return a cloneable handle. Submission I/O,
-//! validation, installation and recovery run on a coordinator thread, not the
-//! caller's executor. Snapshot reads use synchronous caller-thread I/O.
-//! The futures use Tokio channels but need no Tokio
-//! runtime. A persistent worker pool interprets independent transactions.
-//! Count and byte budgets apply backpressure before sequencing.
-//! Each receipt follows log durability, execution and
-//! checkpoint publication, including when its outcome is a semantic abort.
+//! Start with [`create`] or [`open`] to obtain a cloneable [`Database`] handle.
+//! Call [`execute`] to submit a bound transaction, then check its [`Receipt`]
+//! outcome. A receipt means the record is durable and part of the contiguous
+//! visible prefix, including when the transaction aborts. Checkpoints can lag;
+//! recovery replays the durable log after the checkpoint.
 //!
-//! Dropping a submission future after enqueueing does not cancel the request.
-//! An interrupted call may have committed. Retrying is a new transaction; put
-//! any required request-ID deduplication inside the transaction itself.
-//! [`close`] drains accepted requests and releases the directory lock for all
-//! handle clones. Dropping every handle also drains the queue, but does not
-//! wait for the writer to finish. Snapshots are revocable; close revokes all
-//! claims and drains in-flight reads without waiting for idle handles or scans.
-//! Durable cursors survive close and are released only by explicit request.
+//! # Execution and capacity
+//!
+//! A coordinator thread validates submissions, performs publication I/O,
+//! installs results, and runs recovery. Persistent workers interpret
+//! independent transactions. Count and byte budgets delay admission before
+//! sequencing when capacity is full. Futures use Tokio channels but do not
+//! require a Tokio runtime. Snapshot reads perform synchronous I/O on the
+//! calling thread.
+//!
+//! # Cancellation and shutdown
+//!
+//! Dropping an enqueued submission future does not cancel the request. An
+//! interrupted call may have committed, and retrying creates a new transaction.
+//! Put required request-ID deduplication inside the transaction.
+//!
+//! [`close`] finishes accepted work, revokes snapshots, waits for active reads,
+//! and releases the directory lock for all handle clones. Idle snapshots and
+//! scans do not delay close. Dropping every database handle also starts this
+//! shutdown, but does not wait for completion or report failures. Durable
+//! cursor registrations survive shutdown until explicitly released.
 
 mod budget;
 pub(crate) mod cursor;
@@ -89,7 +98,7 @@ use crate::vm;
 use crate::vm::CatalogueOperation;
 use crate::vm::Outcome;
 
-/// A cloneable submission handle to one exclusively owned database directory.
+/// A cloneable handle for submitting work to one exclusively owned database.
 #[derive(Clone, Debug)]
 pub struct Database {
     sender: mpsc::Sender<Request>,
@@ -120,11 +129,12 @@ impl Database {
     }
 }
 
-/// Database initialization settings. Omitted identities are independently
-/// generated UUIDs (version 4). Explicit identities must be unique and nonzero.
-/// Defaults use the finite format ceilings; applications can lower individual
-/// named limits. All resolved settings are persisted, never regenerated on
-/// open.
+/// Identities and resource policy to persist when creating a database.
+///
+/// Omitted identities become independently generated version-4 UUIDs. Supplied
+/// identities must be unique and nonzero. Default limits are the finite format
+/// ceilings; lower individual fields to suit the application. Reopening uses
+/// the stored settings and does not generate replacements.
 #[derive(Clone, Debug, Default)]
 pub struct CreateOptions {
     pub limits: Limits,
@@ -132,17 +142,20 @@ pub struct CreateOptions {
     pub cursor_namespace: Option<[u8; 16]>,
 }
 
-/// A durable result in the contiguous visible prefix. The materialized
-/// checkpoint may lag behind; recovery replays its durable log suffix.
-/// An aborted outcome contains no data writes but still occupies this sequence
-/// and is durably recorded.
+/// A durable transaction outcome in the contiguous visible log prefix.
+///
+/// Check the outcome for success or abort. An abort has no data writes but
+/// still occupies its sequence. The checkpoint may lag behind this receipt;
+/// recovery reconstructs later state from the durable log.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Receipt {
     pub sequence: u64,
     pub outcome: Outcome,
 }
 
-/// Limits include the complete H.1 header and CRC. Records are never split.
+/// Maximum batch size, including the H.1 feed header and checksum.
+///
+/// A batch contains complete records; these limits never split a record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BatchLimits {
     pub max_records: usize,
@@ -176,10 +189,11 @@ pub enum Error {
     Read(vm::Error),
     /// Validation rejected the request before sequencing. Nothing was written.
     Rejected(vm::Error),
-    /// Definite pre-sequence rejection by this process's operational capacity,
-    /// not a semantic policy failure or a logged abort. Reopen with more
-    /// capacity or use a smaller transaction. Recovery does not apply these
-    /// settings.
+    /// The request exceeds process capacity and was rejected before sequencing.
+    ///
+    /// Reopen with more capacity or reduce the request. This is not a logged
+    /// abort and does not change semantic policy. Recovery uses the recorded
+    /// claims rather than these process limits.
     OperationalLimit {
         resource: &'static str,
         required: u64,
@@ -299,10 +313,11 @@ enum Request {
     Close,
 }
 
-/// Create a database in a new directory. The parent directory must exist.
-/// `CreateOptions::default()` generates UUIDs and uses default named limits.
-/// A failed or cancelled creation may leave a directory; it is never silently
-/// replaced or treated as a new empty database.
+/// Create a database in a new directory whose parent already exists.
+///
+/// [`CreateOptions::default`] generates UUIDs and uses default named limits.
+/// Failure or cancellation may leave an incomplete directory. A later create
+/// will not replace it or treat it as an empty database.
 pub async fn create(
     path: impl AsRef<Path>,
     options: CreateOptions,
@@ -310,8 +325,9 @@ pub async fn create(
     create_with_options(path, options, EngineOptions::default()).await
 }
 
-/// Create with separate, nonpersistent process limits. Existing CreateOptions
-/// initializers remain unchanged.
+/// Create a database with separate persistent policy and local engine options.
+///
+/// Engine options control this process and are not stored in the database.
 pub async fn create_with_options(
     path: impl AsRef<Path>,
     options: CreateOptions,
@@ -320,17 +336,20 @@ pub async fn create_with_options(
     start(path.as_ref().to_owned(), Some(options), engine, None).await
 }
 
-/// Open an existing database and replay its durable post-checkpoint records
-/// before accepting submissions. Corruption is an error, not a reason to fall
-/// back to an older checkpoint. Recovery validates full C.4 access manifests
-/// against the historical catalogue and policy, including older broad
-/// manifests.
+/// Open a database and recover it before accepting submissions.
+///
+/// Recovery replays every durable record after the selected checkpoint. It
+/// validates C.4 access manifests against the historical catalogue and policy,
+/// including older broad manifests. Corruption produces an error; recovery
+/// does not fall back to an older checkpoint.
 pub async fn open(path: impl AsRef<Path>) -> Result<Database> {
     open_with_options(path, EngineOptions::default()).await
 }
 
-/// Replay sequentially under the logged historical policy, then start the
-/// bounded live scheduler. Operational limits do not reduce replay semantics.
+/// Open and recover a database, then start it with the supplied engine options.
+///
+/// Recovery is sequential and uses the logged historical policy. Local limits
+/// must not change replay outcomes.
 pub async fn open_with_options(
     path: impl AsRef<Path>,
     engine: EngineOptions,
@@ -487,10 +506,11 @@ fn random_uuid() -> storage::Result<[u8; 16]> {
 }
 
 /// Submit a bound transaction and wait for its durable, visible outcome.
-/// Claims are checked against the policy at its assigned sequence. The writer
-/// derives normalized C.4 scopes; resource 7 charges their actual entry count.
-/// Concurrent callers are sequenced in enqueue order. Independent transactions
-/// may interpret concurrently and finish out of order; visibility is a prefix.
+///
+/// The writer checks claims against the policy at the assigned sequence and
+/// derives normalized C.4 access scopes. Resource 7 charges their entry count.
+/// Requests receive sequences in enqueue order. Independent transactions may
+/// finish out of order, but receipts wait for a contiguous visible prefix.
 ///
 /// Cancellation before enqueueing submits nothing. After enqueueing, the
 /// transaction proceeds even if this future is dropped. An `Uncertain` error
@@ -512,11 +532,13 @@ pub async fn execute(
     .await
 }
 
-/// Submit explicit normalized C.4 declarations. The writer independently proves
-/// coverage under the historical schemas and policy before sequencing. Broader
-/// declarations are allowed and retained exactly, including their resource-7
-/// count. `AccessManifest::decode` accepts canonical wire manifests; `new`
-/// normalizes application-constructed scopes before submission.
+/// Submit a transaction with explicit normalized C.4 access declarations.
+///
+/// Before sequencing, the writer checks that the declarations cover the program
+/// under its historical schemas and policy. Broader declarations are allowed
+/// and retained, including their resource-7 entry count. Use
+/// `AccessManifest::decode` for canonical encoded manifests, or
+/// `AccessManifest::new` to normalize application-constructed scopes.
 pub async fn execute_with_manifest(
     database: &Database,
     transaction: Transaction,
@@ -584,18 +606,21 @@ async fn submit(
     })?
 }
 
-/// Stop accepting new submissions from all clones, drain already accepted
-/// requests, checkpoint the visible prefix, and wait until the directory lock
-/// has been released. A shutdown failure reports `Storage(NeedsRecovery)`;
-/// earlier successful receipts remain durable through log replay. Receipts for
-/// individual transactions still report their own results. A repeated close
-/// after shutdown returns `Error::Closed`. Even that result waits for the
-/// writer to release its storage handles, so the directory can be reopened.
-/// All snapshots and their iterators are revoked before this returns. In-flight
-/// reads finish at their original view; idle handles do not delay close. Cursor
-/// registrations remain durable and can be reopened using their saved tokens.
-/// Active backup workers finish before the lock is released, even when their
-/// waiting futures have been cancelled. Stalled filesystem I/O can delay close.
+/// Finish accepted work, checkpoint it, and wait for the directory lock to
+/// release.
+///
+/// New submissions from every handle clone are stopped. A shutdown failure
+/// returns `Storage(NeedsRecovery)`; earlier successful receipts remain durable
+/// through replay. Individual transaction receipts report their own results.
+/// A repeated close returns `Error::Closed` after storage handles are released,
+/// so the directory can still be reopened safely.
+///
+/// Close revokes all snapshots and iterators. Active reads finish at their
+/// original view; idle handles do not delay shutdown. Durable cursors remain
+/// registered and can be reopened with their saved tokens.
+///
+/// Close also joins active backup workers, even if their waiting futures were
+/// cancelled. Stalled filesystem I/O can therefore delay close.
 pub async fn close(database: &Database) -> Result<()> {
     let result = database
         .sender
