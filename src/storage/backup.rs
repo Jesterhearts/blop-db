@@ -142,8 +142,9 @@ pub(crate) fn attach(
     path: &Path,
     namespace: [u8; 16],
     read_only: bool,
+    recovery: super::TailRecovery,
 ) -> Result<Store> {
-    let mut store = store::open_directory(path, true)?;
+    let mut store = store::open_directory(path, true, recovery)?;
     let directory = platform::open_directory(store.directory())?;
     let marker = store.directory().join("ATTACH_REQUIRED");
     if !marker.try_exists()? {

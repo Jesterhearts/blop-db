@@ -22,7 +22,7 @@ use crate::storage;
 use crate::vm;
 
 #[cfg(test)]
-const SEGMENT_HEADER_LENGTH: usize = 96;
+const SEGMENT_HEADER_LENGTH: usize = 4096;
 const RECORD_HEADER_LENGTH: usize = 64;
 const RECORD_OVERHEAD: usize = 72;
 const MAX_RECORD_LENGTH: usize = 64 * 1024 * 1024;
@@ -415,17 +415,17 @@ mod tests {
             } else {
                 prefix.len()
             };
-            assert_eq!(
-                &log[offset..],
-                storage::wal::tests::frame(
-                    2,
-                    before.durable_digest,
-                    &records
-                        .iter()
-                        .map(|(_, bytes)| bytes.as_slice())
-                        .collect::<Vec<_>>()
-                )
+            let expected = storage::wal::tests::frame(
+                2,
+                before.durable_digest,
+                &records
+                    .iter()
+                    .map(|(_, bytes)| bytes.as_slice())
+                    .collect::<Vec<_>>(),
             );
+            assert_eq!(&log[offset..offset + expected.len()], expected);
+            assert!(log[offset + expected.len()..].iter().all(|byte| *byte == 0));
+            assert!(log.len().is_multiple_of(SEGMENT_HEADER_LENGTH));
             assert_eq!(&fs::read(&first).unwrap()[..prefix.len()], prefix);
             let path = store.directory().to_owned();
             drop(store);

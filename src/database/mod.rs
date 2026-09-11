@@ -94,6 +94,7 @@ use crate::Transaction;
 use crate::storage;
 use crate::storage::Genesis;
 use crate::storage::LimitPolicy;
+pub use crate::storage::TailRecovery;
 use crate::vm;
 use crate::vm::CatalogueOperation;
 use crate::vm::Outcome;
@@ -340,8 +341,10 @@ pub async fn create_with_options(
 ///
 /// Recovery replays every durable record after the selected checkpoint. It
 /// validates C.4 access manifests against the historical catalogue and policy,
-/// including older broad manifests. Corruption produces an error; recovery
-/// does not fall back to an older checkpoint.
+/// including older broad manifests. By default, malformed WAL suffixes outside
+/// the selected durable bounds are discarded. Select [`TailRecovery::Strict`]
+/// through [`open_with_options`] to reject complete-sized malformed groups.
+/// Selected checkpoint and log corruption always produces an error.
 pub async fn open(path: impl AsRef<Path>) -> Result<Database> {
     open_with_options(path, EngineOptions::default()).await
 }
@@ -400,9 +403,10 @@ async fn start(
                             &path,
                             namespace,
                             mode == AttachMode::ReadOnlyReplica,
+                            engine_options.tail_recovery,
                         )
                     }),
-                    None => storage::open(path),
+                    None => storage::open_with_recovery(path, engine_options.tail_recovery),
                 })
                 .and_then(|mut store| {
                     engine::recover(&mut store)?;

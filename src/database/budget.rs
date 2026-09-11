@@ -12,8 +12,8 @@ use super::Result;
 use super::record::Command;
 use crate::vm;
 
-/// Local admission and scheduling settings, separate from stored semantic
-/// policy.
+/// Local recovery, admission, and scheduling settings, separate from stored
+/// semantic policy.
 ///
 /// Reservations bound accounted capacity, not total resident memory or disk
 /// space. They exclude retained visible history, page traversal, and operating
@@ -21,6 +21,9 @@ use crate::vm;
 /// can run while assigned transactions hold execution reservations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineOptions {
+    /// Handle malformed WAL suffixes when opening or attaching. Defaults to
+    /// discarding the invalid suffix; selected durable prefixes remain strict.
+    pub tail_recovery: crate::storage::TailRecovery,
     pub workers: usize,
     pub execution_window: u64,
     /// Checkpoint after this many newly visible records. Receipts before then
@@ -41,6 +44,7 @@ pub struct EngineOptions {
 impl Default for EngineOptions {
     fn default() -> Self {
         Self {
+            tail_recovery: crate::storage::TailRecovery::default(),
             workers: std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4)),
             execution_window: 64,
             checkpoint_interval: 64,

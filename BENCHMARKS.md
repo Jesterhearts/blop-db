@@ -200,6 +200,10 @@ creation adds a directory flush. Checkpoints retain the existing publication ord
 durable logging. The final partial checkpoint remains in close, outside timing. Group framing adds
 168 bytes per group, without changing canonical transaction or outcome bytes.
 
+These measurements predate WAL write isolation. Segments now pad the header and each group to 4 KiB
+boundaries while retaining one file flush per append. The figures below do not measure that
+additional write volume or the configurable tail recovery policy.
+
 Run these commands on `243b001`, then rebuild and repeat on `87afb51`. The commands use the existing
 `/tmp/opencode` parent directory from the recorded environment; substitute your measurement
 directory when reproducing them elsewhere.

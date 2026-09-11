@@ -1,4 +1,5 @@
-//! Store immutable pages and publish version 1 write-ahead log (WAL) groups.
+//! Store immutable pages and publish write-isolated write-ahead log (WAL)
+//! groups.
 //!
 //! This engine-facing API uses append-only, copy-on-write pages. Supply
 //! validated system entries in physical batches. The caller must check schemas
@@ -49,11 +50,34 @@ pub use store::create;
 pub(crate) use store::enable_runtime_cache;
 pub use store::get;
 pub use store::open;
+pub use store::open_with_recovery;
 pub use store::prepare_checkpoint;
 pub use store::publish;
 pub use store::scan;
 pub use store::view;
 pub(crate) use store::wal::append_wal;
+
+/// How recovery handles malformed WAL bytes beyond the selected manifest's
+/// durable bounds. This process-local setting is not persisted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TailRecovery {
+    /// Keep the valid group prefix and discard the suffix starting at the first
+    /// malformed group. Later storage damage to an acknowledged suffix can be
+    /// mistaken for an interrupted append.
+    #[default]
+    DiscardInvalid,
+    /// Reject complete-sized malformed groups without modifying the WAL.
+    Strict,
+}
+
+impl TailRecovery {
+    pub(super) fn discards(
+        self,
+        error: &Error,
+    ) -> bool {
+        self == Self::DiscardInvalid && matches!(error, Error::Corrupt(_))
+    }
+}
 
 /// A physical system-tree identity from storage format 1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

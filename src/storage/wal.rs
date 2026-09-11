@@ -1,4 +1,4 @@
-//! Read version 1 segments and frame complete WAL commit groups.
+//! Read write-isolated version 1 segments and frame complete WAL commit groups.
 //!
 //! Group layout is local; it does not change canonical records or their
 //! digests.
@@ -19,12 +19,38 @@ use super::Result;
 use super::SegmentDescriptor;
 use super::metadata;
 
-pub(super) const SEGMENT_BYTES: u64 = 96;
+pub(super) const SEGMENT_BYTES: u64 = metadata::SEGMENT_HEADER_LENGTH;
+pub(super) const BLOCK_BYTES: u64 = 4096;
 pub(super) const HEADER_BYTES: usize = 112;
 pub(super) const TRAILER_BYTES: usize = 56;
 pub(super) const GROUP_OVERHEAD: u64 = (HEADER_BYTES + TRAILER_BYTES) as u64;
 pub(super) const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) const MAX_GROUP_RECORDS: usize = 64;
+
+pub(super) fn group_bytes(bytes: u64) -> Result<u64> {
+    bytes
+        .checked_next_multiple_of(BLOCK_BYTES)
+        .ok_or(Error::Corrupt("WAL padded length overflow"))
+}
+
+pub(super) fn segment_crc_valid(header: &[u8; 96]) -> bool {
+    crc32c::crc32c_append(crc32c::crc32c(&header[..92]), &[0; 4]) == u32_at(header, 92)
+}
+
+pub(super) fn read_padding(
+    reader: &mut impl Read,
+    length: u64,
+) -> Result<()> {
+    let mut bytes = [0; BLOCK_BYTES as usize];
+    let bytes = bytes
+        .get_mut(..length as usize)
+        .ok_or(Error::Corrupt("invalid WAL padding length"))?;
+    metadata::read_committed(reader, bytes)?;
+    if bytes.iter().any(|byte| *byte != 0) {
+        return Err(Error::Corrupt("nonzero WAL padding"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct GroupHeader {
@@ -113,8 +139,8 @@ pub(super) fn trailer(
 pub(super) fn segment_header(
     database: [u8; 16],
     segment: &SegmentDescriptor,
-) -> [u8; 96] {
-    let mut bytes = [0; 96];
+) -> [u8; BLOCK_BYTES as usize] {
+    let mut bytes = [0; BLOCK_BYTES as usize];
     bytes[..8].copy_from_slice(b"BLOPLG01");
     bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
     bytes[10..12].copy_from_slice(&96_u16.to_le_bytes());
@@ -122,8 +148,8 @@ pub(super) fn segment_header(
     bytes[32..40].copy_from_slice(&segment.segment_id.to_le_bytes());
     bytes[40..48].copy_from_slice(&segment.first_sequence.to_le_bytes());
     bytes[48..80].copy_from_slice(&segment.predecessor_digest);
-    let crc = crc32c::crc32c(&bytes);
-    bytes[92..].copy_from_slice(&crc.to_le_bytes());
+    let crc = crc32c::crc32c(&bytes[..SEGMENT_BYTES as usize]);
+    bytes[92..96].copy_from_slice(&crc.to_le_bytes());
     bytes
 }
 
@@ -166,7 +192,7 @@ impl<R: Read + Seek> Records<R> {
             file,
             database,
             segment,
-            SEGMENT_BYTES,
+            BLOCK_BYTES,
             segment.first_sequence,
             segment.predecessor_digest,
         )
@@ -185,10 +211,12 @@ impl<R: Read + Seek> Records<R> {
         let mut header = [0; 96];
         metadata::read_committed(&mut file, &mut header)?;
         metadata::validate_segment_header(&header, &database, segment)?;
-        if offset < SEGMENT_BYTES
+        read_padding(&mut file, BLOCK_BYTES - SEGMENT_BYTES)?;
+        if offset < BLOCK_BYTES
             || offset > segment.committed_bytes
             || first < segment.first_sequence
             || first > segment.last_sequence
+            || !offset.is_multiple_of(BLOCK_BYTES)
         {
             return Err(Error::Corrupt("invalid log reader prefix"));
         }
@@ -232,7 +260,7 @@ fn next_record<R: Read>(records: &mut Records<R>) -> Result<Record> {
         let mut bytes = [0; HEADER_BYTES];
         metadata::read_committed(&mut records.reader, &mut bytes)?;
         let header = GroupHeader::decode(&bytes)?;
-        if header.bytes > records.remaining
+        if group_bytes(header.bytes)? > records.remaining
             || header.first != records.sequence
             || header.predecessor != records.predecessor
             || header.first + u64::from(header.count) - 1 > records.last
@@ -281,6 +309,9 @@ fn next_record<R: Read>(records: &mut Records<R>) -> Result<Record> {
             return Err(Error::Corrupt("WAL group trailer or digest mismatch"));
         }
         records.remaining -= TRAILER_BYTES as u64;
+        let padding = group_bytes(group.header.bytes)? - group.header.bytes;
+        read_padding(&mut records.reader, padding)?;
+        records.remaining -= padding;
     }
     if records.sequence > records.last {
         if records.remaining != 0 || records.group.is_some() {
@@ -378,6 +409,7 @@ pub(crate) mod tests {
             bytes.extend_from_slice(record);
         }
         bytes.extend_from_slice(&trailer(length, Sha256::digest(&bytes).into()));
+        bytes.resize(group_bytes(length).unwrap() as usize, 0);
         bytes
     }
 

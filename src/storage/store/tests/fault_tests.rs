@@ -40,11 +40,11 @@ fn publication_fixture(extend: bool) -> (tempfile::TempDir, Store, Manifest) {
                     .join(format!("log-{:020}.bin", segment.segment_id)),
             )
             .unwrap()
-            .write_all(&bytes[96..])
+            .write_all(&bytes[4096..])
             .unwrap();
         segment.last_sequence = added.last_sequence;
         segment.last_digest = added.last_digest;
-        segment.committed_bytes += added.committed_bytes - 96;
+        segment.committed_bytes += added.committed_bytes - 4096;
         fs::remove_file(added_path).unwrap();
     }
     for sequence in 2..=3 {

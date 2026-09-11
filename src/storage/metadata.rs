@@ -182,14 +182,18 @@ pub(super) fn validate_descriptor(
     {
         return Err("invalid segment sequence range");
     }
+    let block = u128::from(super::wal::BLOCK_BYTES);
     let records = u128::from(segment.last_sequence - segment.first_sequence + 1);
-    let Some(payload) = segment.committed_bytes.checked_sub(SEGMENT_HEADER_LENGTH) else {
-        return Err("segment prefix is shorter than its header");
-    };
     let groups = records.div_ceil(super::wal::MAX_GROUP_RECORDS as u128);
-    if u128::from(payload) < records * 72 + groups * u128::from(super::wal::GROUP_OVERHEAD)
-        || u128::from(payload)
-            > records * u128::from(MAX_RECORD_LENGTH + super::wal::GROUP_OVERHEAD)
+    let minimum =
+        (records * 72 + groups * u128::from(super::wal::GROUP_OVERHEAD)).div_ceil(block) * block;
+    let maximum = records
+        * u128::from(MAX_RECORD_LENGTH + super::wal::GROUP_OVERHEAD).div_ceil(block)
+        * block;
+    if !segment
+        .committed_bytes
+        .is_multiple_of(super::wal::BLOCK_BYTES)
+        || !(block + minimum..=block + maximum).contains(&u128::from(segment.committed_bytes))
     {
         return Err("segment prefix length cannot contain its record range");
     }
@@ -584,8 +588,7 @@ pub(super) fn validate_segment_header(
     database_id: &[u8; 16],
     segment: &SegmentDescriptor,
 ) -> Result<()> {
-    let crc = crc32c::crc32c_append(crc32c::crc32c(&header[..92]), &[0; 4]);
-    if crc != u32_at(header, 92) {
+    if !super::wal::segment_crc_valid(header) {
         return Err(Error::Corrupt("log segment header CRC mismatch"));
     }
     if &header[..8] != b"BLOPLG01" {
@@ -751,7 +754,7 @@ mod tests {
                     segment_id: 11,
                     first_sequence: 1,
                     last_sequence: 2,
-                    committed_bytes: 408,
+                    committed_bytes: 8192,
                     predecessor_digest: [0x11; 32],
                     last_digest: [0x22; 32],
                 },
@@ -759,7 +762,7 @@ mod tests {
                     segment_id: 21,
                     first_sequence: 3,
                     last_sequence: 4,
-                    committed_bytes: 408,
+                    committed_bytes: 8192,
                     predecessor_digest: [0x22; 32],
                     last_digest: [0x44; 32],
                 },
@@ -898,7 +901,7 @@ mod tests {
         put_u64(&mut descriptor, 0, 11);
         put_u64(&mut descriptor, 8, 1);
         put_u64(&mut descriptor, 16, 2);
-        put_u64(&mut descriptor, 24, 408);
+        put_u64(&mut descriptor, 24, 8192);
         descriptor[32..64].fill(0x11);
         descriptor[64..96].fill(0x22);
         assert_eq!(manifest.segments[0].encode().unwrap(), descriptor);
@@ -1115,11 +1118,10 @@ mod tests {
             (284, 3),
             (292, 95),
             (292, 96),
-            (292, 407),
-            (
-                292,
-                96 + 2 * (MAX_RECORD_LENGTH + super::super::wal::GROUP_OVERHEAD) + 1,
-            ),
+            (292, 4096),
+            (292, 8191),
+            (292, 8193),
+            (292, 4096 + 2 * (MAX_RECORD_LENGTH + 4096) + 4096),
             (364, 11),
             (372, 2),
             (372, 4),
@@ -1245,7 +1247,7 @@ mod tests {
             segment_id: u64::MAX - 1,
             first_sequence: u64::MAX - 1,
             last_sequence: u64::MAX - 1,
-            committed_bytes: 336,
+            committed_bytes: 8192,
             predecessor_digest: manifest.checkpoint_digest,
             last_digest: manifest.durable_digest,
         });
@@ -1283,7 +1285,7 @@ mod tests {
         id: u64,
         records: &[Vec<u8>],
     ) -> (SegmentDescriptor, Vec<u8>) {
-        let mut bytes = vec![0; 96];
+        let mut bytes = vec![0; 4096];
         bytes[..12].copy_from_slice(b"BLOPLG01\x01\x00\x60\x00");
         bytes[16..32].copy_from_slice(&database_id);
         put_u64(&mut bytes, 32, id);
@@ -1327,7 +1329,7 @@ mod tests {
         (directory, manifest, bytes)
     }
 
-    const RECORD_START: usize = 96 + crate::storage::wal::HEADER_BYTES;
+    const RECORD_START: usize = 4096 + crate::storage::wal::HEADER_BYTES;
 
     fn replace_single_record(
         directory: &Path,
@@ -1335,7 +1337,7 @@ mod tests {
         original: &[u8],
         record: &[u8],
     ) {
-        let mut bytes = original[..96].to_vec();
+        let mut bytes = original[..4096].to_vec();
         bytes.extend_from_slice(&crate::storage::wal::tests::frame(
             1,
             manifest.genesis_digest,
@@ -1475,8 +1477,8 @@ mod tests {
     #[test]
     fn every_record_header_field_is_validated_even_with_valid_crc_and_final_digest() {
         let (directory, mut manifest, original) = single_log(1, b"abc");
-        let canonical =
-            &original[RECORD_START..original.len() - crate::storage::wal::TRAILER_BYTES];
+        let record_length = u32_at(&original, RECORD_START + 8) as usize;
+        let canonical = &original[RECORD_START..RECORD_START + record_length];
         for index in 0..64 {
             let mut record = canonical.to_vec();
             record[index] ^= 0x80;
@@ -1492,8 +1494,8 @@ mod tests {
     #[test]
     fn record_crc_precedes_version_interpretation_and_lengths_do_not_wrap() {
         let (directory, mut manifest, original) = single_log(1, b"abc");
-        let canonical =
-            &original[RECORD_START..original.len() - crate::storage::wal::TRAILER_BYTES];
+        let record_length = u32_at(&original, RECORD_START + 8) as usize;
+        let canonical = &original[RECORD_START..RECORD_START + record_length];
         let mut record = canonical.to_vec();
         record[6] = 2;
         replace_single_record(directory.path(), &mut manifest, &original, &record);
@@ -1548,17 +1550,19 @@ mod tests {
         ));
         manifest.durable_digest = digest;
         manifest.segments[0].last_digest = manifest.durable_digest;
-        bytes.push(0);
-        manifest.segments[0].committed_bytes += 1;
+        bytes.resize(bytes.len() + 4096, 0);
+        manifest.segments[0].committed_bytes += 4096;
         fs::write(&path, bytes).unwrap();
         assert!(matches!(
             validate_logs(directory.path(), &manifest),
             Err(Error::Corrupt("excess bytes inside committed log prefix"))
         ));
-        manifest.segments[0].committed_bytes -= 2;
+        manifest.segments[0].committed_bytes -= 1;
         assert!(matches!(
             validate_logs(directory.path(), &manifest),
-            Err(Error::Corrupt("WAL group does not match committed prefix"))
+            Err(Error::Corrupt(
+                "segment prefix length cannot contain its record range"
+            ))
         ));
     }
 

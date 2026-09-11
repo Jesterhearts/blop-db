@@ -74,7 +74,7 @@ metadata computed by executing the log.
 
 A write-ahead log (WAL) group holds complete records and checksums. On an existing segment, one file
 flush makes the group durable. Checkpoint and storage-metadata publication use manifests and the
-`CURRENT` selection file. Creation and reopening use this same version 1 protocol. See
+`CURRENT` selection file. Version 1 uses 4 KiB-aligned WAL segment headers and commit groups. See
 [WAL commit groups](DESIGN.md#appendix-i-wal-commit-groups) for its recovery rules.
 
 `tx!` compiles to instruction set architecture (ISA) 1 bytecode during Rust compilation. It parses,
@@ -181,10 +181,11 @@ program.
 
 ### Bounded execution
 
-`EngineOptions` controls live admission and scheduling independently of `Limits`:
+`EngineOptions` controls recovery, live admission and scheduling independently of `Limits`:
 
 | Field                    | Default                               | Purpose                                                                                |
 | ------------------------ | ------------------------------------- | -------------------------------------------------------------------------------------- |
+| `tail_recovery`          | `TailRecovery::DiscardInvalid`        | Recovery policy for malformed WAL suffixes when opening or attaching.                  |
 | `workers`                | Available CPUs clamped to 2 through 4 | Persistent interpreters; configurable from 1 through 256.                              |
 | `execution_window`       | 64                                    | Dispatch only `F < N <= min(D, F + W)`, using overflow-safe arithmetic.                |
 | `checkpoint_interval`    | 64                                    | Newly visible records before checkpoint publication; configurable from 1 through 4096. |
@@ -332,14 +333,51 @@ Log appends validate and append up to 64 canonical records inside one checksumme
 file, then advance D before dispatch. New segments also require a directory flush. Recovery
 validates the selected checkpoint and log prefixes, discovers complete linked WAL groups beyond
 them, flushes the recovered suffix, and replays `(C, D]`. Group framing adds 168 bytes per group;
-canonical record bytes and logical replication digests are preserved. Checkpoints may end inside a
-group, but durable physical log bounds end only at group boundaries.
+canonical record bytes and logical replication digests are preserved. New segment headers occupy a
+zero-padded 4 KiB block. Each group starts on a 4 KiB boundary and is zero-padded through the next
+boundary before its existing file flush. Later appends never write into an earlier group's blocks,
+including its padding. Checkpoints may end inside a group, but durable physical log bounds include
+the whole padded group. This isolates writes on storage with 4 KiB write-failure isolation; it does
+not assume atomic 4 KiB writes or protect against devices that damage neighbouring blocks.
 
-Physically short terminal appends are discarded. Complete-sized checksum-invalid groups, forks and
-gaps are errors; recovery never skips forward past damage. A full-length torn append can therefore
-require explicit repair. Loss or physical truncation of an uncheckpointed suffix caused by later
-damage cannot be distinguished from an interrupted append; already selected byte bounds remain
-strict. Low-level storage and the public database API use the same WAL format.
+#### Choose a tail recovery policy
+
+`EngineOptions::tail_recovery` is a process-local option used by `open_with_options` and
+`attach_with_options`:
+
+- `TailRecovery::DiscardInvalid` is the default. Beyond the manifest's selected durable bounds,
+  recovery retains complete valid groups, then discards the suffix from the first malformed group
+  through the end of that segment. It never skips a damaged group to resume at a later group.
+- `TailRecovery::Strict` rejects complete-sized malformed groups without modifying the WAL.
+
+Both policies discard physically short terminal appends, including incomplete padding. Damage inside
+selected log bounds or checkpoint data is always an error. Unsupported formats, checksum-valid
+group-header sequence or predecessor mismatches, and complete segment forks or gaps remain errors. A
+complete successor after a damaged accepted segment is also an error, before any tail is trimmed.
+
+For strict recovery:
+
+```rust,no_run
+# #[cfg(any(unix, windows))]
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use blop_db::database::{self, EngineOptions, TailRecovery};
+
+let db = database::open_with_options("/path/to/database", EngineOptions {
+    tail_recovery: TailRecovery::Strict,
+    ..EngineOptions::default()
+}).await?;
+database::close(&db).await?;
+# Ok(())
+# }
+# #[cfg(not(any(unix, windows)))]
+# fn main() {}
+```
+
+The default favours automatic recovery from full-length torn appends. Later storage damage to an
+acknowledged suffix outside selected bounds can be mistaken for an interrupted append and discarded.
+Physical truncation of that suffix is ambiguous under either policy. Selected byte bounds remain
+strict. Reopening starts a fresh segment using the same aligned layout.
 
 ### Administrative requests and controls
 
@@ -1126,9 +1164,10 @@ WAL framing in appendices E and I. Application writes should use `blop_db::datab
   `CURRENT`. It rejects stale metadata, decreasing frontiers, changed history anchors and stale
   cursor roots.
 - `open` restores the selected checkpoint, validates reachable pages and committed log envelopes,
-  and discovers and flushes later complete WAL groups. It discards physically incomplete terminal
-  appends after validation. Corrupt committed data and complete malformed groups are errors;
-  recovery does not fall back to an older manifest.
+  and discovers and flushes later complete WAL groups. Its default policy discards malformed
+  suffixes outside selected durable bounds. `open_with_recovery(path, TailRecovery::Strict)` selects
+  strict tail validation. Corrupt selected data is always an error; recovery does not fall back to
+  an older manifest.
 
 ### Create an isolated store
 

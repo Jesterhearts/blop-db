@@ -3,7 +3,7 @@
 Use this guide to locate the implementation and tests for each part of the
 [design specification](DESIGN.md). It is for contributors reviewing a change or checking which
 behaviours have been tested. The design defines the required transaction semantics and version 1
-storage bytes.
+storage bytes, including write-isolated WAL segments.
 
 The tests provide evidence for specific behaviours and failure cases. They do not certify every
 filesystem, hardware failure mode, or possible execution. Read the
@@ -180,6 +180,10 @@ committed prefixes. WAL-specific checks cover:
 - errors and partial writes at every group-append I/O boundary;
 - native child-process exit at each append boundary;
 - truncation at every byte position in a group;
+- aligned group and segment endpoints, zero padding, and unchanged earlier acknowledged blocks;
+- full-length torn groups with surviving trailers under default discard and strict recovery;
+- strict selected-prefix validation under both policies and no mutation before successor validation;
+- recovery retries after flush errors, and public open and attach policy propagation;
 - complete damaged groups, forks, unsupported versions, and invalid group bounds;
 - checkpoints inside a group and backups whose live D exceeds the selected manifest's D;
 - cache bounds, pinned-prefix rejection, incremental anchors, and invalidation of root proofs;
@@ -277,9 +281,15 @@ The implementation makes these choices within the design's required semantics.
   implemented.
 - WAL append advances live D after one segment flush, plus a directory flush for a new segment.
   `CURRENT` advances when checkpoints or storage metadata are published.
-- Recovery rejects complete malformed groups and discards only physically short terminal appends.
-  Some full-length torn writes therefore require explicit repair. Later loss or truncation of an
-  uncheckpointed suffix cannot be distinguished from an interrupted append.
+- Recovery defaults to discarding the suffix from the first malformed group outside selected bounds.
+  Strict mode rejects complete-sized malformed groups. Both modes discard physically short terminal
+  appends and reject selected-prefix damage, unsupported versions and broken group/segment links.
+  Discard mode can mistake later corruption of acknowledged suffixes for interrupted appends. Later
+  loss or truncation of a suffix outside selected bounds is ambiguous under either policy.
+- Version 1 WAL segments use a padded 4 KiB header block and groups padded to 4 KiB endpoints.
+  Padding shares the existing group flush. Reopened writers start new segments. Isolation assumes
+  interrupted writes cannot damage neighbouring 4 KiB blocks, without assuming atomic writes within
+  a block.
 - Backup constructs destination metadata for its pinned live D and selected C. It copies exact
   complete-group log prefixes and the cursor metadata captured with them.
 

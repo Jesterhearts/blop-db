@@ -709,7 +709,7 @@ mod tests {
         record.extend_from_slice(&crc32c::crc32c(&record).to_le_bytes());
         record.extend_from_slice(&212_u32.to_le_bytes());
         let digest = Sha256::digest(&record).into();
-        let mut log = vec![0; 96];
+        let mut log = vec![0; 4096];
         log[..8].copy_from_slice(b"BLOPLG01");
         log[8..10].copy_from_slice(&1_u16.to_le_bytes());
         log[10..12].copy_from_slice(&96_u16.to_le_bytes());
@@ -717,7 +717,7 @@ mod tests {
         log[32..40].copy_from_slice(&1_u64.to_le_bytes());
         log[40..48].copy_from_slice(&1_u64.to_le_bytes());
         log[48..80].copy_from_slice(&store.manifest().genesis_digest);
-        let crc = crc32c::crc32c(&log);
+        let crc = crc32c::crc32c(&log[..96]);
         log[92..96].copy_from_slice(&crc.to_le_bytes());
         log.extend_from_slice(&storage::wal::tests::single(&record));
         std::fs::write(store.directory().join("log-00000000000000000001.bin"), &log).unwrap();

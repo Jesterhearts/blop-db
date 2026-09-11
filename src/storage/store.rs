@@ -223,19 +223,33 @@ pub fn create(
 /// storage.
 ///
 /// Discover and flush complete linked WAL groups beyond the selected log
-/// bounds. Trim physically short terminal appends after validation, but reject
-/// complete malformed groups.
+/// bounds. Discard malformed suffixes using
+/// [`super::TailRecovery::DiscardInvalid`]. Selected prefixes, unsupported
+/// formats, and broken history links remain errors. Use [`open_with_recovery`]
+/// to select strict tail validation.
 ///
 /// The returned durable frontier may exceed the checkpoint. This function does
 /// not replay those later records. The engine must replay them before serving
 /// public reads or resuming transactions.
 pub fn open(path: impl AsRef<Path>) -> Result<Store> {
-    open_directory(path.as_ref(), false)
+    open_with_recovery(path, super::TailRecovery::default())
+}
+
+/// Open storage with an explicit WAL tail recovery policy.
+///
+/// Both policies discard physically short terminal appends. No policy permits
+/// discarding damage inside a CURRENT-selected log prefix.
+pub fn open_with_recovery(
+    path: impl AsRef<Path>,
+    recovery: super::TailRecovery,
+) -> Result<Store> {
+    open_directory(path.as_ref(), false, recovery)
 }
 
 pub(super) fn open_directory(
     path: &Path,
     attaching: bool,
+    recovery: super::TailRecovery,
 ) -> Result<Store> {
     let directory = fs::canonicalize(path)?;
     let lease = lock(&directory)?;
@@ -276,7 +290,7 @@ pub(super) fn open_directory(
     validate_checkpoint(&pages.reader(), &manifest, &genesis)?;
     metadata::validate_logs(&directory, &manifest)?;
     let selected = manifest.clone();
-    manifest = wal::recover_tail(&directory, &manifest)?;
+    manifest = wal::recover_tail(&directory, &manifest, recovery)?;
     pages.truncate_tail()?;
     if let Some(segment) = manifest.segments.last() {
         OpenOptions::new()
@@ -1005,7 +1019,7 @@ mod tests {
     ) -> (Manifest, Vec<[u8; 32]>) {
         let id = store.manifest.next_segment_id;
         let first = store.manifest.durable_sequence + 1;
-        let mut bytes = vec![0; 96];
+        let mut bytes = vec![0; 4096];
         bytes[..8].copy_from_slice(b"BLOPLG01");
         bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
         bytes[10..12].copy_from_slice(&96_u16.to_le_bytes());
@@ -1013,7 +1027,7 @@ mod tests {
         bytes[32..40].copy_from_slice(&id.to_le_bytes());
         bytes[40..48].copy_from_slice(&first.to_le_bytes());
         bytes[48..80].copy_from_slice(&store.manifest.durable_digest);
-        let crc = crc32c::crc32c(&bytes);
+        let crc = crc32c::crc32c(&bytes[..96]);
         bytes[92..96].copy_from_slice(&crc.to_le_bytes());
         let mut digests = vec![store.manifest.durable_digest];
         for sequence in first..first + count {
@@ -1820,7 +1834,13 @@ mod tests {
             ));
             drop(store);
             assert!(matches!(open(&path), Err(Error::AttachRequired)));
-            let store = super::super::backup::attach(&path, [4; 16], true).unwrap();
+            let store = super::super::backup::attach(
+                &path,
+                [4; 16],
+                true,
+                super::super::TailRecovery::default(),
+            )
+            .unwrap();
             assert_eq!(store.manifest.cursor_namespace, [4; 16]);
             assert_eq!(store.manifest.next_cursor_id, 2);
             assert_eq!(

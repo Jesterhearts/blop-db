@@ -17,7 +17,6 @@ use super::Manifest;
 use super::Result;
 use super::SegmentDescriptor;
 use super::metadata;
-use super::metadata::SEGMENT_HEADER_LENGTH;
 
 const MAX_PENDING_ANCHORS: u64 = 4096;
 
@@ -170,7 +169,7 @@ pub(super) fn validate_extension(
                     "new segment does not extend the durable anchor",
                 ));
             }
-            SEGMENT_HEADER_LENGTH
+            super::wal::BLOCK_BYTES
         };
         let path = directory.join(format!("log-{:020}.bin", segment.segment_id));
         let file = File::open(path).map_err(|error| {
@@ -212,14 +211,15 @@ fn validate_segment_extension(
     predecessor: [u8; 32],
     pending: &mut Vec<[u8; 32]>,
 ) -> Result<()> {
-    for record in super::wal::Records::suffix(
+    let records = super::wal::Records::suffix(
         file,
         manifest.database_id,
         segment,
         offset,
         first_sequence,
         predecessor,
-    )? {
+    )?;
+    for record in records {
         let record = record?;
         if record.sequence == manifest.checkpoint_sequence
             && record.digest != manifest.checkpoint_digest
@@ -310,20 +310,20 @@ mod tests {
         next.generation += 1;
         if rotate || next.segments.is_empty() {
             let id = next.next_segment_id;
-            let mut header = [0; 96];
+            let mut header = [0; 4096];
             header[..12].copy_from_slice(b"BLOPLG01\x01\x00\x60\x00");
             header[16..32].copy_from_slice(&next.database_id);
             header[32..40].copy_from_slice(&id.to_le_bytes());
             header[40..48].copy_from_slice(&(previous.durable_sequence + 1).to_le_bytes());
             header[48..80].copy_from_slice(&previous.durable_digest);
-            let crc = crc32c::crc32c(&header);
+            let crc = crc32c::crc32c(&header[..96]);
             header[92..96].copy_from_slice(&crc.to_le_bytes());
             fs::write(directory.join(format!("log-{id:020}.bin")), header).unwrap();
             next.segments.push(SegmentDescriptor {
                 segment_id: id,
                 first_sequence: previous.durable_sequence + 1,
                 last_sequence: previous.durable_sequence,
-                committed_bytes: 96,
+                committed_bytes: 4096,
                 predecessor_digest: previous.durable_digest,
                 last_digest: previous.durable_digest,
             });
@@ -564,9 +564,10 @@ mod tests {
         let path = directory.path().join("log-00000000000000000001.bin");
         let original = fs::read(&path).unwrap();
         let offset = previous.segments[0].committed_bytes as usize;
+        let group_end = offset + crate::storage::wal::u64_at(&original, offset + 16) as usize;
         for index in 0..64 {
             let mut record = original[offset + crate::storage::wal::HEADER_BYTES
-                ..original.len() - crate::storage::wal::TRAILER_BYTES]
+                ..group_end - crate::storage::wal::TRAILER_BYTES]
                 .to_vec();
             record[index] ^= 0x80;
             let end = record.len() - 8;
@@ -622,9 +623,9 @@ mod tests {
         ));
 
         let mut excess = next.clone();
-        excess.segments[0].committed_bytes += 1;
+        excess.segments[0].committed_bytes += 4096;
         let mut bytes = original.clone();
-        bytes.push(0);
+        bytes.resize(bytes.len() + 4096, 0);
         fs::write(&path, &bytes).unwrap();
         excess.encode().unwrap();
         assert!(matches!(
@@ -699,8 +700,9 @@ mod tests {
         .unwrap();
         assert_eq!(pending, digests);
         assert_eq!(reader.reads[0], 0..96);
+        assert_eq!(reader.reads[1], 96..4096);
         assert!(
-            reader.reads[1..]
+            reader.reads[2..]
                 .iter()
                 .all(|range| range.start >= old_end && range.end <= new_end)
         );
@@ -710,12 +712,12 @@ mod tests {
                 .iter()
                 .map(|range| range.end - range.start)
                 .sum::<u64>(),
-            96 + new_end - old_end
+            4096 + new_end - old_end
         );
 
         // Deliberately violate the owner's immutable-prefix contract to detect
         // accidental full-prefix reads through the public incremental entry.
-        bytes[100] ^= 1;
+        bytes[4096 + 4] ^= 1;
         fs::write(&path, &bytes).unwrap();
         assert!(
             validate_extension(directory.path(), &previous, &next, &proof)
@@ -802,7 +804,7 @@ mod tests {
         replaced.segments[1].segment_id = replaced.next_segment_id;
         replaced.next_segment_id += 1;
         let mut altered_prefix = next.clone();
-        altered_prefix.segments[0].committed_bytes += 1;
+        altered_prefix.segments[0].committed_bytes += 4096;
         let (one, _) = extend(directory.path(), &previous, 1, true);
         let (mut two, _) = extend(directory.path(), &one, 1, true);
         two.generation = next.generation;

@@ -454,7 +454,7 @@ fn seeded_access_and_storage_manifest_mutations_are_panic_free() {
         segment_id: 1,
         first_sequence: 1,
         last_sequence: 2,
-        committed_bytes: 520,
+        committed_bytes: 8192,
         predecessor_digest: manifest.genesis_digest,
         last_digest: [4; 32],
     });

@@ -349,9 +349,13 @@ pub(super) fn install(
     let path = temporary.path().join("prefix");
     let image = storage::backup::capture(store).map_err(Error::Storage)?;
     storage::backup::copy(image, &path).map_err(Error::Storage)?;
-    let mut isolated =
-        storage::backup::attach(&path, super::random_uuid().map_err(Error::Storage)?, false)
-            .map_err(Error::Storage)?;
+    let mut isolated = storage::backup::attach(
+        &path,
+        super::random_uuid().map_err(Error::Storage)?,
+        false,
+        storage::TailRecovery::Strict,
+    )
+    .map_err(Error::Storage)?;
     engine::recover(&mut isolated).map_err(Error::Storage)?;
     #[cfg(test)]
     test_point(hooks, 2)?;

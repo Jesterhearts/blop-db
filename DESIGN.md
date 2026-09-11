@@ -8,8 +8,8 @@ implementation and test coverage, use the [conformance guide](CONFORMANCE.md).
 **The central rule is sequential equivalence:** parallel execution must produce the same state and
 outcomes as execution of the durable log in sequence order.
 
-Version 1 uses one storage protocol for creation, opening, reads, and writes. Appendices E and I
-define write-ahead log (WAL) groups, durability, and recovery. Appendix G defines publication of
+Creation, opening, reads, and writes share one versioned storage protocol. Appendices E and I define
+write-ahead log (WAL) groups, durability, and recovery. Appendix G defines publication of
 checkpoints and retention metadata.
 
 ## Find a topic
@@ -130,7 +130,7 @@ protect their unacknowledged history until advanced or explicitly released.
 
 ## 1. Scope
 
-This document defines the logical architecture, correctness model, and version 1 binary formats of
+This document defines the logical architecture, correctness model, and versioned binary formats of
 an embedded database for Rust applications. It defines transaction semantics, bytecode rules,
 scheduling, MVCC, visibility, rollback, durability, recovery, and physical storage. Appendices A
 through I are normative: they specify the bytes and validation rules needed to implement compatible
@@ -1655,7 +1655,9 @@ Exhaustion is a system limitation, not a logged transaction abort.
 | Transaction body and manifest                            | Transaction 1, appendix C.                 |
 | Administrative operations and limits                     | Administrative 1 and policy 1, appendix D. |
 | Outcome                                                  | Outcome 1, appendix D.                     |
-| Log segment and record                                   | Log 1, appendix E.                         |
+| Log segment                                              | Segment 1, appendix E.                     |
+| Log record                                               | Record 1, appendix E.                      |
+| WAL group                                                | Group 1, appendix I.                       |
 | Page and physical system trees                           | Page 1 and storage 1, appendix F.          |
 | Genesis, publication pointer, manifest, and cursor value | Metadata 1, appendix G.                    |
 | Feed batch, cursor token, and consumer watermark         | Exchange 1, appendix H.                    |
@@ -2213,27 +2215,38 @@ protect feed history are authoritative; post-checkpoint outcome caches never sup
 ### E.1 Segment header
 
 The log consists of files named `log-<segment_id>.bin`, where the ID is 20 zero-padded decimal
-digits. A segment begins with this 96-byte header, followed by the WAL groups in I.2 without
-alignment or padding. Neither a group nor a record can cross a segment boundary. Segment IDs
-increase in append order but need not be consecutive after a crash. Rotation occurs at group
-boundaries.
+digits. A segment begins with this 96-byte header, zero-padded through offset 4096, then places the
+WAL groups in I.2 at 4096-byte boundaries. Each group is followed by zero padding through the next
+boundary, with no padding when it already ends on a boundary.
 
-| Offset | Bytes | Field                                                  |
-| ------ | ----- | ------------------------------------------------------ |
-| 0      | 8     | Magic `BLOPLG01`.                                      |
-| 8      | 2     | Log segment version = 1.                               |
-| 10     | 2     | Header length = 96.                                    |
-| 12     | 4     | Flags = 0.                                             |
-| 16     | 16    | Database ID.                                           |
-| 32     | 8     | Segment ID matching the filename.                      |
-| 40     | 8     | Sequence of the first record in this segment.          |
-| 48     | 32    | Digest of the record preceding the first record.       |
-| 80     | 12    | Reserved = 0.                                          |
-| 92     | 4     | CRC-32C of the complete header with this field zeroed. |
+All segments use this aligned version 1 layout. A reopened writer starts a fresh segment. Neither a
+group nor a record can cross a segment boundary. Segment IDs increase in append order but need not
+be consecutive after a crash. Rotation occurs at complete physical group boundaries, including
+padding.
+
+| Offset | Bytes | Field                                                 |
+| ------ | ----- | ----------------------------------------------------- |
+| 0      | 8     | Magic `BLOPLG01`.                                     |
+| 8      | 2     | Log segment version = 1.                              |
+| 10     | 2     | Header length = 96.                                   |
+| 12     | 4     | Flags = 0.                                            |
+| 16     | 16    | Database ID.                                          |
+| 32     | 8     | Segment ID matching the filename.                     |
+| 40     | 8     | Sequence of the first record in this segment.         |
+| 48     | 32    | Digest of the record preceding the first record.      |
+| 80     | 12    | Reserved = 0.                                         |
+| 92     | 4     | CRC-32C of the 96-byte header with this field zeroed. |
 
 The first record uses the GENESIS digest as its predecessor. Each later record uses the previous
 record's digest, including across segment boundaries. Removing older segments must not change a
 retained segment's original predecessor digest.
+
+Reserve whole 4 KiB blocks for each committed group. Never reuse a published group's padding for a
+later append. Header and group padding must be zero and validated by readers, but do not enter
+canonical hashes or the group digest. All padding is written before the group's existing file flush.
+Write isolation assumes that interrupted writes cannot damage other 4 KiB blocks; it does not assume
+atomic 4 KiB writes. Storage that can damage neighbouring blocks falls outside this isolation
+guarantee.
 
 ### E.2 Record envelope
 
@@ -2273,8 +2286,9 @@ segments. Later complete groups may extend the active segment or continue in new
 without updating that manifest. Existing durable prefixes remain immutable.
 
 Recovery validates complete groups and their canonical chain beyond the selected bounds. It trims
-only physically incomplete terminal appends and makes the recovered suffix durable before replay, as
-specified in I.4. It must not skip an invalid complete group to search for later records.
+physically incomplete terminal appends and applies the configured policy to malformed suffixes, then
+makes the recovered prefix durable before replay, as specified in I.4. It must not skip an invalid
+group to resume at later records.
 
 Advance live D only after flushing a complete WAL group and, for a newly created segment, its
 directory entry. No manifest-pointer update is needed for this append. Dispatch waits for that
@@ -2576,14 +2590,17 @@ A manifest is at most 16 MiB. It must satisfy
 `0 <= history_floor <= checkpoint_sequence <= durable_sequence` and
 `1 <= log_floor <= checkpoint_sequence + 1`. Segments are ordered by sequence, nonempty, and
 together cover exactly `[log_floor, durable_sequence]` without gaps or overlap. If the vector is
-empty, D = C and log_floor = D + 1. A descriptor's committed_bytes includes the 96-byte segment
-header and ends at the complete group containing last_sequence, which must be that group's last
-record. Segment headers, filenames, predecessor digests, and final digests must agree with the
-descriptors. Adjacent descriptors must chain to each other. Segment IDs are strictly increasing.
+empty, D = C and log_floor = D + 1. A descriptor's committed_bytes includes the segment header and
+ends at the complete group containing last_sequence, which must be that group's last record. It
+includes all header and group padding and must be a multiple of 4096. Segment headers, filenames,
+predecessor digests, and final digests must agree with the descriptors. Adjacent descriptors must
+chain to each other. Segment IDs are strictly increasing.
 
 The manifest's durable_sequence is a guaranteed lower bound on live D. Discover later complete
-groups according to I.4. For N records, a descriptor needs at least
-`96 + 72 * N + 168 * ceil(N / 64)` bytes and at most `96 + N * (64 MiB + 168)` bytes.
+groups according to I.4. Define `align(x) = 4096 * ceil(x / 4096)`. For N records, a descriptor
+needs at least `4096 + align(72 * N + 168 * ceil(N / 64))` bytes and at most
+`4096 + N * align(64 MiB + 168)` bytes. Validate these bounds when decoding metadata, then validate
+exact group endpoints when reading the segment file.
 
 The chain at C must equal checkpoint_digest when C is in retained log coverage; when C is just
 before log_floor, the first descriptor must use checkpoint_digest as its predecessor. The last
@@ -2974,7 +2991,8 @@ Implementations must test the following binary behaviours as well as the cases i
   never a recovery starting point.
 - Corrupt or remove a record inside a published prefix and require corruption, not silent tail
   truncation. Physically incomplete terminal WAL appends must be discardable without changing the
-  preceding complete prefix; complete malformed groups must fail as specified in I.4.
+  preceding complete prefix. Complete malformed suffix groups must follow the configured policy in
+  I.4; damage inside selected prefixes must fail under both policies.
 - Interleave cursor checkout, acknowledgement, release, checkpoint publication, and compaction.
   Verify that unrelated manifest updates are preserved and that protected history is never deleted
   using a stale retention root. Start compaction with C < F and installed versions above F, drain
@@ -2998,8 +3016,9 @@ compatible outcomes, historical snapshots, resource accounting, or retention beh
 
 ### I.1 Checkpoint selection and live durability
 
-Use the version 1 CURRENT layout in G.2 and version 1 WAL group and segment headers. Reject unknown
-versions. Creation, live publication, and recovery share the same protocol and log format.
+Use the version 1 CURRENT layout in G.2, WAL groups in I.2 and aligned segments in E.1. Reject
+unknown versions. Creation, live publication, and recovery share the same protocol. Physical padding
+does not enter canonical record, group or exchange hashes.
 
 The selected manifest is authoritative for C, materialized roots, page-file prefix, cursor metadata,
 retention floors and allocation counters. Its D and log descriptors are a durable lower bound, not
@@ -3020,6 +3039,10 @@ Total group length is `168 + sum(canonical_record_lengths)`. It ranges from `168
 through `168 + 64 MiB * count`. Check arithmetic before allocating or traversing bytes. The first
 sequence must be nonzero, and `first + count` must fit u64. No record may use the reserved u64
 maximum.
+
+This encoded length excludes physical padding. Round it up to a multiple of 4096 to find the next
+group or committed endpoint. Validate the zero padding after the trailer before accepting the group.
+A trailer whose required padding is physically incomplete is not a complete physical group.
 
 | Header offset | Bytes | Field                                             |
 | ------------: | ----: | ------------------------------------------------- |
@@ -3057,15 +3080,17 @@ Serialize append and metadata publication on the directory owner:
 1. Validate the bounded group and reserve its canonical sequences in order.
 1. Write its header, canonical records and trailer to the active segment without changing an
    existing committed prefix. On rotation, create a fresh noncolliding segment ID and write its
-   complete version-1 segment header first.
+   complete version-1 segment header and its zero padding first. Write every group's trailing zero
+   padding through its 4 KiB endpoint before flushing. The next append starts at that endpoint and
+   never modifies an earlier group's blocks.
 1. Flush the segment file once. For a new segment, also flush its directory entry. Failure stops
    dispatch and further writes until recovery; a failed or cancelled submission remains uncertain.
 1. Advance live D and the in-memory descriptor only after those operations succeed. Dispatch is now
    allowed. Receipts still wait for complete installation and contiguous visibility F.
 
-The trailer shares the same file flush as the records. An ordinary append on an existing segment
-requires one file flush and no rename, directory flush or manifest publication. A group is a local
-durability unit, not a semantic transaction merge.
+The trailer and padding share the same file flush as the records. An ordinary append on an existing
+segment requires one file flush and no rename, directory flush or manifest publication. A group is a
+local durability unit, not a semantic transaction merge.
 
 Checkpoints and cursor/retention/layout changes continue to use G.3. Their manifests incorporate the
 latest live D and exact segment bounds. Files already flushed by WAL append need no repeated flush
@@ -3081,21 +3106,42 @@ Under the exclusive directory lease:
    Missing or corrupt bytes within selected prefixes are always errors.
 1. Extend the last selected segment from its recorded boundary using complete groups.
 1. Enumerate potential successor log files at or above the selected next_segment_id in increasing
-   file-ID order. Validate their database/file identities and require version 1. Follow only a
-   contiguous sequence/digest chain from the preceding accepted endpoint. Reject complete forks,
-   gaps, foreign identities, unsupported versions and malformed headers. Never resynchronise at a
-   later magic string after invalid data. Discovery retains at most 1,048,576 candidate IDs.
+   file-ID order. Validate their database/file identities and require segment version 1. Follow only
+   a contiguous sequence/digest chain from the preceding accepted endpoint. Reject complete forks,
+   gaps, foreign identities, unsupported versions and checksum-valid malformed segment headers.
+   Never resynchronise at a later magic string after invalid data. Discovery retains at most
+   1,048,576 candidate IDs.
 1. Discard a physically short terminal group: fewer than 112 remaining header bytes, or a valid
-   header whose declared group extends beyond physical EOF. A physically short segment header, or a
-   valid unlisted segment containing no complete group, is orphan output. A later complete successor
-   after an incomplete accepted segment is an error. Complete-sized groups with invalid CRCs,
-   hashes, framing or envelopes fail closed.
-1. Only after validating the candidate chain, truncate incomplete accepted tails, flush recovered
-   suffix files and flush newly discovered filenames. Readable bytes left in an OS cache after a
-   process crash do not by themselves establish durability-before-execution.
+   header whose physical group, including required padding, extends beyond EOF. A physically short
+   segment header, including incomplete padding, is orphan output. Apply the selected tail policy
+   below to complete-sized malformed suffixes. A valid unlisted segment containing no complete group
+   is orphan output. A later complete successor after an incomplete or malformed accepted segment is
+   an error under both policies.
+1. Only after validating the candidate chain, truncate discarded tails and orphan output, flush
+   recovered suffix files and flush newly discovered filenames. Readable bytes left in an OS cache
+   after a process crash do not by themselves establish durability-before-execution.
 1. Discard post-checkpoint materialization and replay every canonical record in `(C, D]`, including
    aborts and records whose receipts may already have succeeded. Publish the resulting checkpoint
    before serving public requests.
+
+#### Select a tail recovery policy
+
+The process-local policy applies only beyond the selected manifest's validated log bounds. It does
+not change canonical transaction semantics or the physical encoding:
+
+- **DiscardInvalid (default):** stop at the first malformed group header, body, trailer or padding,
+  keep the preceding valid groups, and discard the remaining suffix of that segment. Do not scan or
+  resume at later groups in the same file. An unlisted segment with an invalid header CRC or invalid
+  header padding is orphan output; truncate it to zero. A valid unlisted header followed by no valid
+  group may be retained as an empty orphan after truncating its malformed suffix.
+- **Strict:** reject complete-sized malformed groups, invalid segment header CRCs and nonzero header
+  padding. Leave WAL files unchanged when validation fails. Physically short terminal appends remain
+  discardable, as described above.
+
+Both policies reject unsupported required versions and checksum-valid group headers whose first
+sequence or predecessor digest does not match the accepted endpoint. Selected log prefixes, pages
+and metadata always require strict validation. Validate all candidate segments before truncating
+anything, so discovery of a later fork or gap cannot partially repair a failed open.
 
 #### Interpret recovery results
 
@@ -3103,10 +3149,12 @@ A complete valid group can survive even if the writer never observed a successfu
 receipt. Its submission result is uncertain. Checksums alone do not prove that a past flush
 occurred.
 
-Later loss or physical truncation of an uncheckpointed suffix cannot be distinguished from an
-interrupted append. The selected manifest's byte bounds remain strict. Recovery must reject complete
-malformed suffix groups, including full-length torn appends that fail validation, rather than
-silently roll them back. This distinction is part of the version 1 recovery contract.
+Later loss or physical truncation of a suffix outside selected bounds cannot be distinguished from
+an interrupted append under either policy. DiscardInvalid also cannot distinguish full-length torn
+appends from later corruption of acknowledged suffix groups. It favours automatic crash recovery and
+may discard acknowledged data after a storage failure. Strict detects complete-sized malformed
+suffixes but can require intervention after an ordinary interrupted append. The selected manifest's
+byte bounds remain strict under both policies.
 
 ### I.5 Backup and logical consumers
 
@@ -3128,10 +3176,13 @@ segments and reclaims whole segments only after replacement metadata is durable.
 Test each of these WAL behaviours:
 
 - one-flush appends and unchanged CURRENT across WAL-only commits;
+- 4 KiB-aligned segment and group endpoints, zero padding, and no writes into earlier committed
+  blocks;
 - exact group boundaries, malformed checksummed frames, and every physically short group prefix;
+- both tail policies, selected-prefix errors, and full-length torn groups with surviving trailers;
 - segment forks, missing predecessors, unsupported versions, and orphan filenames;
 - process exit and partial writes at append boundaries;
-- recovery flushing before replay and checkpoints inside groups; and
+- recovery flushing before replay, interrupted recovery retries, and checkpoints inside groups; and
 - backups captured while live D exceeds the selected manifest's D.
 
 Sequential-equivalence, retention, revocation, and replica outcome checks also remain required.
